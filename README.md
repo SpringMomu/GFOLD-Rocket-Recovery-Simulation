@@ -185,7 +185,7 @@ $$
 
 动压 $q=\tfrac12\rho\lVert\mathbf v_{rel}\rVert^2$，马赫数 $M=\lVert\mathbf v_{rel}\rVert/a$，$\mathbf v_{rel}=\mathbf v-\mathbf w$（风速 $\mathbf w$）。设箭体轴与来流的夹角为攻角 $\alpha$（相对迎风端），参考面积 $A_{ref}=\pi D^2/4$，侧面积 $A_{plan}=LD$。
 
-- **轴向力**：$\mathbf F_A=-\operatorname{sgn}(c)\,q A_{ref}C_A\,\hat{\mathbf z}_b$，其中 $c=\hat{\mathbf u}\cdot\hat{\mathbf z}_b$（$c>0$ 箭头朝前，$c<0$ 发动机朝前），$C_A=C_{A0}(M)\cos^2\alpha$，两种朝向的 $C_{A0}$ 不同。
+- **轴向力**：$\mathbf F_A=-\mathrm{sgn}(c)\,q A_{ref}C_A\,\hat{\mathbf z}_b$，其中 $c=\hat{\mathbf u}\cdot\hat{\mathbf z}_b$（$c>0$ 箭头朝前，$c<0$ 发动机朝前），$C_A=C_{A0}(M)\cos^2\alpha$，两种朝向的 $C_{A0}$ 不同。
 - **法向力** = 位势项 + 粘性横流项：
 
 $$
@@ -229,7 +229,7 @@ $$
 \Delta\mathbf v_h=-\frac{\mathbf r_{imp}}{t_{fall}}
 $$
 
-推力方向取 $\hat{\mathbf d}\propto(\Delta v_x,\Delta v_y,\ 0.3\lVert\Delta\mathbf v_h\rVert)$（带一点向上分量），节流做比例控制 $\eta=\operatorname{clip}(\lVert\Delta\mathbf v_h\rVert/8,\ 0.4,\ 0.9)$；姿态误差 < 25° 才点火。每 0.1 s 重新预测一次落点，形成**对预测落点的闭环**。结束条件（任一即可）：预测落点误差 < 25 m；$\lVert\Delta\mathbf v_h\rVert<0.4$ m/s；高度 < 700 m；误差比历史最优大 30 m（发散保护）。
+推力方向取 $\hat{\mathbf d}\propto(\Delta v_x,\Delta v_y,\ 0.3\lVert\Delta\mathbf v_h\rVert)$（带一点向上分量），节流做比例控制 $\eta=\mathrm{clip}(\lVert\Delta\mathbf v_h\rVert/8,\ 0.4,\ 0.9)$；姿态误差 < 25° 才点火。每 0.1 s 重新预测一次落点，形成**对预测落点的闭环**。结束条件（任一即可）：预测落点误差 < 25 m；$\lVert\Delta\mathbf v_h\rVert<0.4$ m/s；高度 < 700 m；误差比历史最优大 30 m（发散保护）。
 
 此阶段栅格舵**收起**（反推结束、转入滑行后再展开），姿态由万向节和 RCS 完成。
 
@@ -248,7 +248,7 @@ $$
 令 $\Delta r=-\mathbf r_{imp}$，得所需横向加速度 $\mathbf a_{des}=-\mathbf r_{imp}/[t_{ign}(t_{imp}-t_{ign}/2)]$。再用 5° 探测攻角在气动模型上测得升力斜率 $\partial F/\partial\alpha$，反解攻角并限幅：
 
 $$
-\alpha=\operatorname{clip}\!\Bigl(\frac{a_{des}\,m}{\partial F/\partial\alpha},\ 0,\ 15^\circ\Bigr)
+\alpha=\mathrm{clip}\!\Bigl(\frac{a_{des}\,m}{\partial F/\partial\alpha},\ 0,\ 15^\circ\Bigr)
 $$
 
 点火前 3 s 内转为对准即将开始的燃烧方向（低而短的燃烧只小幅预倾斜）。函数：`_aero_steer`。
@@ -325,7 +325,7 @@ $$
 - 控制（每个节点 4 个）：$\mathbf u_k$（3）、$\sigma_k$；
 - 松弛量：终端误差正负部 $\mathbf e^\pm$（12 个）、滑翔锥松弛 $s_k$、下沉包络松弛、推进剂松弛（都非负）。
 
-节点数 $N=\operatorname{clip}(\operatorname{round}(t_f/1.0),\,40,\,70)$，即至少 40 个、每步约 1 s；共 $13N+24$ 个决策变量（$N=40$ 时 544 个）。2D 版是 $8N+15$ 个。**规划时域覆盖“从现在到触地”**，不是固定 600 s。
+节点数 $N=\mathrm{clip}(\mathrm{round}(t_f/1.0),\,40,\,70)$，即至少 40 个、每步约 1 s；共 $13N+24$ 个决策变量（$N=40$ 时 544 个）。2D 版是 $8N+15$ 个。**规划时域覆盖“从现在到触地”**，不是固定 600 s。
 
 #### 5.4.3 阻力与升力：沿上一条规划轨迹逐次线性化
 
@@ -414,10 +414,10 @@ $$
 
 前馈是主角，反馈只修正残差。之后依次套用：
 
-1. **下沉包络**：离地 < 15 m，若 $v_z<-(1.2+0.5h)$ 则 $a_z\mathrel{+}=2\,(v_{lim}-v_z)$ 刹住多余下沉；
+1. **下沉包络**：离地 < 15 m，若 $v_z<-(1.2+0.5h)$ 则 $a_z\leftarrow a_z+2\,(v_{lim}-v_z)$ 刹住多余下沉；
 2. **倾角预算**（近地越来越竖直）：$\theta_{budget}(h)=\text{interp}\bigl(h;\ [0.3,1.5,3,12,40]\text{ m}\to[0.6°,2°,5°,10°,75°]\bigr)$，水平分量限制为 $\lVert\mathbf a_{xy}\rVert\le\tan\theta_{budget}\,a_z$；
 3. **推力方向转速限制**：指令方向的变化率不超过 8°/s（离地 2 m）→15°/s（30 m）→25°/s（300 m）——箭体这么大，追着方向跳变跑只会摇摆；
-4. **油门映射**：$\eta=\operatorname{clip}\bigl(m\lVert\mathbf a_{cmd}\rVert/(T_{avail}\cos\varepsilon),0,1\bigr)$，$\varepsilon$ 为体轴与指令方向夹角（$\varepsilon>25^\circ$ 时改为乘 $\operatorname{clip}(\cos\varepsilon,0.35,1)$，姿态没转到位就不猛推）；离地 > 1 m 保持最小节流的 90 %，避免熄火。
+4. **油门映射**：$\eta=\mathrm{clip}\bigl(m\lVert\mathbf a_{cmd}\rVert/(T_{avail}\cos\varepsilon),0,1\bigr)$，$\varepsilon$ 为体轴与指令方向夹角（$\varepsilon>25^\circ$ 时改为乘 $\mathrm{clip}(\cos\varepsilon,0.35,1)$，姿态没转到位就不猛推）；离地 > 1 m 保持最小节流的 90 %，避免熄火。
 
 2D 版同样是前馈 + PD（$0.45,\ 1.5$，限幅 4 m/s²），倾角预算 $[0.3,1.5,3,12,40]\to[0.6°,2°,4°,6°,75°]$。
 
