@@ -50,7 +50,7 @@
 
 **任务。** 一级火箭分离后处于任意位置、速度、姿态（高度可以是 100 m，也可以是 12 km，速度可能带着朝外飞的水平分量）。要求它自己回到发射台，以近乎竖直、接近 1 m/s 的下沉速度、几乎零水平速度、落点误差 ≪ 台面半径的状态触地，同时燃料够用。
 
-记位置 $\mathbf r=(x,y,h)$（东、北、天，$h$ 为高度，原点在台面中心）、速度 $\mathbf v$、质量 $m$、推力矢量 $\mathbf T$、重力加速度矢量 $\mathbf g=(0,0,-g_0)$、气动加速度 $\mathbf d$。这个问题可以写成一个**最优控制问题**（记为 P0）：
+记位置 $\mathbf r=(x,y,h)$（东、北、天， $h$ 为高度，原点在台面中心）、速度 $\mathbf v$、质量 $m$、推力矢量 $\mathbf T$、重力加速度矢量 $\mathbf g=(0,0,-g_0)$、气动加速度 $\mathbf d$。这个问题可以写成一个**最优控制问题**（记为 P0）：
 
 $$
 \begin{aligned}
@@ -98,7 +98,7 @@ flowchart TD
 | 阶段 | 目标 | 控制/制导方法 | 关键公式或算法 | 代码入口 |
 | --- | --- | --- | --- | --- |
 | ① 反推返航 BOOSTBACK | 把无动力落点从远处推回台面附近 | 落点预测–校正（预测落点反馈）+ 比例节流；姿态用 SO(3) 控制，冷气 RCS 提供力矩 | $\Delta\mathbf v_h=-\mathbf r_{imp}/t_{fall}$（§5.1） | `Autopilot3D._pre_ignition`、`_ballistic` |
-| ② 无动力滑行 COAST | 发动机关闭，稳定迎风；用箭体升力微调落点 | 数值弹道预测 + 攻角气动导引；栅格舵做姿态执行器 | $\mathbf a_{des}=-\mathbf r_{imp}/[t_{ign}(t_{imp}-t_{ign}/2)]$，$\alpha=a_{des}\,m/(\partial F/\partial\alpha)$（§5.2） | `_aero_steer`、`_ballistic` |
+| ② 无动力滑行 COAST | 发动机关闭，稳定迎风；用箭体升力微调落点 | 数值弹道预测 + 攻角气动导引；栅格舵做姿态执行器 | $\mathbf a_{des}=-\mathbf r_{imp}/[t_{ign}(t_{imp}-t_{ign}/2)]$， $\alpha=a_{des}\,m/(\partial F/\partial\alpha)$（§5.2） | `_aero_steer`、`_ballistic` |
 | ③ 点火判定 | 找“最晚仍来得及”的点火时刻（hover-slam） | 解析点火预测器：竖直匀减速 + 横向最小能量（ZEM/ZEV）加速度 | $f=m\lVert\mathbf a_{need}\rVert/T_{avail}\ge 0.62$（§5.3） | `_burn_need`、`_pre_ignition` |
 | ④ 着陆燃烧 LANDING BURN | 一次连续燃烧、直接烧到触地，燃料尽量省，推力平滑 | **G-FOLD 凸优化**：SOCP + 无损凸化 + FOH 离散 + L1 精确罚；滚动时域 5 Hz 重规划；锁定触地时间，不可达时只前移到“最早可达”时刻 | §5.4 的全部公式 | `Planner3D.build/solve`、`Autopilot3D._replan/_earliest` |
 | ⑤ 轨迹跟踪（内环） | 让实际轨迹贴住规划轨迹 | 规划推力前馈 + 位置/速度 PD 修正 + 倾角/下沉包络限幅 + 推力方向转速限制 | $\mathbf a_{cmd}=\mathbf u_{ff}+K_p\Delta\mathbf r+K_v\Delta\mathbf v$（§5.5） | `Autopilot3D.command`、`_fly_accel` |
@@ -123,7 +123,7 @@ flowchart TD
 
 ### 4.1 6 自由度刚体
 
-世界系为本地东-北-天（ENU），体系 $+z_b$ 沿箭体轴（发动机 → 箭头）。位置、速度在世界系，姿态用单位四元数 $\mathbf q$（$R(\mathbf q)$ 把体轴向量转到世界系）：
+世界系为本地东-北-天（ENU），体系 $+z_b$ 沿箭体轴（发动机 → 箭头）。位置、速度在世界系，姿态用单位四元数 $\mathbf q$（ $R(\mathbf q)$ 把体轴向量转到世界系）：
 
 $$
 m\dot{\mathbf v}=R(\mathbf q)\,\mathbf T_b+m\,\mathbf g(h)+\mathbf F_{aero}+\mathbf F_{contact},\qquad \dot{\mathbf r}=\mathbf v
@@ -173,7 +173,7 @@ $\eta\in[0,1]$ 是节流。因为质量流量由油门决定，**同样的油门
 
 ### 4.3 大气与风
 
-国际标准大气（ISA，`atmosphere`）：对流层 $T=288.15-0.0065h$，$p=101325\,(T/288.15)^{5.25588}$，$\rho=p/(287.05\,T)$，声速 $a=\sqrt{1.4\cdot 287.05\,T}$；11 km 以上等温层按指数衰减，25 km 以上升温。
+国际标准大气（ISA，`atmosphere`）：对流层 $T=288.15-0.0065h$， $p=101325\,(T/288.15)^{5.25588}$， $\rho=p/(287.05\,T)$，声速 $a=\sqrt{1.4\cdot 287.05\,T}$；11 km 以上等温层按指数衰减，25 km 以上升温。
 
 风（`Wind`）：对数风廓线加阵风。默认 10 m 高度 6 m/s、阵风 1.8 m/s：
 
@@ -183,25 +183,25 @@ $$
 
 ### 4.4 气动力（工程模型，`aero3d.AeroModel`）
 
-动压 $q=\tfrac12\rho\lVert\mathbf v_{rel}\rVert^2$，马赫数 $M=\lVert\mathbf v_{rel}\rVert/a$，$\mathbf v_{rel}=\mathbf v-\mathbf w$（风速 $\mathbf w$）。设箭体轴与来流的夹角为攻角 $\alpha$（相对迎风端），参考面积 $A_{ref}=\pi D^2/4$，侧面积 $A_{plan}=LD$。
+动压 $q=\tfrac12\rho\lVert\mathbf v_{rel}\rVert^2$，马赫数 $M=\lVert\mathbf v_{rel}\rVert/a$， $\mathbf v_{rel}=\mathbf v-\mathbf w$（风速 $\mathbf w$）。设箭体轴与来流的夹角为攻角 $\alpha$（相对迎风端），参考面积 $A_{ref}=\pi D^2/4$，侧面积 $A_{plan}=LD$。
 
-- **轴向力**：$\mathbf F_A=-\mathrm{sgn}(c)\,q A_{ref}C_A\,\hat{\mathbf z}_b$，其中 $c=\hat{\mathbf u}\cdot\hat{\mathbf z}_b$（$c>0$ 箭头朝前，$c<0$ 发动机朝前），$C_A=C_{A0}(M)\cos^2\alpha$，两种朝向的 $C_{A0}$ 不同。
+- **轴向力**： $\mathbf F_A=-\mathrm{sgn}(c)\,q A_{ref}C_A\,\hat{\mathbf z}_b$，其中 $c=\hat{\mathbf u}\cdot\hat{\mathbf z}_b$（ $c>0$ 箭头朝前， $c<0$ 发动机朝前）， $C_A=C_{A0}(M)\cos^2\alpha$，两种朝向的 $C_{A0}$ 不同。
 - **法向力** = 位势项 + 粘性横流项：
 
 $$
 C_N=\underbrace{\frac{\sin\alpha\cos\alpha}{\sqrt{1-\min(M,0.85)^2}}}_{\text{细长体位势流 + Prandtl–Glauert 修正}}+\underbrace{0.62\,C_{d,c}(M)\,\frac{A_{plan}}{A_{ref}}\sin^2\alpha}_{\text{Jorgensen 横流（圆柱绕流）项}}
 $$
 
-- **跨声速阻力上升**：用 smoothstep 在 $0.8\le M\le1.1$ 内从 $C_{low}$ 升到 $C_{peak}$，$M>1.1$ 后按 $e^{-(M-1.1)/0.6}$ 衰减到 $C_{high}$。
+- **跨声速阻力上升**：用 smoothstep 在 $0.8\le M\le1.1$ 内从 $C_{low}$ 升到 $C_{peak}$， $M>1.1$ 后按 $e^{-(M-1.1)/0.6}$ 衰减到 $C_{high}$。
 - **力矩**：轴向力作用在箭身中点，位势法向力作用在迎风端，粘性法向力在中点，再加上气动阻尼 $\propto q\,L^2\boldsymbol\omega_\perp/V$。合力矩 $\sum \mathbf r_i\times\mathbf F_i$ 决定压心位置。发动机朝前下落时，压心必须落在质心的“尾随侧”（箭头一侧）箭体才有风向标稳定性；栅格舵装在箭头附近，正是提供这个稳定力矩。
 
-**栅格舵**（`grid_fin_forces`）：4 片，每片绕自己的径向铰链偏转 $\delta_i$。每片有自己的**当地来流** $\mathbf V_i=-(\mathbf v_b+\boldsymbol\omega\times\mathbf p_i)$（$\mathbf v_b$ 为体轴系下的相对来流速度，含箭体转动，所以舵面天然带阻尼），格栅轴线为 $\mathbf c=\cos\delta\,\hat{\mathbf z}-\sin\delta\,\hat{\mathbf e}_t$。来流相对格栅轴线在切向、径向上的偏角记为 $\alpha_t,\alpha_r$，两组格壁各自产生法向力，再加格栅阻力：
+**栅格舵**（`grid_fin_forces`）：4 片，每片绕自己的径向铰链偏转 $\delta_i$。每片有自己的**当地来流** $\mathbf V_i=-(\mathbf v_b+\boldsymbol\omega\times\mathbf p_i)$（ $\mathbf v_b$ 为体轴系下的相对来流速度，含箭体转动，所以舵面天然带阻尼），格栅轴线为 $\mathbf c=\cos\delta\,\hat{\mathbf z}-\sin\delta\,\hat{\mathbf e}_t$。来流相对格栅轴线在切向、径向上的偏角记为 $\alpha_t,\alpha_r$，两组格壁各自产生法向力，再加格栅阻力：
 
 $$
 \mathbf F_i=q_{loc}S\Bigl[f_M(M)\bigl(C_N(\alpha_t)\hat{\mathbf n}_t+C_N(\alpha_r)\hat{\mathbf e}_r\bigr)+C_{d0}\,\hat{\mathbf V}_i\Bigr],\quad C_N(\alpha)=C_{N\alpha}\sin\alpha\cos\alpha,\quad f_M=1-0.35\,e^{-\left(\frac{M-1.05}{0.22}\right)^2}
 $$
 
-$C_N\propto\sin\alpha\cos\alpha$ 在 45° 处最大——格栅舵不像平板翼那样在大攻角失速；$f_M$ 描述格栅在 $M\approx1$ 附近“壅塞”导致效率下降约 35 %。力矩为 $\mathbf p_i\times\mathbf F_i$。
+$C_N\propto\sin\alpha\cos\alpha$ 在 45° 处最大——格栅舵不像平板翼那样在大攻角失速； $f_M$ 描述格栅在 $M\approx1$ 附近“壅塞”导致效率下降约 35 %。力矩为 $\mathbf p_i\times\mathbf F_i$。
 
 **规划器用的简化气动**：`AeroModel.quick_force` 只算力、不算力矩，用于制导里的弹道预测与阻力/升力线性化。
 
@@ -229,7 +229,7 @@ $$
 \Delta\mathbf v_h=-\frac{\mathbf r_{imp}}{t_{fall}}
 $$
 
-推力方向取 $\hat{\mathbf d}\propto(\Delta v_x,\Delta v_y,\ 0.3\lVert\Delta\mathbf v_h\rVert)$（带一点向上分量），节流做比例控制 $\eta=\mathrm{clip}(\lVert\Delta\mathbf v_h\rVert/8,\ 0.4,\ 0.9)$；姿态误差 < 25° 才点火。每 0.1 s 重新预测一次落点，形成**对预测落点的闭环**。结束条件（任一即可）：预测落点误差 < 25 m；$\lVert\Delta\mathbf v_h\rVert<0.4$ m/s；高度 < 700 m；误差比历史最优大 30 m（发散保护）。
+推力方向取 $\hat{\mathbf d}\propto(\Delta v_x,\Delta v_y,\ 0.3\lVert\Delta\mathbf v_h\rVert)$（带一点向上分量），节流做比例控制 $\eta=\mathrm{clip}(\lVert\Delta\mathbf v_h\rVert/8,\ 0.4,\ 0.9)$；姿态误差 < 25° 才点火。每 0.1 s 重新预测一次落点，形成**对预测落点的闭环**。结束条件（任一即可）：预测落点误差 < 25 m； $\lVert\Delta\mathbf v_h\rVert<0.4$ m/s；高度 < 700 m；误差比历史最优大 30 m（发散保护）。
 
 此阶段栅格舵**收起**（反推结束、转入滑行后再展开），姿态由万向节和 RCS 完成。
 
@@ -237,7 +237,7 @@ $$
 
 ### 5.2 无动力滑行（COAST）
 
-**姿态**：发动机朝前（“尾向来流”），与相对风对齐，即体轴 $=-\hat{\mathbf u}$，$\hat{\mathbf u}=\mathbf v_{rel}/\lVert\mathbf v_{rel}\rVert$。这个姿态阻力小；栅格舵位于尾随侧，使它气动上稳定（风向标稳定），同时栅格舵也是姿态控制的执行机构。
+**姿态**：发动机朝前（“尾向来流”），与相对风对齐，即体轴 $=-\hat{\mathbf u}$， $\hat{\mathbf u}=\mathbf v_{rel}/\lVert\mathbf v_{rel}\rVert$。这个姿态阻力小；栅格舵位于尾随侧，使它气动上稳定（风向标稳定），同时栅格舵也是姿态控制的执行机构。
 
 **落点修正：用箭体升力。** 让箭体带一个小攻角 $\alpha$，法向力就是一个横向加速度。设想在点火前 $t_{ign}$ 内持续施加横向加速度 $a$，之后速度增量一直保留到落地 $t_{imp}$，则落点位移为
 
@@ -265,7 +265,7 @@ $$
 
 （2D 的 `_initial_time_bracket` 用它估计搜索区间。）
 
-**3D 的点火预测器**（`_burn_need`）：假设“此刻点火”，竖直方向匀减速到台面并达到 $v_{td}$，横向按最小能量（$\min\int\lVert\mathbf a\rVert^2dt$，双积分器、终端位置速度为零）的解，问所需推力占可用推力的比例：
+**3D 的点火预测器**（`_burn_need`）：假设“此刻点火”，竖直方向匀减速到台面并达到 $v_{td}$，横向按最小能量（ $\min\int\lVert\mathbf a\rVert^2dt$，双积分器、终端位置速度为零）的解，问所需推力占可用推力的比例：
 
 $$
 h_{eff}=h-h_{gate}-0.45\max(0,-v_z),\qquad a_v=\frac{v_z^2-v_{td}^2}{2h_{eff}},\qquad t_b=\frac{-v_z-v_{td}}{a_v}
@@ -277,7 +277,7 @@ $$
 f=\frac{m\lVert\mathbf a_{need}\rVert}{T_{avail}(h)}
 $$
 
-其中 $0.45$ s 是发动机起转的时间余量，$d_{up}$ 是向上的气动减速（保守只计 1/3）。横向项 $-6\mathbf r/t^2-4\mathbf v/t$ 是零控脱靶量/零控速度（ZEM/ZEV）形式的最小能量制导律：对 $\ddot r=a$，$r(t_b)=v(t_b)=0$，最优 $a(t)$ 是 $t$ 的线性函数，代入边界条件可解出 $a(0)$。
+其中 $0.45$ s 是发动机起转的时间余量， $d_{up}$ 是向上的气动减速（保守只计 1/3）。横向项 $-6\mathbf r/t^2-4\mathbf v/t$ 是零控脱靶量/零控速度（ZEM/ZEV）形式的最小能量制导律：对 $\ddot r=a$， $r(t_b)=v(t_b)=0$，最优 $a(t)$ 是 $t$ 的线性函数，代入边界条件可解出 $a(0)$。
 
 当 $f\ge0.62$ 时点火（预计燃烧时间 $t_b<5$ s 的短燃烧，阈值在 2–5 s 内从 0.48 线性升到 0.62，让短燃烧早一点点火，留时间修横向漂移）。滑行预测器把整条无动力弹道向前积分，找到第一个满足条件的时刻作为 `ignition_in`。
 
@@ -305,7 +305,7 @@ $$
 T_{\min}e^{-z}\le\sigma\le T_{\max}e^{-z},\qquad \lVert\mathbf u\rVert\le\sigma\ \ \text{（二阶锥约束，SOC）}
 $$
 
-**无损凸化定理（Açıkmeşe & Ploen 2007；Açıkmeşe & Blackmore 2011）**：把非凸的 $\lVert\mathbf u\rVert\ge\rho_{\min}$ 换成凸的 $\lVert\mathbf u\rVert\le\sigma$ 之后，在一定条件下（系统可控、无奇异弧等），松弛问题的最优解在最优时刻**处处满足 $\lVert\mathbf u^*\rVert=\sigma^*$**，因此它同时也是原非凸问题的最优解——松弛是“无损”的。直观理解：燃料随 $\sigma$ 增大而变多，优化器不愿多用 $\sigma$，所以 $\sigma$ 会贴着 $\lVert\mathbf u\rVert$；严格证明用庞特里亚金极大值原理。
+**无损凸化定理（Açıkmeşe & Ploen 2007；Açıkmeşe & Blackmore 2011）**：把非凸的 $\lVert\mathbf u\rVert\ge\rho_{\min}$ 换成凸的 $\lVert\mathbf u\rVert\le\sigma$ 之后，在一定条件下（系统可控、无奇异弧等），松弛问题的最优解在最优时刻**处处满足** $\lVert\mathbf u^\star\rVert=\sigma^\star$，因此它同时也是原非凸问题的最优解——松弛是“无损”的。直观理解：燃料随 $\sigma$ 增大而变多，优化器不愿多用 $\sigma$，所以 $\sigma$ 会贴着 $\lVert\mathbf u\rVert$；严格证明用庞特里亚金极大值原理。
 
 > 诚实说明：定理针对论文里的理想问题。本项目又加了气动项、变化率约束、软约束，这些超出了定理的证明范围，**没有严格的无损性证明**，靠闭环仿真验证有效。
 
@@ -321,11 +321,11 @@ $$
 
 #### 5.4.2 状态与控制
 
-- 状态（每个节点 7 个）：$\mathbf r_k$（3）、$\mathbf v_k$（3）、$z_k=\ln m_k$；
-- 控制（每个节点 4 个）：$\mathbf u_k$（3）、$\sigma_k$；
+- 状态（每个节点 7 个）： $\mathbf r_k$（3）、 $\mathbf v_k$（3）、 $z_k=\ln m_k$；
+- 控制（每个节点 4 个）： $\mathbf u_k$（3）、 $\sigma_k$；
 - 松弛量：终端误差正负部 $\mathbf e^\pm$（12 个）、滑翔锥松弛 $s_k$、下沉包络松弛、推进剂松弛（都非负）。
 
-节点数 $N=\mathrm{clip}(\mathrm{round}(t_f/1.0),\,40,\,70)$，即至少 40 个、每步约 1 s；共 $13N+24$ 个决策变量（$N=40$ 时 544 个）。2D 版是 $8N+15$ 个。**规划时域覆盖“从现在到触地”**，不是固定 600 s。
+节点数 $N=\mathrm{clip}(\mathrm{round}(t_f/1.0),\,40,\,70)$，即至少 40 个、每步约 1 s；共 $13N+24$ 个决策变量（ $N=40$ 时 544 个）。2D 版是 $8N+15$ 个。**规划时域覆盖“从现在到触地”**，不是固定 600 s。
 
 #### 5.4.3 阻力与升力：沿上一条规划轨迹逐次线性化
 
@@ -348,22 +348,22 @@ z_{k+1}&=z_k-\frac{\alpha\Delta t}{2}(\sigma_k+\sigma_{k+1})
 \end{aligned}
 $$
 
-（推导：$\mathbf u(s)=\mathbf u_k+\frac{s}{\Delta t}(\mathbf u_{k+1}-\mathbf u_k)$，$\mathbf v$ 是 $\mathbf u$ 的积分，$\mathbf r$ 是 $\mathbf v$ 的积分：$\int_0^{\Delta t}(\Delta t-s)\mathbf u(s)ds=\Delta t^2(\mathbf u_k/3+\mathbf u_{k+1}/6)$。）这些都是**线性等式**，进入 Clarabel 的零锥。
+（推导： $\mathbf u(s)=\mathbf u_k+\frac{s}{\Delta t}(\mathbf u_{k+1}-\mathbf u_k)$， $\mathbf v$ 是 $\mathbf u$ 的积分， $\mathbf r$ 是 $\mathbf v$ 的积分： $\int_0^{\Delta t}(\Delta t-s)\mathbf u(s)ds=\Delta t^2(\mathbf u_k/3+\mathbf u_{k+1}/6)$。）这些都是**线性等式**，进入 Clarabel 的零锥。
 
 #### 5.4.5 约束清单
 
 | 约束 | 公式 | 作用 |
 | --- | --- | --- |
-| 初值 | $\mathbf r_0,\mathbf v_0$ 等于当前测量，$z_0=\ln m_0$ | 从“现在”开始规划 |
+| 初值 | $\mathbf r_0,\mathbf v_0$ 等于当前测量， $z_0=\ln m_0$ | 从“现在”开始规划 |
 | 推力锥 | $\lVert\mathbf u_k\rVert\le\sigma_k$ | SOC（4 维），无损凸化 |
 | 推力上下界 | $\mu_1\bigl(1-(z_k-\bar z_k)\bigr)\le\sigma_k\le\mu_2\bigl(1-(z_k-\bar z_k)\bigr)$ | 油门范围随质量变化 |
-| 推力倾角 | $u_{z,k}\ge\sigma_k\cos\theta_{\max}(t_{go})$ | 随剩余时间收紧：$t_{go}$ = 8 / 3 / 1 / 0 s 时上限依次为“远端值 / 22° / 8° / 6°”，中间线性插值 |
-| 滑翔锥（软） | $\lVert(x_k,y_k)\rVert\le\tan\gamma\,(h_k+s_k)$，$\gamma=65^\circ$，$s_k\ge0$ 罚 30 | 防止贴地横飞 |
-| 下沉包络（软） | $v_{z,k}\ge-(v_{td}+c_s h_k)-s'_k$，$c_s=0.5$ | 近地下沉速度 $\le1.2+0.5h$ m/s，杜绝“高速撞地”和“悬停” |
-| 推力变化率 | $\lvert\sigma_{k+1}-\sigma_k\rvert\le0.8\,\dot\eta_{\max}\tfrac{T_{\max}}{m_0}\Delta t$；$\lvert u_{xy,k+1}-u_{xy,k}\rvert\le4\Delta t$ | 节流与侧向推力变化不超过执行机构能力 |
+| 推力倾角 | $u_{z,k}\ge\sigma_k\cos\theta_{\max}(t_{go})$ | 随剩余时间收紧： $t_{go}$ = 8 / 3 / 1 / 0 s 时上限依次为“远端值 / 22° / 8° / 6°”，中间线性插值 |
+| 滑翔锥（软） | $\lVert(x_k,y_k)\rVert\le\tan\gamma\,(h_k+s_k)$， $\gamma=65^\circ$， $s_k\ge0$ 罚 30 | 防止贴地横飞 |
+| 下沉包络（软） | $v_{z,k}\ge-(v_{td}+c_s h_k)-s'_k$， $c_s=0.5$ | 近地下沉速度 $\le1.2+0.5h$ m/s，杜绝“高速撞地”和“悬停” |
+| 推力变化率 | $\lvert\sigma_{k+1}-\sigma_k\rvert\le0.8\,\dot\eta_{\max}\tfrac{T_{\max}}{m_0}\Delta t$； $\lvert u_{xy,k+1}-u_{xy,k}\rvert\le4\Delta t$ | 节流与侧向推力变化不超过执行机构能力 |
 | 首节点 | 推力大小等于当前发动机出力（± 起转余量） | 与正在运行的发动机连续 |
-| 推进剂（软） | $z_N\ge\ln m_{dry}-s_f$，$s_f\ge0$ 罚 $2\times10^4$ | 推进剂用光时问题仍可行 |
-| **终端（精确罚）** | $\mathbf r_N-\mathbf r_{tgt}=\mathbf e_p^+-\mathbf e_p^-$，$\mathbf v_N-\mathbf v_{tgt}=\mathbf e_v^+-\mathbf e_v^-$，$\mathbf e^\pm\ge0$，代价 $400\lVert\mathbf e_p\rVert_1+250\lVert\mathbf e_v\rVert_1$ | 见下 |
+| 推进剂（软） | $z_N\ge\ln m_{dry}-s_f$， $s_f\ge0$ 罚 $2\times10^4$ | 推进剂用光时问题仍可行 |
+| **终端（精确罚）** | $\mathbf r_N-\mathbf r_{tgt}=\mathbf e_p^+-\mathbf e_p^-$， $\mathbf v_N-\mathbf v_{tgt}=\mathbf e_v^+-\mathbf e_v^-$， $\mathbf e^\pm\ge0$，代价 $400\lVert\mathbf e_p\rVert_1+250\lVert\mathbf e_v\rVert_1$ | 见下 |
 
 **为什么终端用 L1 精确罚函数而不是硬等式？** 硬等式在“到不了台面”时会使问题**不可行**，求解器返回失败，飞行就没有规划可用。L1 罚把等式变成“尽量满足”，问题**永远可行**；而且当罚权重大于最优对偶乘子的无穷范数时，L1 罚是**精确的**——能到达时解和硬约束完全一样（Nocedal & Wright, *Numerical Optimization*, 第 17 章）。规划器再用 `reaches_pad`（终端位置误差 < 1 m、速度误差 < 0.8 m/s、滑翔锥松弛 < 1、推进剂松弛 ≈ 0）判断“真的到了没有”，见 §5.4.8。
 
@@ -373,14 +373,14 @@ $$
 
 两种模式（`PlanConfig3D.mode`）：
 
-- **`fuel` 燃料最优**（点火前 / 判断可达性）：$J=\sum_k w_k\,\sigma_k+\text{极小的加加速度项}$，$w_k$ 为梯形积分权重。因为 $\dot m\propto\sigma$，这就是耗油量。最优解自然是 §5.3 说的“滑行 + 一次猛烧”。
+- **`fuel` 燃料最优**（点火前 / 判断可达性）： $J=\sum_k w_k\,\sigma_k+\text{极小的加加速度项}$， $w_k$ 为梯形积分权重。因为 $\dot m\propto\sigma$，这就是耗油量。最优解自然是 §5.3 说的“滑行 + 一次猛烧”。
 - **`smooth` 平滑**（点火后，锁定触地时间）：
 
 $$
 J=0.02\sum_k w_k\sigma_k+0.05\sum_k w_k\bigl\lVert\mathbf u_k-g\hat{\mathbf z}\bigr\rVert^2+\frac{0.25}{\Delta t}\sum_k\lVert\mathbf u_{k+1}-\mathbf u_k\rVert^2_{W}+\sum_k w_k\Bigl(\lambda_r(t_{go})\lVert\mathbf r_{xy,k}\rVert^2+\lambda_v(t_{go})\lVert\mathbf v_{xy,k}\rVert^2\Bigr)+\ldots
 $$
 
-第二项 $\lVert\mathbf u-g\hat{\mathbf z}\rVert^2$ 是**净加速度能量**，让推力均匀而不是先猛后松；第三项是加加速度（jerk）惩罚，侧向权重再乘 8，避免“来回摇摆”；$\lambda_r,\lambda_v$ 随 $t_{go}$ 变小而增大（$t_{go}$=15/10/6/0 s 时位置权重 0.008/0.02/0.2/0.3），**把横向修正尽量推到高处去做**，最后几秒只剩近乎竖直的下降。后面还有“最后 10 s 侧向推力本身也有代价”等项。
+第二项 $\lVert\mathbf u-g\hat{\mathbf z}\rVert^2$ 是**净加速度能量**，让推力均匀而不是先猛后松；第三项是加加速度（jerk）惩罚，侧向权重再乘 8，避免“来回摇摆”； $\lambda_r,\lambda_v$ 随 $t_{go}$ 变小而增大（ $t_{go}$=15/10/6/0 s 时位置权重 0.008/0.02/0.2/0.3），**把横向修正尽量推到高处去做**，最后几秒只剩近乎竖直的下降。后面还有“最后 10 s 侧向推力本身也有代价”等项。
 
 `smooth` 里只保留很小的一份燃料项（0.02）：燃料项本身倾向于把制动往后推，权重大了会让规划“为省油而晚减速”。
 
@@ -390,7 +390,7 @@ $$
 
 #### 5.4.8 自由终端时间、滚动时域重规划与“绝不悬停”
 
-**自由终端时间的一维搜索。** 固定 $t_f$ 时问题是凸的；定义 $J^*(t_f)$ 为最优目标值，则最优终端时间是一维极小化问题。假设 $J^*(t_f)$ 单峰（Blackmore 等, 2010 采用同样的做法），用**黄金分割搜索**（`search_final_time`/`Planner3D.search`）：
+**自由终端时间的一维搜索。** 固定 $t_f$ 时问题是凸的；定义 $J^\star(t_f)$ 为最优目标值，则最优终端时间是一维极小化问题。假设 $J^\star(t_f)$ 单峰（Blackmore 等, 2010 采用同样的做法），用**黄金分割搜索**（`search_final_time`/`Planner3D.search`）：
 
 $$
 c=b-\varphi(b-a),\quad d=a+\varphi(b-a),\quad \varphi=\frac{\sqrt5-1}{2}\approx0.618
@@ -415,17 +415,17 @@ $$
 前馈是主角，反馈只修正残差。之后依次套用：
 
 1. **下沉包络**：离地 < 15 m，若 $v_z<-(1.2+0.5h)$ 则 $a_z\leftarrow a_z+2\,(v_{lim}-v_z)$ 刹住多余下沉；
-2. **倾角预算**（近地越来越竖直）：$\theta_{budget}(h)=\text{interp}\bigl(h;\ [0.3,1.5,3,12,40]\text{ m}\to[0.6°,2°,5°,10°,75°]\bigr)$，水平分量限制为 $\lVert\mathbf a_{xy}\rVert\le\tan\theta_{budget}\,a_z$；
+2. **倾角预算**（近地越来越竖直）： $\theta_{budget}(h)=\text{interp}\bigl(h;\ [0.3,1.5,3,12,40]\text{ m}\to[0.6°,2°,5°,10°,75°]\bigr)$，水平分量限制为 $\lVert\mathbf a_{xy}\rVert\le\tan\theta_{budget}\,a_z$；
 3. **推力方向转速限制**：指令方向的变化率不超过 8°/s（离地 2 m）→15°/s（30 m）→25°/s（300 m）——箭体这么大，追着方向跳变跑只会摇摆；
-4. **油门映射**：$\eta=\mathrm{clip}\bigl(m\lVert\mathbf a_{cmd}\rVert/(T_{avail}\cos\varepsilon),0,1\bigr)$，$\varepsilon$ 为体轴与指令方向夹角（$\varepsilon>25^\circ$ 时改为乘 $\mathrm{clip}(\cos\varepsilon,0.35,1)$，姿态没转到位就不猛推）；离地 > 1 m 保持最小节流的 90 %，避免熄火。
+4. **油门映射**： $\eta=\mathrm{clip}\bigl(m\lVert\mathbf a_{cmd}\rVert/(T_{avail}\cos\varepsilon),0,1\bigr)$， $\varepsilon$ 为体轴与指令方向夹角（ $\varepsilon>25^\circ$ 时改为乘 $\mathrm{clip}(\cos\varepsilon,0.35,1)$，姿态没转到位就不猛推）；离地 > 1 m 保持最小节流的 90 %，避免熄火。
 
-2D 版同样是前馈 + PD（$0.45,\ 1.5$，限幅 4 m/s²），倾角预算 $[0.3,1.5,3,12,40]\to[0.6°,2°,4°,6°,75°]$。
+2D 版同样是前馈 + PD（ $0.45,\ 1.5$，限幅 4 m/s²），倾角预算 $[0.3,1.5,3,12,40]\to[0.6°,2°,4°,6°,75°]$。
 
 ### 5.6 姿态控制与执行机构分配
 
 代码：`guidance3d.attitude_control`（3D）、`AutonomousGuidance._attitude`（2D）。
 
-**几何姿态误差（SO(3)）**。只给一个期望体轴 $\mathbf z_d$；期望的滚转取“离当前最近”的：$\mathbf x_d=\text{normalize}(\mathbf x_b-(\mathbf x_b\cdot\mathbf z_d)\mathbf z_d)$，$\mathbf y_d=\mathbf z_d\times\mathbf x_d$，$R_d=[\mathbf x_d\ \mathbf y_d\ \mathbf z_d]$。姿态误差用不含奇异性的几何形式（Lee, Leok & McClamroch, 2010）：
+**几何姿态误差（SO(3)）**。只给一个期望体轴 $\mathbf z_d$；期望的滚转取“离当前最近”的： $\mathbf x_d=\text{normalize}(\mathbf x_b-(\mathbf x_b\cdot\mathbf z_d)\mathbf z_d)$， $\mathbf y_d=\mathbf z_d\times\mathbf x_d$， $R_d=[\mathbf x_d\ \mathbf y_d\ \mathbf z_d]$。姿态误差用不含奇异性的几何形式（Lee, Leok & McClamroch, 2010）：
 
 $$
 \mathbf e_R=\tfrac12\bigl(R_d^\top R-R^\top R_d\bigr)^\vee,\qquad \lVert\mathbf e_R\rVert=\sin\theta_{err}
@@ -437,7 +437,7 @@ $$
 \boldsymbol\omega_{cmd}=-k_\theta\,\mathbf e_R\ (k_\theta=2),\qquad \boldsymbol\alpha_{cmd}=k_\omega(\boldsymbol\omega_{cmd}-\boldsymbol\omega)\ (k_\omega=4),\qquad \boldsymbol\tau_{cmd}=I\boldsymbol\alpha_{cmd}-\boldsymbol\tau_{aero,body}-\mathbf M_0
 $$
 
-$\boldsymbol\tau_{cmd}$ 是执行机构需要提供的力矩；$\boldsymbol\tau_{aero,body}$、$\mathbf M_0$ 是已知的箭体气动力矩和栅格舵零偏转力矩，直接**前馈抵消**。
+$\boldsymbol\tau_{cmd}$ 是执行机构需要提供的力矩； $\boldsymbol\tau_{aero,body}$、 $\mathbf M_0$ 是已知的箭体气动力矩和栅格舵零偏转力矩，直接**前馈抵消**。
 
 **制动距离限速（避免冲过头）。** 用匀减速运动学 $\omega^2=2\,a_{avail}\,\theta$，把角速度指令限制在执行机构“来得及刹住”的范围：
 
@@ -449,16 +449,16 @@ $\omega_{\max}=30^\circ/\text{s}$。这是消除“低推力时姿态摆动”�
 
 **力矩分配：栅格舵 → TVC → RCS。**
 
-1. **栅格舵**：在当前来流下用有限差分测出效能矩阵 $B$（俯仰/偏航/滚转指令 → 体轴力矩，`fin_effectiveness`：$B_{:,j}=[\mathbf M(+0.5\mathbf e_j)-\mathbf M(-0.5\mathbf e_j)]/1$），最小二乘 $\min\lVert B\mathbf f-\boldsymbol\tau\rVert_2$（`numpy.linalg.lstsq`）后限幅到 $[-1,1]$；空气太稀薄（效能 < 1500 N·m）时保持中立，在 1500–3000 N·m 之间逐渐接管，避免在近真空中“乱拍”。
-2. **万向节（TVC）**：推力 $T$、力臂 $L=z_c-z_{gimbal}$，需要的侧向分力 $F_y=\tau_x/L,\ F_x=-\tau_y/L$，则 $g_y=\arcsin(F_x/T)$，$g_x=\arcsin\!\bigl(-F_y/(T\cos g_y)\bigr)$，限幅 ±8°；
+1. **栅格舵**：在当前来流下用有限差分测出效能矩阵 $B$（俯仰/偏航/滚转指令 → 体轴力矩，`fin_effectiveness`： $B_{:,j}=[\mathbf M(+0.5\mathbf e_j)-\mathbf M(-0.5\mathbf e_j)]/1$），最小二乘 $\min\lVert B\mathbf f-\boldsymbol\tau\rVert_2$（`numpy.linalg.lstsq`）后限幅到 $[-1,1]$；空气太稀薄（效能 < 1500 N·m）时保持中立，在 1500–3000 N·m 之间逐渐接管，避免在近真空中“乱拍”。
+2. **万向节（TVC）**：推力 $T$、力臂 $L=z_c-z_{gimbal}$，需要的侧向分力 $F_y=\tau_x/L,\ F_x=-\tau_y/L$，则 $g_y=\arcsin(F_x/T)$， $g_x=\arcsin\!\bigl(-F_y/(T\cos g_y)\bigr)$，限幅 ±8°；
 3. **RCS**：TVC 限幅之后剩下的力矩、滚转轴力矩，以及发动机关闭时的全部力矩，由冷气推进器补足。
 
-**2D 姿态环**（`AutonomousGuidance._attitude`）：角度误差 $\to$ 限幅角速度指令（20°/s，带转向速率前馈）$\to$ 角加速度 $\alpha=k_\omega(\omega_{cmd}-\omega)$ $\to$ 按推力换算万向节角 $\delta=\arcsin\!\bigl(-\alpha I/(L\,T)\bigr)$（限幅 ±12°）。
+**2D 姿态环**（`AutonomousGuidance._attitude`）：角度误差 $\to$ 限幅角速度指令（20°/s，带转向速率前馈） $\to$ 角加速度 $\alpha=k_\omega(\omega_{cmd}-\omega)$ $\to$ 按推力换算万向节角 $\delta=\arcsin\!\bigl(-\alpha I/(L\,T)\bigr)$（限幅 ±12°）。
 
 ### 5.7 触地与成败判定
 
 - **关机**：任一着陆腿接触地面（`feet_contact>0`）立即节流归零，姿态回正，之后不再点火。
-- **LANDED**（`_check_landed`）：至少 3 只脚接触，$\lVert\mathbf v\rVert<0.25$ m/s，$\lVert\boldsymbol\omega\rVert<0.06$ rad/s，节流 < 5 %，并保持 0.8 s。
+- **LANDED**（`_check_landed`）：至少 3 只脚接触， $\lVert\mathbf v\rVert<0.25$ m/s， $\lVert\boldsymbol\omega\rVert<0.06$ rad/s，节流 < 5 %，并保持 0.8 s。
 - **验收标准**（测试脚本）：落点误差、触地下沉速度、水平速度、姿态角分别不超过 §8 表中的阈值，且全程无悬停、无接地前摇摆。
 - 2D 游戏规则里 LANDED 要求落点误差 ≤ 8 m、速度 ≤ 4 m/s、姿态 ≤ 12°、角速度 ≤ 20°/s；更严格的验收标准见 §8。
 
@@ -492,7 +492,7 @@ $$
 | 界面 | pygame 窗口，模拟舱风格仪表 | 浏览器 WebGL2，阿波罗 FDAI 姿态球 + MFD 着陆区显示器 |
 | 状态 | $(x,h,v_x,v_z)$，4 个 | $(\mathbf r,\mathbf v,\ln m)$，7 个 |
 | 质量 | 规划用加速度界，质量取当前值 | $\ln m$ 进入规划，推力界随质量变化 |
-| 点火时机 | 自由终端时间的燃料最优**搜索**（黄金分割），滑行→猛烧自然出现 | **解析点火预测器**（$f\ge0.62$） |
+| 点火时机 | 自由终端时间的燃料最优**搜索**（黄金分割），滑行→猛烧自然出现 | **解析点火预测器**（ $f\ge0.62$） |
 | 反推返航 | 规划“先烧后滑再烧”自然产生，标为 BOOSTBACK | **显式规则**（预测落点反馈） |
 | 气动 | 指数大气、阻力（倾斜时计入侧面阻力） | 工程气动模型 + 升力线性化 + 栅格舵物理模型 |
 | 姿态 | 1 自由度，万向节 + RCS | 四元数、SO(3) 误差、栅格舵 + 万向节 + RCS |
@@ -550,7 +550,7 @@ $$
 | 100 m，静止 | 68.1 m | 69.8 m | 2.5 % |
 | 2000 m，±30 m/s | 1393 m | 1374 m | 1.4 % |
 
-（$v_0=+30$ 与 $-30$ 给出相同的 $v_0^2$，所以公式对二者预测一致；仿真里两者点火高度也只差 0.5 m。公式没有计入大气阻力、1 m/s 的触地速度、油门起转和规划里额外的横向/倾角约束，剩余的 1–3 % 差异应主要来自这些简化。）2D 规划器自己“找出”的点火时机与经典 suicide-burn 理论吻合。
+（ $v_0=+30$ 与 $-30$ 给出相同的 $v_0^2$，所以公式对二者预测一致；仿真里两者点火高度也只差 0.5 m。公式没有计入大气阻力、1 m/s 的触地速度、油门起转和规划里额外的横向/倾角约束，剩余的 1–3 % 差异应主要来自这些简化。）2D 规划器自己“找出”的点火时机与经典 suicide-burn 理论吻合。
 
 ### 8.4 鲁棒性边界
 
@@ -655,7 +655,7 @@ ln -sf /etc/nginx/sites-available/rockt3d.conf /etc/nginx/sites-enabled/ && ngin
 2. **约束的作用。** 去掉滑翔锥、把倾角上限放宽、或把 3D 的 `Autopilot3D.sink_gain` 设为 0，各自会让轨迹和触地状态发生什么变化？
 3. **精确罚 vs 硬约束。** 把终端 L1 罚改成硬等式，构造一个“到不了台面”的初值，观察求解器返回什么；再用 `reaches_pad` 的判定思考 §5.4.8 的“最早可达”逻辑为什么必要。
 4. **FOH 与 ZOH。** 把推力改成分段常值（零阶保持），比较推力剖面的平滑度、燃料和跟踪误差。
-5. **自由终端时间。** 固定 $t_f$ 取不同值，画出 $J^*(t_f)$ 曲线，检验“单峰”假设是否成立；比较黄金分割与网格搜索所需的求解次数。
+5. **自由终端时间。** 固定 $t_f$ 取不同值，画出 $J^\star(t_f)$ 曲线，检验“单峰”假设是否成立；比较黄金分割与网格搜索所需的求解次数。
 6. **鲁棒性。** 用 `python metrics.py 3 '{}' '[{"aero":1.3}]'`（参数 `3` 是从 0 开始的场景下标，即场景 4；真实气动力放大 1.3 倍而制导仍用名义模型）复现 §8.4 里的失败，找出是哪一层失效（落点预测？升力线性化？点火时机？），设计改进。
 7. **执行机构极限。** 缩小万向节范围、降低节流速率或关掉栅格舵，看姿态环的“制动距离限速”如何维持稳定。
 8. **换一个规划器。** 参考 `scvx3d.py`，把逐次线性化换成 SCvx（信赖域 + 虚拟控制），比较连续两次规划之间的一致性。
@@ -671,7 +671,7 @@ ln -sf /etc/nginx/sites-available/rockt3d.conf /etc/nginx/sites-enabled/ && ngin
 - **3D 的反推返航和点火判定是启发式**，参数（350 m、180 m/s、0.62 等）是经验设定，不保证最优。
 - **气动是工程估算**，栅格舵、箭体升力的系数是示意值；实时 CFD 网格很粗、不含粘性，只用于可视化和限幅耦合。
 - **鲁棒性有限**：见 §8.4，气动力模型偏差较大时反推返航场景会失败。
-- 控制增益（$K_p,K_v,k_\theta,k_\omega$ 等）是经验设定的，没有做系统的增益整定或稳定裕度分析。
+- 控制增益（ $K_p,K_v,k_\theta,k_\omega$ 等）是经验设定的，没有做系统的增益整定或稳定裕度分析。
 
 ## 14. 参考文献
 
