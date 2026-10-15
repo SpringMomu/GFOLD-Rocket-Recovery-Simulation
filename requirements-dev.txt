@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=8
+ruff>=0.6
+# only for tools/check_airflow.py
+playwright>=1.45

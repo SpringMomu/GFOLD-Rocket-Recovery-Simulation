@@ -1,7 +1,11 @@
 """Quantitative acceptance metrics for the 3-D recovery (boost-back, glide, landing burn).
 
+    python -m tools.metrics 0,3 '{}' '[{"aero": 1.3}]'
+
+arguments: scenario indices, class-attribute overrides, list of perturbation dicts.
+
 run(sc, over={}, pert={}) -> dict
-  over : class attribute overrides for guidance3d.Autopilot3D / Planner3D  ({"A.x": v, "P.y": v})
+  over : class attribute overrides for Autopilot3D / Planner3D  ({"A.x": v, "P.y": v})
   pert : truth perturbations {aero, lift, thrust, wind, hdg, gust, seed}
 """
 from __future__ import annotations
@@ -16,13 +20,15 @@ import numpy as np
 def run(sc, over=None, pert=None, t_max=400.0):
     over = over or {}
     pert = pert or {}
-    import guidance3d
+    from lander3d.autopilot import Autopilot3D
+    from lander3d.planner import Planner3D
+    from lander3d.sim import PHYSICS_DT, Sim3D
+
+    from . import mc_harness as H
+
     for k, v in over.items():
         cls, name = k.split(".", 1)
-        target = guidance3d.Autopilot3D if cls == "A" else guidance3d.Planner3D
-        setattr(target, name, tuple(v) if isinstance(v, list) else v)
-    import mc_harness as H
-    from sim3d import Sim3D, PHYSICS_DT
+        setattr(Autopilot3D if cls == "A" else Planner3D, name, tuple(v) if isinstance(v, list) else v)
     sim = Sim3D(cfd=False)
     sim.load_scenario(sc)
     veh, ap = sim.vehicle, sim.autopilot
@@ -79,7 +85,6 @@ def run(sc, over=None, pert=None, t_max=400.0):
                 M["ign_miss"] = true_miss()
                 M["ign_q"] = float(veh.last.get("q", 0.0))
                 M["ign_line"] = float(np.linalg.norm(veh.pos[:2] + veh.vel[:2] * veh.altitude / max(1.0, -float(veh.vel[2]))))
-                M["mode"] = "vertical" if getattr(ap, "_vertical_mode", False) else "divert"
             prev_phase = ph
         if t_ign is not None and veh.feet_contact == 0 and veh.touchdown is None:
             tl = veh.tilt_deg()
@@ -99,17 +104,7 @@ def run(sc, over=None, pert=None, t_max=400.0):
                 M["h200_vz"] = float(veh.vel[2])
             if veh.altitude < 150 and abs(veh.vel[2]) < 3.0 and veh.altitude > 2.0:
                 lowslow += PHYSICS_DT
-            sp = getattr(ap, "_scvx_plan", None)
-            if sp is not None and sp is not last_plan:
-                if last_plan is not None and hasattr(last_plan, "t0"):
-                    dev = 0.0
-                    t_a = max(sp.t0, last_plan.t0)
-                    t_b = min(sp.t0 + sp.t_f, last_plan.t0 + last_plan.t_f)
-                    for tt in np.linspace(t_a, max(t_a, t_b), 8):
-                        dev = max(dev, float(np.linalg.norm(sp.sample(tt)[0] - last_plan.sample(tt)[0])))
-                    plans.append(dev)
-                last_plan = sp
-            p = ap.plan if sp is None else None
+            p = ap.plan
             if p is not None and p is not last_plan:
                 if last_plan is not None:
                     dev = 0.0
@@ -139,28 +134,36 @@ def run(sc, over=None, pert=None, t_max=400.0):
 
 
 def fmt(sc, M):
-    f = lambda k, n=1: ("-" if k not in M or M[k] is None or (isinstance(M[k], float) and math.isnan(M[k])) else f"{M[k]:.{n}f}")
+    def f(k, n=1):
+        value = M.get(k)
+        return "-" if value is None or (isinstance(value, float) and math.isnan(value)) else f"{value:.{n}f}"
+
     return (f"{sc} {M['state'][:6]:6s} bbEnd={f('bb_end_miss',0):>5} ignMiss={f('ign_miss',0):>4} ignLine={f('ign_line',0):>4} ignD={f('ign_d',0):>4} "
-            f"ignVh={f('ign_vh',0):>3} ignH={f('ign_alt',0):>5} {M.get('mode','-')[:4]} | burn={f('burn_s')}s tilt={f('max_tilt',0)} "
+            f"ignVh={f('ign_vh',0):>3} ignH={f('ign_alt',0):>5} | burn={f('burn_s')}s tilt={f('max_tilt',0)} "
             f"tilt<200={f('max_tilt_low',0)} rate95={f('tilt_rate_p95',0)} jump={f('jump_max',0)}/{f('jump_mean',0)} "
             f"ret={M['retimes']} climb={f('climb')} lowslow={f('lowslow')} | @200m d={f('h200_d',0)} vh={f('h200_vh',1)} vz={f('h200_vz',0)} burnVhMax={f('burn_vh_max',0)} | err={f('err')} vh={f('vh',2)} vz={f('vz',2)} prop={f('prop',0)}")
 
 
-if __name__ == "__main__":
+def run_job(job):
+    sc, over, pert = job
+    try:
+        return sc, pert, run(sc, over, pert)
+    except Exception as error:  # report the failure and keep the batch going
+        return sc, pert, dict(state="ERROR", reason=repr(error), retimes=0)
+
+
+def main() -> None:
     from multiprocessing import Pool
-    scen = [int(x) for x in sys.argv[1].split(",")]
+
+    scenarios = [int(x) for x in sys.argv[1].split(",")]
     over = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
     perts = json.loads(sys.argv[3]) if len(sys.argv) > 3 else [{}]
-    jobs = [(sc, over, p) for p in perts for sc in scen]
-
-    def one(j):
-        sc, o, p = j
-        try:
-            return sc, p, run(sc, o, p)
-        except Exception as e:  # pragma: no cover
-            return sc, p, dict(state="ERROR", reason=repr(e), retimes=0)
-
+    jobs = [(sc, over, p) for p in perts for sc in scenarios]
     with Pool(2, maxtasksperchild=1) as pool:
-        for sc, p, M in pool.imap_unordered(one, jobs):
+        for sc, p, M in pool.imap_unordered(run_job, jobs):
             tag = ",".join(f"{k}{v}" for k, v in p.items()) or "nominal"
             print(f"[{tag}] " + (fmt(sc, M) if M["state"] != "ERROR" else f"{sc} ERROR {M['reason']}"), flush=True)
+
+
+if __name__ == "__main__":
+    main()

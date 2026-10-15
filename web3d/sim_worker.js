@@ -1,10 +1,9 @@
 // Browser-side simulator: loads Pyodide and runs the Python 3D simulator
-// (rocket3d / aero3d / guidance3d with Clarabel / sim3d) in this worker.
-// Protocol (same data as the /api endpoints of main3d.py):
+// (the lander3d package, solved by Clarabel) in this worker.
+// Protocol (same data as the /api endpoints of lander3d/server.py):
 //   in:  {type: "input", keys, actions} | {type: "cfd", c_world}
 //   out: {type: "progress", text} | {type: "state", json} | {type: "error", text}
 const PYODIDE = "pyodide/";
-const SIM_FILES = ["rocket3d.py", "aero3d.py", "guidance.py", "guidance3d.py", "guidance3d_legacy.py", "sim3d.py", "main3d.py"];
 importScripts(PYODIDE + "pyodide.js");
 
 let glue = null;
@@ -19,13 +18,18 @@ async function main() {
   progress("正在加载 numpy / scipy / Clarabel…");
   await py.loadPackage(["numpy", "scipy", "clarabel"]);
   progress("正在加载仿真代码…");
-  py.FS.mkdirTree("/home/pyodide/sim");
-  const files = await Promise.all(SIM_FILES.map(async (f) => {
+  // py/manifest.json (written by deploy/build_web.py) lists the Python sources.
+  const manifest = await (await fetch("py/manifest.json", { cache: "no-cache" })).json();
+  const files = await Promise.all(manifest.map(async (f) => {
     const r = await fetch("py/" + f, { cache: "no-cache" });
     if (!r.ok) throw new Error(`py/${f}: HTTP ${r.status}`);
     return [f, await r.text()];
   }));
-  for (const [f, src] of files) py.FS.writeFile("/home/pyodide/sim/" + f, src);
+  for (const [f, src] of files) {
+    const path = "/home/pyodide/sim/" + f;
+    py.FS.mkdirTree(path.slice(0, path.lastIndexOf("/")));
+    py.FS.writeFile(path, src);
+  }
   const glueSrc = await (await fetch("sim_worker.py", { cache: "no-cache" })).text();
   const ns = py.globals.get("dict")();
   py.runPython(glueSrc, { globals: ns });

@@ -1,0 +1,23 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["dist", "native/target"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = [
+    "E501",    # long lines are tolerated in drawing code
+    "E741",    # single-letter names (l, I, O) are fine in the math code
+    "SIM108",
+    "RUF005",
+    "RUF012",  # class-level constants are plain data
+    "B905",    # zip() without strict=
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["common", "lander2d", "lander3d"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = ["slow: full closed-loop scenarios (run with `pytest -m slow`)"]

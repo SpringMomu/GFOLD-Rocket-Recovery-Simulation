@@ -2,7 +2,8 @@
 
     python deploy/build_web.py [out_dir]        (default: dist/web3d)
 
-Output: web3d/ front end + the simulator's Python sources (py/) + a trimmed
+Output: web3d/ front end + the simulator's Python sources (py/, listed in
+py/manifest.json) + a trimmed
 Pyodide distribution (pyodide/: runtime, numpy, scipy, clarabel and their
 dependencies).  Serve the directory with any static web server; no Python
 backend is needed.  Pyodide files are downloaded once into .cache/.
@@ -21,7 +22,7 @@ PYODIDE_VERSION = "0.28.3"
 CDN = f"https://cdn.jsdelivr.net/pyodide/v{PYODIDE_VERSION}/full/"
 CORE = ["pyodide.js", "pyodide.asm.js", "pyodide.asm.wasm", "python_stdlib.zip", "pyodide-lock.json"]
 PACKAGES = ["numpy", "scipy", "clarabel"]
-SIM_FILES = ["rocket3d.py", "aero3d.py", "guidance.py", "guidance3d.py", "guidance3d_legacy.py", "sim3d.py", "main3d.py"]
+SIM_PACKAGES = ["common", "lander3d"]
 
 
 def fetch(name: str, cache: Path) -> Path:
@@ -42,9 +43,12 @@ def main() -> None:
     if out.exists():
         shutil.rmtree(out)
     shutil.copytree(ROOT / "web3d", out)
-    (out / "py").mkdir()
-    for f in SIM_FILES:
-        shutil.copy2(ROOT / f, out / "py" / f)
+    sources = sorted(p.relative_to(ROOT).as_posix() for pkg in SIM_PACKAGES for p in (ROOT / pkg).rglob("*.py"))
+    for rel in sources:
+        target = out / "py" / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / rel, target)
+    (out / "py" / "manifest.json").write_text(json.dumps(sources), encoding="utf-8")
 
     pyo = out / "pyodide"
     pyo.mkdir()

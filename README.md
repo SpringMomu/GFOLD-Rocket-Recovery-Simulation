@@ -75,7 +75,7 @@ $$
 
 ## 3. 方法总览
 
-### 3.1 阶段流程（3D 自动驾驶，`guidance3d.py: Autopilot3D`）
+### 3.1 阶段流程（3D 自动驾驶，`lander3d/autopilot.py: Autopilot3D`）
 
 ```mermaid
 flowchart TD
@@ -105,7 +105,7 @@ flowchart TD
 | ⑥ 姿态与执行机构 | 把箭体轴对准指令方向 | SO(3) 几何误差 + 级联角速度环 + 制动距离限速 + 栅格舵→TVC→RCS 力矩分配 | $\mathbf e_R=\tfrac12(R_d^\top R-R^\top R_d)^\vee$、最小二乘分配（§5.6） | `attitude_control`、`fin_effectiveness` |
 | ⑦ 触地 | 判定成败 | 弹簧–阻尼接触模型；脚接触即关机 | $F_n=\max(0,k\delta-c\dot\delta)$（§5.7） | `Vehicle._contact/_check_landed` |
 
-2D 版（`main.py` + `guidance.py`）用**同一个凸规划思想**，但把“反推返航—滑行—点火”全部交给“自由终端时间的燃料最优搜索”自然产生（§7），是更适合入门的最小版本。
+2D 版（`lander2d/`）用**同一个凸规划思想**，但把“反推返航—滑行—点火”全部交给“自由终端时间的燃料最优搜索”自然产生（§7），是更适合入门的最小版本。
 
 ### 3.3 多速率结构
 
@@ -119,7 +119,7 @@ flowchart TD
 
 ## 4. 被控对象：物理与气动模型
 
-代码：`rocket3d.py`（刚体、发动机、大气、风、接触）、`aero3d.py`（气动力与栅格舵）。
+代码：`lander3d/vehicle.py`（刚体、发动机、大气、风、接触）、`lander3d/aero.py`（气动力与栅格舵）。
 
 ### 4.1 6 自由度刚体
 
@@ -181,7 +181,7 @@ $$
 u(z)=u_{10}\,\frac{\ln(z/z_0)}{\ln(10/z_0)},\quad z_0=0.05\ \text{m}
 $$
 
-### 4.4 气动力（工程模型，`aero3d.AeroModel`）
+### 4.4 气动力（工程模型，`lander3d/aero.py: AeroModel`）
 
 动压 $q=\tfrac12\rho\lVert\mathbf v_{rel}\rVert^2$，马赫数 $M=\lVert\mathbf v_{rel}\rVert/a$， $\mathbf v_{rel}=\mathbf v-\mathbf w$（风速 $\mathbf w$）。设箭体轴与来流的夹角为攻角 $\alpha$（相对迎风端），参考面积 $A_{ref}=\pi D^2/4$，侧面积 $A_{plan}=LD$。
 
@@ -283,7 +283,7 @@ $$
 
 ### 5.4 着陆燃烧：G-FOLD 凸优化（核心）
 
-代码：`guidance3d.py: Planner3D`（3D），`guidance.py: ConvexLandingPlanner`（2D）。
+代码：`lander3d/planner.py: Planner3D`（3D），`lander2d/planner.py: ConvexLandingPlanner`（2D）。
 
 #### 5.4.1 变量替换与松弛
 
@@ -423,7 +423,7 @@ $$
 
 ### 5.6 姿态控制与执行机构分配
 
-代码：`guidance3d.attitude_control`（3D）、`AutonomousGuidance._attitude`（2D）。
+代码：`lander3d/attitude.py: attitude_control`（3D）、`lander2d/autopilot.py: AutonomousGuidance._attitude`（2D）。
 
 **几何姿态误差（SO(3)）**。只给一个期望体轴 $\mathbf z_d$；期望的滚转取“离当前最近”的： $\mathbf x_d=\text{normalize}(\mathbf x_b-(\mathbf x_b\cdot\mathbf z_d)\mathbf z_d)$， $\mathbf y_d=\mathbf z_d\times\mathbf x_d$， $R_d=[\mathbf x_d\ \mathbf y_d\ \mathbf z_d]$。姿态误差用不含奇异性的几何形式（Lee, Leok & McClamroch, 2010）：
 
@@ -487,7 +487,7 @@ $$
 
 ## 7. 2D 版与 3D 版的差别
 
-| | 2D（`main.py` + `guidance.py`） | 3D（`main3d.py` + `guidance3d.py`） |
+| | 2D（`main.py` + `lander2d/`） | 3D（`main3d.py` + `lander3d/`） |
 | --- | --- | --- |
 | 界面 | pygame 窗口，模拟舱风格仪表 | 浏览器 WebGL2，阿波罗 FDAI 姿态球 + MFD 着陆区显示器 |
 | 状态 | $(x,h,v_x,v_z)$，4 个 | $(\mathbf r,\mathbf v,\ln m)$，7 个 |
@@ -519,7 +519,7 @@ $$
 
 通过条件：`LANDED`、落点 ≤ 3.5 m、下沉 ≤ 2.5 m/s、水平速度 ≤ 1.5 m/s、姿态 ≤ 5°。6 个场景全部通过。
 
-**无悬停/无摇摆检查**（`artifacts/check_landing_envelope.py` 的逻辑，要求：离地 > 1.5 m 时下沉速度不得小于 0.8 m/s；离地 < 8 m 时俯仰/偏航角速度 ≤ 12°/s；触地姿态 ≤ 1.5°）：
+**无悬停/无摇摆检查**（`tools/check_landing_envelope.py` 的逻辑，要求：离地 > 1.5 m 时下沉速度不得小于 0.8 m/s；离地 < 8 m 时俯仰/偏航角速度 ≤ 12°/s；触地姿态 ≤ 1.5°）：
 
 | 场景 | 1 | 2 | 3 | 4 | 5 | 6 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -554,7 +554,7 @@ $$
 
 ### 8.4 鲁棒性边界
 
-`metrics.py` / `mc_harness.py` 可以给“真实世界”加偏差，而制导仍按**名义模型**规划。下表是把 6 个场景各跑一遍的结果（同样用 Python 版 Clarabel；每格是“通过与否 落点误差 m / 水平速度 m/s”）。判据：`LANDED`、落点 ≤ 3.5 m、下沉 ≤ 2.5 m/s、水平速度 ≤ 1.5 m/s（此表未统计触地姿态）。
+`tools/metrics.py` / `tools/mc_harness.py` 可以给“真实世界”加偏差，而制导仍按**名义模型**规划。下表是把 6 个场景各跑一遍的结果（同样用 Python 版 Clarabel；每格是“通过与否 落点误差 m / 水平速度 m/s”）。判据：`LANDED`、落点 ≤ 3.5 m、下沉 ≤ 2.5 m/s、水平速度 ≤ 1.5 m/s（此表未统计触地姿态）。
 
 | 扰动 | 1 | 2 | 3 | 4 | 5 | 6 | 通过 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -567,7 +567,7 @@ $$
 **读表要点**（只陈述观测到的事实，原因留作研究问题）：
 
 - 名义条件下 6/6 通过；30 次带扰动的运行中 **20 次通过**。
-- **气动力**：真实气动力偏小 20 % 时 6/6 通过；偏大 15 % 起，反推返航场景（4）的落点偏差达到 6 m；偏大 30 % 时该场景**坠毁**（`metrics.py` 的诊断输出里，反推结束时按“真实气动力”算出的无动力落点仍偏约 104 m，名义条件下约 20 m），场景 5 落点偏 14 m。
+- **气动力**：真实气动力偏小 20 % 时 6/6 通过；偏大 15 % 起，反推返航场景（4）的落点偏差达到 6 m；偏大 30 % 时该场景**坠毁**（`tools/metrics.py` 的诊断输出里，反推结束时按“真实气动力”算出的无动力落点仍偏约 104 m，名义条件下约 20 m），场景 5 落点偏 14 m。
 - **推力**：真实推力比制导假设低 10 %（质量流量不变）时 3/6 通过，未通过的场景是水平速度或落点超标，场景 4 触地下沉达到 2.31 m/s（仍在 2.5 m/s 限内，但落点偏 11.7 m）。
 - **风**：10 m 风速翻倍到 12 m/s 时，场景 2、3 落点偏 12.7 m 和 16.7 m（水平速度也达 4.40、3.11 m/s），场景 4 落点偏 9.5 m，场景 1 仅水平速度超标（1.93 m/s），场景 5、6 仍然通过。
 - 这些是**开放的研究问题**：是落点预测、升力线性化、点火时机还是重规划的哪一环节先失效？见 §12 练习 6。
@@ -602,8 +602,18 @@ python main.py --record videos  # 2D：用游戏自己的渲染器离屏录制�
 在 Python 里直接调用 2D 场景：
 
 ```python
-from main import run_landing_scenario
+from lander2d.scenarios import run_landing_scenario
 print(run_landing_scenario(initial_altitude=2_000.0, horizontal_position=1_000.0, horizontal_speed=100.0))
+```
+
+**测试与检查**：
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest                       # 快速测试：求解器管道、2D 场景 1、3D 场景 1、状态 JSON
+python -m pytest -m slow               # 其余 2D / 3D 着陆场景（几分钟）
+ruff check .                           # 静态检查
+python -m tools.check_landing_envelope # 3D 无悬停 / 无摇摆包络（见 §8.1）
 ```
 
 **重新编译原生求解器**（改动了 `native/src/lib.rs` 之后；需要 Rust 工具链，Windows）：
@@ -626,42 +636,44 @@ ln -sf /etc/nginx/sites-available/rockt3d.conf /etc/nginx/sites-enabled/ && ngin
 
 ## 11. 代码地图与阅读顺序
 
-| 文件 | 内容 |
+| 路径 | 内容 |
 | --- | --- |
-| `guidance.py` | **2D 制导**：`ConvexLandingPlanner`（SOCP 装配 `build`、求解 `solve`、时间搜索 `search_final_time`）、`AutonomousGuidance`（重规划 `_replan`、最早可达 `_earliest_reachable_time`、内环 `command`、姿态 `_attitude`），以及 Clarabel 后端 `_NativeClarabelBackend` |
-| `main.py` | 2D 刚体与游戏、无窗口测试 `run_landing_scenario`、录像 |
-| `visuals.py`、`cockpit.py` | 2D 的箭体/尾焰/烟尘/着陆台，以及模拟舱风格仪表（只读遥测） |
-| `rocket3d.py` | **3D 刚体**：四元数、推进剂与质量特性、发动机、执行机构、大气、风、着陆腿与接触 |
-| `aero3d.py` | **3D 气动**：`AeroModel`、`grid_fin_forces`、`ExternalCFD` |
-| `guidance3d.py` | **3D 制导**：`Planner3D`（G-FOLD）、`Autopilot3D`（阶段逻辑）、`attitude_control`、`fin_effectiveness` |
-| `sim3d.py` | 仿真核心、6 个场景、KSP 式手动控制与 SAS |
-| `main3d.py` | 本地 HTTP 服务（`/api/state`、`/api/input`、`/api/cfd3d`）、实时循环、`--test` |
+| `main.py`、`main3d.py` | 2D / 3D 的命令行入口（游戏、`--landing-test` / `--test`、`--record`） |
+| `common/conic.py` | 2D 与 3D 共用的锥规划管道：原生 DLL 适配器 `NativeClarabel`、后端选择 `ConicSolver`、约束行/Hessian 装配器、黄金分割搜索 |
+| `lander2d/planner.py` | **2D 规划器**：`ConvexLandingPlanner`（SOCP 装配 `build`、求解 `solve`、时间搜索 `search_final_time`） |
+| `lander2d/autopilot.py` | **2D 制导**：`AutonomousGuidance`（重规划 `_replan`、最早可达 `_earliest_reachable_time`、内环 `command`、姿态 `_attitude`） |
+| `lander2d/rocket.py`、`game.py`、`scenarios.py`、`recording.py` | 2D 刚体；pygame 游戏循环；预设场景与无窗口回归 `run_landing_scenario`；离屏录像 |
+| `lander2d/camera.py`、`backdrop.py`、`dialog.py`、`visuals.py`、`cockpit.py` | 相机；天空与地面；初始状态对话框；箭体/尾焰/烟尘/着陆台；模拟舱风格仪表（只读遥测） |
+| `lander3d/vehicle.py` | **3D 刚体**：四元数、推进剂与质量特性、发动机、执行机构、大气、风、着陆腿与接触 |
+| `lander3d/aero.py` | **3D 气动**：`AeroModel`、`grid_fin_forces`、`ExternalCFD` |
+| `lander3d/planner.py` | **3D 规划器**：`Planner3D`（G-FOLD，含推进剂与升力线性化） |
+| `lander3d/autopilot.py` | **3D 制导**：`Autopilot3D`（滑行 / 反推返航 / 点火预测 / 着陆燃烧） |
+| `lander3d/attitude.py` | 姿态环 `attitude_control` 与栅格舵效能 `fin_effectiveness` |
+| `lander3d/sim.py`、`regression.py`、`server.py` | 仿真核心（6 个场景、KSP 式手动控制与 SAS）；`--test` 回归；本地 HTTP 服务（`/api/state`、`/api/input`、`/api/cfd3d`）与状态快照 |
 | `web3d/` | WebGL2 前端：`scene.js`（场景）、`fluid.js`（3D GPU 流体）、`tunnel.js`（风洞截面）、`instruments.js`（姿态球与 MFD）、`hud.js`、`sim_worker.js` + `sim_worker.py`（Pyodide 浏览器内仿真） |
 | `native/` | Rust 原生 Clarabel 包装（ABI 2） |
 | `deploy/` | 网页版打包 `build_web.py` 与 nginx 配置 |
+| `tools/` | 研究与检查脚本（`python -m tools.<名称>`）：带扰动的指标 `metrics`、鲁棒性实验 `mc_harness`、无悬停/无摇摆包络 `check_landing_envelope`、点火诊断 `ignition_diagnostic`、气流视觉检查 `check_airflow` |
+| `tests/` | pytest：求解器管道的单元测试，以及 2D / 3D 着陆回归（完整场景标记为 `slow`） |
 | `build_and_record.bat` | Windows 一键脚本：重新编译 DLL、跑 2D 回归、录制着陆视频（日志写入 `build_and_record.log`） |
-| `metrics.py`、`mc_harness.py` | 研究用：带扰动的指标采集与鲁棒性实验 |
-| `scvx3d.py` | 研究用：逐次凸化（SCvx）规划器的探索性实现，**未接入**当前自动驾驶 |
-| `guidance3d_legacy.py` | 早期 3D 制导，保留供对照，当前流程不使用 |
-| `artifacts/` | 检查脚本（无悬停/无摇摆包络、点火诊断、气流视觉检查） |
 
-**建议阅读顺序**：`rocket3d.py`（先弄懂被控对象）→ `guidance.py` 的 `ConvexLandingPlanner.build`（对照 §5.4 逐行看约束怎么装进矩阵）→ `AutonomousGuidance.command`（闭环）→ `aero3d.py` → `guidance3d.py`。
+**建议阅读顺序**：`lander3d/vehicle.py`（先弄懂被控对象）→ `lander2d/planner.py` 的 `ConvexLandingPlanner.build`（对照 §5.4 逐行看约束怎么装进矩阵）→ `lander2d/autopilot.py` 的 `AutonomousGuidance.command`（闭环）→ `lander3d/aero.py` → `lander3d/planner.py` → `lander3d/autopilot.py`。
 
 ## 12. 课题与练习
 
-每题都可以直接改常量、跑 `--test` 或 `metrics.py` 观察结果，并试着**用本文的公式解释现象**。
+每题都可以直接改常量、跑 `--test` 或 `tools/metrics.py` 观察结果，并试着**用本文的公式解释现象**。
 
-1. **验证 suicide-burn 公式。** 改变 2D 的 `ignition_thrust_fraction`（`guidance.py`）或初始速度，比较 §8.3 的闭式预测和仿真点火高度。差别主要来自哪几项？
+1. **验证 suicide-burn 公式。** 改变 2D 的 `ignition_thrust_fraction`（`lander2d/autopilot.py`）或初始速度，比较 §8.3 的闭式预测和仿真点火高度。差别主要来自哪几项？
 2. **约束的作用。** 去掉滑翔锥、把倾角上限放宽、或把 3D 的 `Autopilot3D.sink_gain` 设为 0，各自会让轨迹和触地状态发生什么变化？
 3. **精确罚 vs 硬约束。** 把终端 L1 罚改成硬等式，构造一个“到不了台面”的初值，观察求解器返回什么；再用 `reaches_pad` 的判定思考 §5.4.8 的“最早可达”逻辑为什么必要。
 4. **FOH 与 ZOH。** 把推力改成分段常值（零阶保持），比较推力剖面的平滑度、燃料和跟踪误差。
 5. **自由终端时间。** 固定 $t_f$ 取不同值，画出 $J^\star(t_f)$ 曲线，检验“单峰”假设是否成立；比较黄金分割与网格搜索所需的求解次数。
-6. **鲁棒性。** 用 `python metrics.py 3 '{}' '[{"aero":1.3}]'`（参数 `3` 是从 0 开始的场景下标，即场景 4；真实气动力放大 1.3 倍而制导仍用名义模型）复现 §8.4 里的失败，找出是哪一层失效（落点预测？升力线性化？点火时机？），设计改进。
+6. **鲁棒性。** 用 `python -m tools.metrics 3 '{}' '[{"aero":1.3}]'`（参数 `3` 是从 0 开始的场景下标，即场景 4；真实气动力放大 1.3 倍而制导仍用名义模型）复现 §8.4 里的失败，找出是哪一层失效（落点预测？升力线性化？点火时机？），设计改进。
 7. **执行机构极限。** 缩小万向节范围、降低节流速率或关掉栅格舵，看姿态环的“制动距离限速”如何维持稳定。
-8. **换一个规划器。** 参考 `scvx3d.py`，把逐次线性化换成 SCvx（信赖域 + 虚拟控制），比较连续两次规划之间的一致性。
+8. **换一个规划器。** 把逐次线性化换成 SCvx（信赖域 + 虚拟控制），比较连续两次规划之间的一致性。
 9. **换一个下降制导律。** 在 `Autopilot3D` 里用 §5.3 的 ZEM/ZEV 解析律替代凸规划，比较燃料、落点精度和对扰动的敏感度。
 10. **实现噪声与延迟。** 给测量加噪声、给指令加延迟，重新评估 §8 的表格。
-11. **补上缺失的前馈。** 3D 的 `Autopilot3D._fly_accel` 计算了推力方向的角速度 `_dir_rate`，但没有传给 `attitude_control(rate_bias=...)`（2D 的姿态环有转向速率前馈）。把它接上，观察接地前的姿态跟踪误差和角速度有什么变化——先提出假设，再用 `artifacts/check_landing_envelope.py` 的判据检验。
+11. **补上缺失的前馈。** 3D 的 `Autopilot3D._fly_accel` 计算了推力方向的角速度 `_dir_rate`，但没有传给 `attitude_control(rate_bias=...)`（2D 的姿态环有转向速率前馈）。把它接上，观察接地前的姿态跟踪误差和角速度有什么变化——先提出假设，再用 `tools/check_landing_envelope.py` 的判据检验。
 
 ## 13. 局限（请务必读）
 

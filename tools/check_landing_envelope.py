@@ -1,0 +1,70 @@
+"""Terminal-flight envelope check for the six 3D scenarios.
+
+    python -m tools.check_landing_envelope [--out DIR]
+
+Beyond the regression limits this checks that the booster never hovers (sink
+rate stays >= 0.8 m/s above 1.5 m) and never rocks near the ground (pitch/yaw
+rate <= 12 deg/s below 8 m, touchdown tilt <= 1.5 deg).  Writes
+``landing-envelope.json`` to DIR (default ``tools/out``); exit code 1 on failure.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from pathlib import Path
+
+from lander3d.sim import PHYSICS_DT, SCENARIOS, Sim3D
+
+MIN_SINK = 0.8          # m/s, while higher than HOVER_HEIGHT
+HOVER_HEIGHT = 1.5      # m
+MAX_LOW_RATE = 12.0     # deg/s, pitch/yaw rate below LOW_HEIGHT
+LOW_HEIGHT = 8.0        # m
+MAX_TOUCHDOWN_TILT = 1.5
+
+
+def check(index: int) -> dict:
+    sim = Sim3D(cfd=False)
+    sim.load_scenario(index)
+    vehicle = sim.vehicle
+    min_sink = math.inf
+    max_rate = 0.0
+    while sim.time < 260 and vehicle.state == "FLYING":
+        sim.step(PHYSICS_DT)
+        if vehicle.touchdown is None and sim.autopilot.phase == "LANDING BURN":
+            if vehicle.altitude > HOVER_HEIGHT:
+                min_sink = min(min_sink, -float(vehicle.vel[2]))
+            if vehicle.altitude < LOW_HEIGHT:
+                rate = math.degrees(max(abs(float(vehicle.omega[0])), abs(float(vehicle.omega[1]))))
+                max_rate = max(max_rate, rate)
+    td = vehicle.touchdown or {}
+    passed = (
+        vehicle.state == "LANDED"
+        and td.get("error", 99) <= 3.5
+        and abs(td.get("vz", 99)) <= 2.5
+        and td.get("vh", 99) <= 1.5
+        and td.get("tilt", 99) <= MAX_TOUCHDOWN_TILT
+        and min_sink >= MIN_SINK
+        and max_rate <= MAX_LOW_RATE
+    )
+    return {"scenario": sim.scenario_name, "pass": passed, "minimum_sink_above_1_5m": min_sink,
+            "maximum_pitch_yaw_rate_below_8m": max_rate, "touchdown": td}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--out", type=Path, default=Path(__file__).with_name("out"))
+    args = parser.parse_args()
+
+    results = []
+    for index in range(len(SCENARIOS)):
+        results.append(check(index))
+        print(json.dumps(results[-1]), flush=True)
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "landing-envelope.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+    return 0 if all(row["pass"] for row in results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
