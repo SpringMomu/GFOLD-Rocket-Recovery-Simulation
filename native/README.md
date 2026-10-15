@@ -5,8 +5,8 @@ This Rust `cdylib` links Clarabel 0.11.1 and exposes one generic entry point,
 
     minimise 1/2 x'Px + q'x   subject to   Ax + s = b,  s in {0}^z x R+^l x SOC(d1) x ... x SOC(dk)
 
-`guidance.ConvexLandingPlanner` assembles the powered-descent SOCP in Python
-and hands the CSC arrays to this DLL, so the native and Python paths solve
+The planners in `lander2d/planner.py` and `lander3d/planner.py` assemble the powered-descent SOCP in Python
+and hand the CSC arrays (through `common/conic.py`) to this DLL, so the native and Python paths solve
 identical matrices. Inputs are validated (sorted CSC, upper-triangular P,
 finite data, cone sizes summing to the row count) before Clarabel sees them.
 

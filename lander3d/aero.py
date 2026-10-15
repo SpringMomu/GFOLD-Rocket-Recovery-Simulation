@@ -27,7 +27,7 @@ import time
 
 import numpy as np
 
-from rocket3d import cross3, vnorm
+from .vehicle import cross3, vnorm
 
 
 # ------------------------------------------------------------ engineering
@@ -128,7 +128,7 @@ class AeroModel:
 
     def __init__(self, spec) -> None:
         self.spec = spec
-        self.cfd: "LBMWindTunnel | None" = None
+        self.cfd: ExternalCFD | None = None
         self.cfd_forces = False
         self.last: dict = {}
 
@@ -214,7 +214,6 @@ class AeroModel:
         perp = u - c * axis
         perp_n = float(vnorm(perp))
         f_axial = -math.copysign(1.0, c) * q * a_ref * ca * axis
-        f_normal = np.zeros(3)
         n_dir = np.zeros(3)
         if perp_n > 1e-6:
             n_dir = perp / perp_n
@@ -247,8 +246,7 @@ class AeroModel:
         moment_body = moment.copy()
         # Grid fins: four hinged lattice panels (deflection = control).
         f_fins, m_fins, _ = grid_fin_forces(s, R, zc, vehicle.omega, v_rel, rho, a_snd,
-                                            getattr(vehicle, "fin_defl", np.zeros(4)),
-                                            float(getattr(vehicle, "fins_deploy", 1.0)))
+                                            vehicle.fin_defl, float(vehicle.fins_deploy))
         total += f_fins
         moment += m_fins
 

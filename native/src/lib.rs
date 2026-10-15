@@ -1,6 +1,6 @@
 //! Native Clarabel backend for the powered-descent landing planner (ABI 2).
 //!
-//! The landing SOCP is assembled in Python (`guidance.ConvexLandingPlanner`),
+//! The landing SOCP is assembled in Python (`lander2d/planner.py`, `lander3d/planner.py`),
 //! so the Rust and Python paths always solve the *same* matrices.  This DLL
 //! is a thin, allocation-safe C ABI around Clarabel 0.11:
 //!

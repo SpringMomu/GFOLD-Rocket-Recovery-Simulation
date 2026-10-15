@@ -1,5 +1,10 @@
 """Robustness harness for the boost-back and unpowered-glide phases (3-D sim).
 
+    python -m tools.mc_harness cases.json results.jsonl
+
+``cases.json`` is a list of case dicts (see :func:`run`); results are written
+one JSON object per line.
+
 Truth model perturbations (guidance keeps its nominal model):
   aero_scale   : true aerodynamic force/moment = scale x engineering model
   lift_scale   : extra scale on the normal (lift) part only
@@ -14,9 +19,8 @@ import sys
 
 import numpy as np
 
-import guidance3d
-from rocket3d import Vehicle, G0, atmosphere, quat_from_axis_angle
-from sim3d import Sim3D, PHYSICS_DT
+from lander3d.sim import PHYSICS_DT, Sim3D
+from lander3d.vehicle import G0, atmosphere, quat_from_axis_angle
 
 
 class TruthAero:
@@ -48,9 +52,6 @@ def truth_impact(r, v, m, aero, s_aero, s_lift, wind, t0):
 
 def run(case: dict) -> dict:
     sim = Sim3D(cfd=False)
-    if case.get("patched"):
-        import guidance3d_patched
-        sim.autopilot = guidance3d_patched.Autopilot3D(sim.aero)
     sim.load_scenario(case.get("base", 3))
     veh = sim.vehicle
     ap = sim.autopilot
@@ -127,10 +128,10 @@ def run(case: dict) -> dict:
 
 
 if __name__ == "__main__":
-    cases = json.load(open(sys.argv[1]))
-    out = sys.argv[2]
     from multiprocessing import Pool
-    with Pool(2, maxtasksperchild=1) as pool, open(out, "w") as fh:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        cases = json.load(fh)
+    with Pool(2, maxtasksperchild=1) as pool, open(sys.argv[2], "w", encoding="utf-8") as fh:
         for res in pool.imap_unordered(run, cases):
             fh.write(json.dumps(res, default=float) + "\n")
             fh.flush()

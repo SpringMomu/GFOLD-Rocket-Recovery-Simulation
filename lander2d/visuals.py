@@ -1,6 +1,6 @@
 """World-space visuals: booster, engine plume, smoke/dust and the landing pad.
 
-Everything here only *draws*; physics lives in ``main.Rocket``.  Coordinates
+Everything here only *draws*; physics lives in ``rocket.Rocket``.  Coordinates
 are the simulator's world metres, converted with the simulator's
 ``world_to_screen``.  Glow effects use additive blending
 (``pygame.BLEND_RGB_ADD``) on small off-screen surfaces, and smoke uses a

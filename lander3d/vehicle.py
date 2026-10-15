@@ -23,14 +23,14 @@ What is modelled
 * Four landing legs that deploy (2 s), spring-damper feet with friction,
   and crash rules for hull impact, leg overload and tip-over.
 
-Aerodynamic forces come from ``aero3d.AeroModel`` (engineering model, or the
+Aerodynamic forces come from ``aero.AeroModel`` (engineering model, or the
 live CFD when enabled) and are passed in by the caller.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -173,7 +173,7 @@ class VehicleSpec:
     # axis.  The flow passes through the cells; deflecting a panel turns
     # the cells against the flow and the panel produces a force in the
     # tangential direction (and a moment about the centre of mass).  See
-    # aero3d.grid_fin_forces.
+    # aero.grid_fin_forces.
     fin_azimuth_deg: tuple = (0.0, 90.0, 180.0, 270.0)
     fin_area: float = 1.62           # panel area (1.35 m span x 1.2 m)
     fin_cn_alpha: float = 0.80       # normal-force slope per cell-wall set (1/rad, on fin_area)
@@ -182,7 +182,6 @@ class VehicleSpec:
     fin_max_defl: float = math.radians(20.0)
     fin_rate: float = math.radians(40.0)   # deflection rate limit (rad/s)
     fin_deploy_time: float = 1.5
-    fin_moment: tuple = (19.0, 19.0, 5.0)  # rough full-deflection moment per Pa (only for legacy code)
     tank_bottom: float = 2.0
     tank_top: float = 15.5
     dry_com_z: float = 7.0
@@ -238,6 +237,7 @@ class Vehicle:
         self.rcs = np.zeros(3)
         self.fins = np.zeros(3)          # last (pitch, yaw, roll) fin command actually mixed
         self.fin_defl = np.zeros(4)      # actual deflection of each panel (rad)
+        self.fin_model_cache = None      # (time, M0, B, deploy) memo of attitude.fin_effectiveness
         self.fins_deploy = 0.0 if on_pad else 1.0
         self.legs = 1.0 if on_pad else 0.0
         self.controls = Controls(legs_down=on_pad, fins_deploy=not on_pad)
@@ -250,7 +250,7 @@ class Vehicle:
         self.last = {"thrust": np.zeros(3), "aero": np.zeros(3), "aero_moment": np.zeros(3), "mass_flow": 0.0, "isp": s.isp_sl,
                      "thrust_mag": 0.0, "g": G0}
         if on_pad:
-            self.pos[2] = self._rest_height()
+            self.pos[2] = self.rest_height
 
     # --------------------------------------------------------- properties
     @property
@@ -272,10 +272,11 @@ class Vehicle:
     @property
     def altitude(self) -> float:
         """Height of the engine section base above the ground (0 when landed)."""
-        return float(self.pos[2] - self._rest_height())
+        return float(self.pos[2] - self.rest_height)
 
-    def _rest_height(self) -> float:
-        # Base height above ground when standing upright on deployed legs.
+    @property
+    def rest_height(self) -> float:
+        """Height of the engine-section base above ground when standing upright on deployed legs."""
         s = self.spec
         return -(s.leg_hinge_z + s.leg_length * math.cos(math.radians(145.0)))
 
@@ -366,7 +367,7 @@ class Vehicle:
         R = self.R
         com = self.pos + R @ np.array([0.0, 0.0, zc])
         h = float(com[2])
-        rho, p, T, a_snd = atmosphere(h)
+        rho, p, _, a_snd = atmosphere(h)
         g = G0 * (EARTH_RADIUS / (EARTH_RADIUS + max(0.0, h))) ** 2
 
         # Engine.
@@ -465,7 +466,7 @@ class Vehicle:
                 if self.state == "FLYING" and v[2] < -7.0:
                     self._crash("LEG FAILURE (HARD LANDING)")
                     return np.zeros(3), np.zeros(3)
-            elif self.state == "FLYING" and (vnorm(v) > 2.5 or not is_foot and self.legs < 0.95):
+            elif self.state == "FLYING" and (vnorm(v) > 2.5 or (not is_foot and self.legs < 0.95)):
                 self._crash("HULL IMPACT" if self.legs >= 0.95 else "IMPACT - LEGS NOT DEPLOYED")
                 return np.zeros(3), np.zeros(3)
             fn = max(0.0, k * depth - c_d * v[2])
