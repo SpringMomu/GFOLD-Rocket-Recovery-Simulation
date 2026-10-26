@@ -44,7 +44,14 @@ class Autopilot3D:
 
     burn_replan_period = 0.2
     coast_predict_period = 0.25
-    ignition_fraction = 0.62
+    # Ignition threshold (thrust fraction a constant-deceleration burn started
+    # now would need).  The later the ignition, the less gravity loss; the
+    # threshold adapts to how much of the 0.85 plan budget the burn will
+    # really have to spare (see _ignition_threshold).
+    ignition_fraction = 0.76      # straight-down burn: ~10 % below the plan cap
+    ignition_lateral_cut = 0.14   # less when the burn must also divert sideways
+    ignition_short = 0.48         # short hover-slam burns (t_burn <= 2 s) ...
+    ignition_mid = 0.62           # ... 5 s; full threshold from 8 s on
     burn_fraction_nominal = 0.85
     minimum_throttle = 0.20
     divert_tilt_deg = 65.0
@@ -218,6 +225,20 @@ class Autopilot3D:
         frac = m * float(np.linalg.norm(need)) / self._thrust_available(veh, r[2])
         return frac, t_b, need / float(np.linalg.norm(need))
 
+    def _ignition_threshold(self, t_burn, burn_dir):
+        """Latest safe ignition: the required thrust fraction at which to light.
+
+        A vertical burn lights at ``ignition_fraction``; the lateral share of
+        the burn (sin of its tilt) lowers it, since the plan then also needs
+        tilt and slew authority; short low burns light earlier so the burn
+        lasts long enough to trim drift without a late sideways swing.
+        """
+        lateral = float(np.linalg.norm(burn_dir[:2]))
+        ign = self.ignition_fraction - self.ignition_lateral_cut * min(1.0, lateral / 0.5)
+        if t_burn < 8.0:
+            ign = float(np.interp(t_burn, [2.0, 5.0, 8.0], [self.ignition_short, self.ignition_mid, ign]))
+        return ign
+
     def _ballistic(self, veh, r, v, m, wind_now, dt=0.25, t_max=240.0, stop_on_ignition=True):
         """Drag-aware coast prediction. Returns (points, impact_xy, t_impact, t_ignition, burn_time)."""
         pts = [r.copy()]
@@ -228,8 +249,8 @@ class Autopilot3D:
             rho, _, _, a = atmosphere(max(0.0, p[2]))
             f = self.aero.quick_force(u - wind_now, None, rho, a, 0.0) if self.aero is not None else np.zeros(3)
             if stop_on_ignition and not math.isfinite(t_ign):
-                frac, tb, _ = self._burn_need(veh, p, u, m, max(0.0, f[2] / m))
-                if frac >= self.ignition_fraction:
+                frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m))
+                if frac >= self._ignition_threshold(tb, bd):
                     t_ign, t_burn = t, tb
                     ign_p, ign_v = p.copy(), u.copy()
             acc = f / m + np.array([0.0, 0.0, -G0])
@@ -502,10 +523,7 @@ class Autopilot3D:
         self._mark()
         drag_up = max(0.0, float(veh.last["aero"][2]) / m)
         frac, t_burn, burn_dir = self._burn_need(veh, r, v, m, drag_up)
-        # Short, low burns (hover-slam) light a little earlier so the burn
-        # lasts long enough to trim drift without a late sideways swing.
-        ign = self.ignition_fraction if t_burn > 5.0 else float(np.interp(t_burn, [2.0, 5.0], [0.48, self.ignition_fraction]))
-        if frac >= ign:
+        if frac >= self._ignition_threshold(t_burn, burn_dir):
             self._ignite(veh, r, v, m, wind_now, t_burn)
             return
         c.throttle = 0.0
