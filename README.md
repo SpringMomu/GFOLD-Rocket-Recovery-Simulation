@@ -32,6 +32,7 @@
 - [12. 课题与练习](#12-课题与练习)
 - [13. 局限（请务必读）](#13-局限请务必读)
 - [14. 参考文献](#14-参考文献)
+- [15. 许可证](#15-许可证)
 
 ## 1. 你能从这个项目学到什么
 
@@ -702,6 +703,10 @@ ln -sf /etc/nginx/sites-available/rockt3d.conf /etc/nginx/sites-enabled/ && ngin
 13. L. H. Jorgensen. *Prediction of Static Aerodynamic Characteristics for Slender Bodies Alone and with Lifting Surfaces to Very High Angles of Attack.* NASA TR R-474, 1977. —— 横流法向力（§4.4）。
 14. J. Stam. *Stable Fluids.* SIGGRAPH, 1999. —— 半拉格朗日“稳定流体”（§9）。
 15. 其他：U.S. Standard Atmosphere, 1976（ISA）；G. P. Sutton, O. Biblarz, *Rocket Propulsion Elements*（比冲、推力与质量流量）。
+
+## 15. 许可证
+
+本项目采用 [MIT No Attribution（MIT-0）](LICENSE) 许可证：可以任意使用、复制、修改、合并、发布、分发、再许可和出售，无需保留版权声明或许可文本，也无需署名。软件按“原样”提供，不附带任何担保。
 
 ---
 
