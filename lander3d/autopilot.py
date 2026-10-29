@@ -18,17 +18,25 @@ from .vehicle import G0, atmosphere
 
 # Landing-burn tilt budget vs height (m -> deg): upright at contact.
 TILT_BUDGET = ([0.3, 1.5, 3.0, 12.0, 40.0], [0.6, 2.0, 5.0, 10.0, 75.0])
+# ... and vs dynamic pressure (Pa -> deg).
+Q_TILT_BUDGET = ([2500.0, 8000.0], [30.0, 12.0])
 
 
 class Autopilot3D:
     """Falcon-9 style recovery: coast -> (boost-back) -> one landing burn to touchdown.
 
-    * COAST: engine off, engines-first and aligned with the relative wind (the
-      grid fins make that attitude aerodynamically stable).  A drag-aware
-      ballistic prediction gives the impact point, and an ignition predictor
+    * COAST: engine off, engines-first, flying a small angle of attack whose
+      body/grid-fin lift steers the booster (zero-effort-miss guidance).
+      The aim point is not the drag-only impact but ``_burn_miss``: where
+      an upright landing burn lit at the predicted ignition would end.  The
+      glide thus removes the horizontal error and the burn only needs a
+      small, steady tilt.  An ignition predictor on the drag-aware coast
       decides the latest safe moment to light the engine.
-    * BOOSTBACK: only when the ballistic impact point is far from the pad; the
-      burn is steered so that the predicted impact moves onto the pad.
+    * BOOSTBACK: only when the ballistic impact point is far from the pad.
+      The velocity change is found by shooting on the coast so that the
+      same aim point lands on the pad, i.e. the booster really comes back
+      over the pad; when the pad is out of reach, or the fall would arrive
+      too shallow, the burn also lofts the trajectory (more time, steeper).
     * LANDING BURN: at ignition the touchdown time is locked and the 3-D
       G-FOLD SOCP (Planner3D) is re-solved every 0.2 s with a smooth
       objective; if the pad becomes unreachable the time moves to the
@@ -65,7 +73,11 @@ class Autopilot3D:
     boostback_miss = 350.0
     aero_steer_max_deg = 15.0
     lift_gradient_cap = 3.0       # body lift per radian of tilt, in units of thrust accel
-    boostback_done_miss = 25.0
+    boostback_done_dv = 2.0       # boost-back ends when the remaining velocity change is this small
+    boostback_gamma_ok = 10.0     # deg: flight path at ignition steeper than this needs no loft
+    boostback_loft_max = 80.0     # m/s of extra climb the boost-back may add for a longer, steeper fall
+    boostback_solve_period = 0.3
+    glide_gain = 1.5
     # attitude loop
     k_angle = 2.0
     k_rate = 4.0
@@ -92,7 +104,13 @@ class Autopilot3D:
         self._gate_xy = np.zeros(2)
         self._dir_rate = np.zeros(3)
         self._dt = 1.0 / 240.0
-        self._best_miss = math.inf
+        self._bb_dv = None
+        self._bb_v = None
+        self._bb_next = 0.0
+        self._bb_reserve = 0.0
+        self._ign_state = None
+        self._burn_miss_now = np.zeros(2)
+        self._brake_time = 0.0
         self.impact = None
         self.ignition_in = math.inf
         self.phase = "STANDBY"
@@ -262,6 +280,10 @@ class Autopilot3D:
             if p[2] <= 0.0:
                 break
         impact = p[:2].copy()
+        # State at the predicted ignition (or at the impact): the glide target.
+        self._ign_state = (t_ign, ign_p, ign_v, t_burn) if math.isfinite(t_ign) else (t, p.copy(), u.copy(), 0.0)
+        self._burn_miss_now, self._brake_time = (self._burn_miss(veh, ign_p, ign_v, m, wind_now) if math.isfinite(t_ign)
+                                                 else (p[:2].copy(), 0.0))
         if math.isfinite(t_ign):
             # Visual prediction: coast until ignition, then a smooth arc to the pad.
             k = int(t_ign / dt)
@@ -417,8 +439,12 @@ class Autopilot3D:
                 v_lim = -(self.gate_speed + self.sink_gain * max(0.0, h))
                 if v[2] < v_lim:
                     accel[2] += 2.0 * (v_lim - v[2])
-            # Tilt budget tightens with height: upright at contact.
-            max_tilt = math.radians(float(np.interp(h, *TILT_BUDGET)))
+            # Tilt budget tightens with height (upright at contact) and with
+            # dynamic pressure: there the body lift of an engines-first
+            # booster opposes its tilt and outweighs the thrust's sideways
+            # part, so more tilt would push the wrong way (and feed back).
+            q_dyn = float(veh.last.get("q", 0.0))
+            max_tilt = math.radians(min(float(np.interp(h, *TILT_BUDGET)), float(np.interp(q_dyn, *Q_TILT_BUDGET))))
         else:
             self.phase = "FALLBACK"
             a_max_now = s.thrust_sl / m
@@ -489,23 +515,25 @@ class Autopilot3D:
             self.next_predict = self.elapsed + self.coast_predict_period
         miss = float(np.linalg.norm(self.impact))
 
-        # ---- boost-back: move the ballistic impact point onto the pad.
+        # ---- boost-back: put the booster over the pad at ignition.
         airspeed = float(np.linalg.norm(v - wind_now))
         if not self._boostback_done and (self._boostback or (miss > self.boostback_miss and r[2] > 1200.0 and airspeed < 180.0)):
             self._boostback = True
             self.phase = "BOOSTBACK"
             self._mark()
-            t_fall = max(5.0, self.time_to_go)
-            # Aim slightly short of the pad; the landing burn removes the rest.
-            dv_h = -self.impact / t_fall
-            dvn = float(np.linalg.norm(dv_h))
-            self._best_miss = min(self._best_miss, miss)
-            if miss < self.boostback_done_miss or dvn < 0.4 or r[2] < 700.0 or miss > self._best_miss + 30.0:
+            if self.elapsed >= self._bb_next or self._bb_dv is None:
+                self._boostback_target(veh, r, v, m, wind_now)
+                self._bb_next = self.elapsed + self.boostback_solve_period
+            elif self._bb_v is not None:
+                self._bb_dv = self._bb_dv - (v - self._bb_v)   # velocity gained since the last solve
+                self._bb_v = v.copy()
+            dv = self._bb_dv
+            dvn = float(np.linalg.norm(dv)) if dv is not None else 0.0
+            if dv is None or dvn < self.boostback_done_dv or r[2] < 700.0 or veh.propellant < self._bb_reserve:
                 self._boostback = False
                 self._boostback_done = True
             else:
-                d = np.array([dv_h[0], dv_h[1], 0.3 * dvn]) / dvn
-                d /= np.linalg.norm(d)
+                d = dv / dvn
                 c.fins_deploy = False           # grid fins stay stowed for the boost-back
                 err = math.acos(max(-1.0, min(1.0, float(np.dot(veh.axis, d)))))
                 thr = float(np.clip(dvn / 8.0, 0.4, 0.9)) if err < math.radians(25.0) else 0.0
@@ -532,15 +560,17 @@ class Autopilot3D:
         vr = v - wind_now
         sp = float(np.linalg.norm(vr))
         if self.ignition_in < 3.0:
-            # Line up for the landing burn, but only pre-tilt as much as the
-            # altitude warrants (a low, short burn should start nearly upright).
+            # Line up for the landing burn: upright, plus the steady lateral
+            # deceleration of _burn_miss and what removes the rest of the
+            # aim-point miss (the glide has done the bulk of it).
+            t_b = max(2.0, self._brake_time)
+            a_lat = -v[:2] / t_b - 2.0 * self._burn_miss_now / t_b ** 2
+            a_z = max(G0, frac * self._thrust_available(veh, r[2]) / m * float(burn_dir[2]))
+            target = np.array([a_lat[0], a_lat[1], a_z])
+            target /= float(np.linalg.norm(target))
             cap = math.radians(float(np.clip(r[2] / 40.0, 1.0, 20.0)))
-            if float(np.linalg.norm(v[:2])) > 8.0:
-                cap = math.pi            # real divert: line up fully
-            tl = math.acos(max(-1.0, min(1.0, float(burn_dir[2]))))
-            target = burn_dir
-            if tl > cap:
-                hz = np.array([burn_dir[0], burn_dir[1], 0.0])
+            if math.acos(max(-1.0, min(1.0, float(target[2])))) > cap:
+                hz = np.array([target[0], target[1], 0.0])
                 hz /= max(1e-9, float(np.linalg.norm(hz)))
                 target = hz * math.sin(cap) + np.array([0.0, 0.0, math.cos(cap)])
         elif sp > 25.0:
@@ -550,36 +580,172 @@ class Autopilot3D:
         self.cmd_axis = target
         self._attitude(veh, target, use_rcs=True)
 
+    def _coast(self, veh, r, v, m, wind_now, dt=0.25, t_max=200.0):
+        """Drag-aware coast to the predicted ignition: ``(t_ign, p_ign, v_ign, t_burn)``, or None."""
+        if self.aero is None:
+            return None
+        p, u = r.copy(), v.copy()
+        t = 0.0
+        while t < t_max and p[2] > 0.0:
+            rho, _, _, a = atmosphere(max(0.0, p[2]))
+            f = self.aero.quick_force(u - wind_now, None, rho, a, 0.0)
+            frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m))
+            if frac >= self._ignition_threshold(tb, bd):
+                return t, p, u, tb
+            u = u + (f / m + np.array([0.0, 0.0, -G0])) * dt
+            p = p + u * dt
+            t += dt
+        return None
+
+    def _burn_miss(self, veh, p_ign, v_ign, m, wind_now, dt=0.2):
+        """Where a (nearly) upright landing burn lit at ``(p_ign, v_ign)`` ends.
+
+        Returns ``(miss_xy, t_brake)``.  The burn brakes at constant
+        deceleration until it meets the final-approach envelope (sink
+        <= gate_speed + sink_gain h), and must be over the pad, without
+        sideways speed, by then: over the braking time the horizontal speed
+        is bled off at the smallest steady rate (the rest is done by the
+        drag of the upright body), so the booster drifts about
+        ``v_ign t_brake / 2``.  The glide and the boost-back aim this point
+        at the pad: the burn then needs only a small, steady tilt -- at high
+        dynamic pressure a tilted engines-first booster gets a body lift
+        *against* its tilt, so a large sideways correction with the engine
+        is costly and fights itself."""
+        h0, vz0 = float(p_ign[2]) - self.gate_height, float(v_ign[2])
+        a_v = max(0.5, (vz0 ** 2 - self.gate_speed ** 2) / (2.0 * max(1.0, h0)))
+        # Braking time: the constant-deceleration profile sqrt(2 a_v h)
+        # meets the final-approach envelope near h = 2 a_v / sink_gain^2 (~100 m).
+        t_br, h, vz = 0.0, h0, vz0
+        while h > 0.0 and -vz <= self.gate_speed + self.sink_gain * h and t_br < 60.0:
+            vz += a_v * dt
+            h += vz * dt
+            t_br += dt
+        if t_br < dt:                       # already below the envelope: low, short burn
+            t_br = 0.6 * max(0.0, -vz0) / a_v
+        t_br = max(t_br, 1.0)
+        p, u = p_ign.copy(), v_ign.copy()
+        up = np.array([0.0, 0.0, 1.0])
+        t = 0.0
+        while t < t_br - 1e-9:
+            a_h = np.zeros(2)
+            if self.aero is not None:
+                rho, _, _, a = atmosphere(max(0.0, p[2]))
+                a_h = self.aero.quick_force(u - wind_now, up, rho, a, 0.0)[:2] / m
+            # steady thrust decel that stops the drift by t_br (drag does part of it)
+            a_h -= u[:2] / max(dt, t_br - t)
+            u[:2] += a_h * dt
+            u[2] += a_v * dt
+            p = p + u * dt
+            t += dt
+        return p[:2], t_br
+
+    def _boostback_target(self, veh, r, v, m, wind_now):
+        """Velocity change that brings the booster back over the pad.
+
+        Shooting on the drag-aware coast: Newton on the horizontal velocity
+        change so that the landing burn ends on the pad (``_burn_miss`` = 0),
+        and loft (extra climb) while that is out of reach or the flight path
+        at ignition is shallower than ``boostback_gamma_ok``: a longer,
+        steeper fall lets drag bleed the horizontal speed off.  Warm-started
+        between solves (every ``boostback_solve_period``)."""
+        dv = np.zeros(3) if self._bb_dv is None else self._bb_dv.copy()
+        if self._bb_v is not None:
+            dv -= v - self._bb_v
+        dv[2] = max(0.0, dv[2])
+
+        def shoot(x):
+            res = self._coast(veh, r, v + x, m, wind_now)
+            return None if res is None else (self._burn_miss(veh, res[1], res[2], m, wind_now)[0], res)
+
+        out = shoot(dv)
+        for _ in range(2):
+            if out is None or float(np.linalg.norm(out[0])) < 3.0:
+                break
+            J = np.zeros((2, 2))
+            for j in range(2):
+                e = np.zeros(3)
+                e[j] = 4.0
+                oj = shoot(dv + e)
+                if oj is None:
+                    J = None
+                    break
+                J[:, j] = (oj[0] - out[0]) / 4.0
+            if J is None or abs(np.linalg.det(J)) < 1e-6:
+                break
+            step = -np.linalg.solve(J, out[0])
+            sn = float(np.linalg.norm(step))
+            if sn > 80.0:
+                step *= 80.0 / sn
+            dv[:2] += step
+            out = shoot(dv)
+        if out is None:
+            # No ignition predicted: fall back to the drag-only impact point.
+            dv = np.zeros(3)
+            dv[:2] = -self.impact / max(5.0, self.time_to_go)
+            dv[2] = 0.3 * float(np.linalg.norm(dv[:2]))
+            self._bb_reserve = 0.0
+        else:
+            v_i = out[1][2]
+            # Loft (extra climb = more time) while the pad is out of reach,
+            # or while the fall would still be too shallow at ignition.
+            excess = float(np.linalg.norm(v_i[:2])) - math.tan(math.radians(self.boostback_gamma_ok)) * max(20.0, -float(v_i[2]))
+            if float(np.linalg.norm(out[0])) > 30.0:
+                excess = max(excess, 5.0)
+            dv[2] = float(np.clip(dv[2] + np.clip(excess, -5.0, 5.0), 0.0, self.boostback_loft_max))
+            # Keep the landing-burn propellant (with margin).
+            isp_g = veh.spec.isp_sl * G0
+            self._bb_reserve = 1.3 * m * (1.0 - math.exp(-(float(np.linalg.norm(v_i)) + 15.0) / isp_g)) + 250.0
+        self._bb_dv = dv
+        self._bb_v = v.copy()
+
     def _aero_steer(self, veh, r, v, m, wind_now):
         """Engines-first attitude with a small angle of attack whose body/grid-fin
-        lift moves the ballistic impact point toward the pad (Falcon-9 style)."""
+        lift steers the booster over the pad (Falcon-9 style glide).
+
+        Zero-effort-miss guidance on the drag-aware coast: the lateral
+        acceleration moves ``_burn_miss`` (where an upright landing burn from
+        the predicted ignition would end) onto the pad, so the glide -- not
+        the burn -- removes the horizontal error."""
         vr = v - wind_now
         sp = float(np.linalg.norm(vr))
         u = vr / sp
         base = -u
-        if self.impact is None or self.aero is None:
+        if self._ign_state is None or self.aero is None:
             return base
-        t_imp = max(3.0, self.time_to_go)
-        t_ign = min(max(1.5, self.ignition_in - 3.0), t_imp)   # finish before lining up for the burn
-        lever = t_ign * max(1.0, t_imp - 0.5 * t_ign)
-        a_des = np.array([-self.impact[0], -self.impact[1], 0.0]) / lever
+        t_i = self._ign_state[0]
+        miss = self._burn_miss_now
+        t_go = max(3.0, float(t_i))
+        # A constant lateral acceleration a held until ignition moves the
+        # aim point by about a (t^2/2 + t_brake t / 2).
+        a_des = np.zeros(3)
+        a_des[:2] = -self.glide_gain * miss / (0.5 * t_go ** 2 + 0.5 * self._brake_time * t_go)
         a_des -= u * float(np.dot(a_des, u))
         an = float(np.linalg.norm(a_des))
         if an < 0.02:
             return base
         e_a = a_des / an
         rho, _, _, a_snd = atmosphere(max(0.0, r[2]))
-        probe = math.radians(5.0)
-        best = None
-        for e in (-e_a, e_a):
-            axis = math.cos(probe) * base + math.sin(probe) * e
-            lift = float(np.dot(self.aero.quick_force(vr, axis, rho, a_snd, veh.legs), e_a))
-            if lift > 0 and (best is None or lift > best[1]):
-                best = (e, lift)
-        if best is None:
+        l0 = float(np.dot(self.aero.quick_force(vr, base, rho, a_snd, veh.legs), e_a))
+        a_max = math.radians(self.aero_steer_max_deg)
+
+        def lift(alpha, e):
+            axis = math.cos(alpha) * base + math.sin(alpha) * e
+            return float(np.dot(self.aero.quick_force(vr, axis, rho, a_snd, veh.legs), e_a)) - l0
+
+        # Engines-first, the lift points against the tilt: find the side that
+        # pushes along e_a, then the angle (secant on the real lift curve).
+        alpha = math.radians(5.0)
+        best = max(((e, lift(alpha, e)) for e in (-e_a, e_a)), key=lambda x: x[1])
+        e, l_a = best
+        if l_a <= 0.0:
             return base
-        e, lift = best
-        alpha = float(np.clip(an * m / (lift / probe), 0.0, math.radians(self.aero_steer_max_deg)))
+        for _ in range(2):
+            alpha = float(np.clip(alpha * an * m / l_a, 0.0, a_max))
+            if alpha >= a_max:
+                break
+            l_a = lift(alpha, e)
+            if l_a <= 0.0:
+                break
         return math.cos(alpha) * base + math.sin(alpha) * e
 
     def _ignite(self, veh, r, v, m, wind_now, t_burn):
