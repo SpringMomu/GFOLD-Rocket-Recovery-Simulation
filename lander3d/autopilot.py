@@ -96,6 +96,8 @@ class Autopilot3D:
         self.burn_locked = False
         self.touchdown_time: float | None = None
         self.burn_fraction = self.burn_fraction_nominal
+        self.thrust_scale = 1.0       # measured / modelled engine thrust (accelerometer estimate)
+        self._wind_ref = (np.zeros(3), 10.0)
         self._failed = 0
         self._boostback = False
         self._boostback_done = False
@@ -207,7 +209,8 @@ class Autopilot3D:
     def _config(self, veh, frac):
         s = veh.spec
         return PlanConfig3D(
-            mode="smooth", thrust_min=self.minimum_throttle * s.thrust_sl, thrust_max=frac * s.thrust_sl, isp=s.isp_sl,
+            mode="smooth", thrust_min=self.minimum_throttle * s.thrust_sl * self.thrust_scale,
+            thrust_max=frac * s.thrust_sl * self.thrust_scale, isp=s.isp_sl,
             dry_mass=s.dry_mass + 150.0, sigma_now=veh.throttle * s.thrust_sl / veh.mass,
             u_now=tuple(veh.last["thrust"] / veh.mass), engine_on=True,
             u_cmd=tuple(self.plan.sample(self.elapsed - self.plan.created_at)[2]) if self.plan is not None else None,
@@ -227,6 +230,13 @@ class Autopilot3D:
         return s.thrust_vac - (s.thrust_vac - s.thrust_sl) * min(1.0, p / 101_325.0)
 
     # ------------------------------------------------------- predictions
+    def _wind(self, z):
+        """Wind assumed at height ``z`` for the predictions: the wind measured
+        now, scaled with a standard log-law shear profile (roughness 5 cm)."""
+        w, z_now = self._wind_ref
+        shape = math.log(max(0.5, z) / 0.05) / math.log(max(0.5, z_now) / 0.05)
+        return w * float(np.clip(shape, 0.3, 3.0))
+
     def _burn_need(self, veh, r, v, m, drag_up):
         """(thrust fraction needed for a landing burn started now, burn time, thrust direction)."""
         g = G0
@@ -265,7 +275,7 @@ class Autopilot3D:
         t_ign, t_burn = math.inf, math.inf
         while t < t_max:
             rho, _, _, a = atmosphere(max(0.0, p[2]))
-            f = self.aero.quick_force(u - wind_now, None, rho, a, 0.0) if self.aero is not None else np.zeros(3)
+            f = self.aero.quick_force(u - self._wind(p[2]), None, rho, a, 0.0) if self.aero is not None else np.zeros(3)
             if stop_on_ignition and not math.isfinite(t_ign):
                 frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m))
                 if frac >= self._ignition_threshold(tb, bd):
@@ -319,7 +329,7 @@ class Autopilot3D:
                 # tracking margin (the smooth plan then is not saturated).
                 t_new = t_new + min(1.0, 0.08 * t_new)
                 self.burn_fraction = max(self.burn_fraction, frac)
-                cfg.thrust_max = self.burn_fraction * veh.spec.thrust_sl
+                cfg.thrust_max = self.burn_fraction * veh.spec.thrust_sl * self.thrust_scale
                 cfg.drag_model = self._drag_model(veh, wind_now, t_new)
                 smooth = P.solve(r, v, m, t_new, cfg)
                 if smooth is not None:
@@ -333,7 +343,7 @@ class Autopilot3D:
 
     def _earliest(self, r, v, m, cfg, t_go, veh):
         for frac in (self.burn_fraction, 0.92, 0.97):
-            chk = PlanConfig3D(**{**cfg.__dict__, "mode": "fuel", "thrust_max": frac * veh.spec.thrust_sl})
+            chk = PlanConfig3D(**{**cfg.__dict__, "mode": "fuel", "thrust_max": frac * veh.spec.thrust_sl * self.thrust_scale})
             ok = partial(self._reaches_pad, r, v, m, chk)
             lo = max(0.8, 0.6 * t_go)
             hi = max(t_go + 1.5, 1.5 * t_go)
@@ -383,6 +393,7 @@ class Autopilot3D:
             return
         self.elapsed += dt
         self._dt = dt
+        self._wind_ref = (np.asarray(wind_now, float).copy(), max(0.5, float(veh.altitude)))
         s = veh.spec
         r, v, m = self._state(veh)
         g = G0
@@ -405,6 +416,14 @@ class Autopilot3D:
         if not self.burn_locked:
             self._pre_ignition(veh, r, v, m, wind_now)
             return
+
+        # Engine performance from the measured thrust (accelerometer): a
+        # weaker-than-modelled engine shrinks the planner's thrust limits, so
+        # the plan does not count on braking it cannot deliver.
+        t_model = veh.throttle * self._thrust_available(veh, h)
+        if veh.throttle > 0.3 and t_model > 0.0:
+            ratio = float(np.clip(np.linalg.norm(veh.last["thrust"]) / t_model, 0.6, 1.1))
+            self.thrust_scale += (ratio - self.thrust_scale) * min(1.0, dt / 0.5)
 
         t_go = self.touchdown_time - self.elapsed
         # One burn all the way to leg contact: re-plan until the last ~0.6 s,
@@ -488,7 +507,7 @@ class Autopilot3D:
             self._dir_rate[2] = 0.0
         self._dir_prev = d.copy()
         err = math.acos(max(-1.0, min(1.0, float(np.dot(veh.axis, d)))))
-        t_av = self._thrust_available(veh, veh.pos[2])
+        t_av = self._thrust_available(veh, veh.pos[2]) * self.thrust_scale
         if err < math.radians(25.0):
             # Small attitude lag: deliver the commanded component along d.
             thr = float(np.clip(m * mag / (t_av * math.cos(err)), 0.0, 1.0))
@@ -588,7 +607,7 @@ class Autopilot3D:
         t = 0.0
         while t < t_max and p[2] > 0.0:
             rho, _, _, a = atmosphere(max(0.0, p[2]))
-            f = self.aero.quick_force(u - wind_now, None, rho, a, 0.0)
+            f = self.aero.quick_force(u - self._wind(p[2]), None, rho, a, 0.0)
             frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m))
             if frac >= self._ignition_threshold(tb, bd):
                 return t, p, u, tb
@@ -625,14 +644,16 @@ class Autopilot3D:
         t_br = max(t_br, 1.0)
         p, u = p_ign.copy(), v_ign.copy()
         up = np.array([0.0, 0.0, 1.0])
+        e0 = v_ign[:2] / max(1e-6, float(np.linalg.norm(v_ign[:2])))
         t = 0.0
         while t < t_br - 1e-9:
             a_h = np.zeros(2)
             if self.aero is not None:
                 rho, _, _, a = atmosphere(max(0.0, p[2]))
-                a_h = self.aero.quick_force(u - wind_now, up, rho, a, 0.0)[:2] / m
-            # steady thrust decel that stops the drift by t_br (drag does part of it)
-            a_h -= u[:2] / max(dt, t_br - t)
+                a_h = self.aero.quick_force(u - self._wind(p[2]), up, rho, a, 0.0)[:2] / m
+            # steady thrust decel that stops the along-track drift by t_br
+            # (drag does part of it); a cross wind is not fought with tilt
+            a_h -= e0 * max(0.0, float(np.dot(u[:2], e0))) / max(dt, t_br - t)
             u[:2] += a_h * dt
             u[2] += a_v * dt
             p = p + u * dt
