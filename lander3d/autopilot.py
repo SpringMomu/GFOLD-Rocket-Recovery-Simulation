@@ -75,7 +75,13 @@ class Autopilot3D:
     sink_gain = 0.5               # final approach: sink <= 1.2 + 0.5 h (m/s): 6.2 at 10 m, 2.2 at 2 m
     sink_track_height = 15.0      # the tracker enforces the envelope below this height
     legs_deploy_height = 450.0
-    boostback_miss = 350.0
+    # Boost-back from about this predicted miss on.  The glide cannot be relied
+    # on beyond ~100 m: a slow fall from 2 km (e.g. 180 m off at -30 m/s)
+    # reaches ignition fast (~120 m/s, ~9 kPa), where the angle-of-attack
+    # budget allows no sideways thrust, so the burn would divert only once
+    # slow -- near the ground, i.e. hovering sideways at ~80 m.  A boost-back
+    # of ~15 m/s up high costs far less and the burn stays nearly vertical.
+    boostback_miss = 120.0
     boostback_min_alt = 900.0     # start a boost-back only above this height ...
     boostback_end_alt = 500.0     # ... and stop it below this one (the landing burn diverts the rest)
     aero_steer_max_deg = 15.0
