@@ -13,7 +13,7 @@ from functools import partial
 import numpy as np
 
 from .attitude import attitude_control
-from .planner import Plan3D, PlanConfig3D, Planner3D
+from .planner import KeepOutBox, Plan3D, PlanConfig3D, Planner3D, along_path, detour_path, separating_planes
 from .vehicle import G0, atmosphere
 
 # Landing-burn tilt budget vs height (m -> deg): upright at contact.
@@ -105,14 +105,21 @@ class Autopilot3D:
         self.set_target()
         self.reset()
 
-    def set_target(self, base_z=None, rest_height=0.0, legs=True) -> None:
+    def set_target(self, base_z=None, rest_height=0.0, legs=True, obstacles=()) -> None:
         """Where the burn ends.  Default: standing on the pad (legs).  For a
         tower catch, ``base_z`` is the world height of the booster's base when
         its catch collar rests on the arms; the whole guidance then works in
         heights above that point (``h_off`` above the pad altitude) and the
-        legs stay stowed."""
+        legs stay stowed.  ``obstacles`` are keep-out boxes for the base point
+        in world coordinates (``(centre, axes, half)``, e.g. the catch tower);
+        the landing burn plans around them."""
         self.h_off = 0.0 if base_z is None else float(base_z) - float(rest_height)
         self.use_legs = legs
+        self._climb_ok = False
+        z0 = 0.0 if base_z is None else float(base_z)
+        self._z_ground = -z0                 # the ground, in planner heights (base point)
+        self.obstacles = [KeepOutBox(np.asarray(c, float) - np.array([0.0, 0.0, z0]), np.asarray(ax, float), np.asarray(hf, float))
+                          for c, ax, hf in obstacles]
 
     def reset(self) -> None:
         self.elapsed = 0.0
@@ -249,6 +256,33 @@ class Autopilot3D:
 
         return model
 
+    def _keep_out(self, veh):
+        """Keep-out half-spaces for the planner, linearised along the previous
+        plan -- if that one made it to the gate; otherwise (first plan, or a
+        plan stuck behind an obstacle, which would only reproduce itself)
+        along a geometric detour from here to the gate."""
+        if not self.obstacles:
+            return None
+        now = self.elapsed
+        r0 = self._state(veh)[0]
+        boxes = self.obstacles
+        path = detour_path(boxes, r0, np.zeros(3), z_min=self._z_ground + 1.0)
+        # Below the top of what stands in the way: the only way is up and over.
+        self._climb_ok = max(float(p[2]) for p in path) > float(r0[2]) + 1.0
+        prev = self.plan if self.burn_locked else None
+        if prev is not None and not prev.reaches(self._climb_ok):
+            prev = None
+
+        def planes(t_knots):
+            t_end = max(float(t_knots[-1]), 1e-6)
+            if prev is not None:
+                pts = [prev.sample(now + float(t) - prev.created_at)[0] for t in t_knots]
+            else:
+                pts = along_path(path, [float(t) / t_end for t in t_knots])
+            return separating_planes(boxes, pts, target=np.zeros(3))
+
+        return planes
+
     def _config(self, veh, frac):
         s = veh.spec
         return PlanConfig3D(
@@ -263,7 +297,7 @@ class Autopilot3D:
             max_tilt_deg=float(max(np.interp(self._height(veh), [20.0, 120.0, 500.0], [6.0, 14.0, self.divert_tilt_deg]),
                                    min(self.divert_tilt_deg, 2.0 * float(np.linalg.norm(veh.vel[:2]))))),
             touchdown_speed=self.gate_speed, target_alt=self.gate_height, target_xy=tuple(self._gate_xy),
-            sink_gain=self.sink_gain,
+            sink_gain=self.sink_gain, keep_out=self._keep_out(veh),
         )
 
     @staticmethod
@@ -368,7 +402,7 @@ class Autopilot3D:
         # the plan misses the pad by far: then only the earliest time that
         # does reach it can save the landing.
         lost = plan is None or plan.terminal_position_error > 10.0
-        if (plan is None or not plan.reaches_pad) and (t_go > 5.0 or lost):
+        if (plan is None or not plan.reaches(self._climb_ok)) and (t_go > 5.0 or lost):
             found = self._earliest(r, v, m, cfg, t_go, veh)
             if found is not None:
                 t_new, frac = found
@@ -394,7 +428,13 @@ class Autopilot3D:
         # sideways transfer at a modest acceleration.
         h, vz = max(0.0, float(r[2])), float(v[2])
         t_fall = (vz + math.sqrt(vz * vz + 2.0 * G0 * h)) / G0
-        t_far = t_fall + 2.0 * math.sqrt(float(np.linalg.norm(r[:2])) / 3.0) + float(np.linalg.norm(v[:2])) / 3.0
+        d = float(np.linalg.norm(r[:2]))
+        t_far = t_fall + 2.0 * math.sqrt(d / 3.0) + float(np.linalg.norm(v[:2])) / 3.0
+        # ... or, low down, at the planner's lateral-speed envelope (2 + 0.15 h,
+        # about half of it on average over the descent): a low, far booster
+        # may otherwise have no reachable time at all and fly a plan that misses.
+        P = self.planner
+        t_far = max(t_far, t_fall + d / max(3.0, 0.5 * (P.lateral_speed_floor + P.lateral_speed_gain * h)))
         for frac in (self.burn_fraction, 0.92, 0.97):
             chk = PlanConfig3D(**{**cfg.__dict__, "mode": "fuel", "thrust_max": frac * veh.spec.thrust_sl * self.thrust_scale})
             ok = partial(self._reaches_pad, r, v, m, chk)
@@ -417,7 +457,7 @@ class Autopilot3D:
 
     def _reaches_pad(self, r, v, m, cfg, t_f):
         plan = self.planner.solve(r, v, m, t_f, cfg)
-        return plan is not None and plan.reaches_pad
+        return plan is not None and plan.reaches(self._climb_ok)
 
     def _publish(self):
         p = self.plan

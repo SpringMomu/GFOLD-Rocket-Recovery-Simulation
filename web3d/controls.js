@@ -7,7 +7,8 @@ import * as ZH from "./zh.js";
 const $ = (id) => document.getElementById(id);
 // Same order as lander3d/sim.py SCENARIOS (action "scenario:<index>").
 const SCENARIOS = ["HOVER-SLAM 100 m", "2000 m / +30 m/s UP", "2000 m / -30 m/s DOWN", "BOOSTBACK +1000 m / 100 m/s",
-  "DIVERT -1000 m / 3-D", "ENTRY 12 km / 280 m/s", "TOWER CATCH 2000 m", "TOWER CATCH BOOSTBACK", "TOWER CATCH ENTRY 12 km"];
+  "DIVERT -1000 m / 3-D", "ENTRY 12 km / 280 m/s", "TOWER CATCH 2000 m", "TOWER CATCH BOOSTBACK", "TOWER CATCH ENTRY 12 km",
+  "TOWER CATCH OVER TOWER"];
 const PAD_KEY = "booster3d.pad.v1";
 
 export function initControls({ press, command, act }) {

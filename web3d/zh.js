@@ -18,6 +18,7 @@ export const SCENARIO = {
   "TOWER CATCH 2000 m": "筷子夹箭 · 2000 m 下降",
   "TOWER CATCH BOOSTBACK": "筷子夹箭 · 反推返航 +1000 m",
   "TOWER CATCH ENTRY 12 km": "筷子夹箭 · 12 km 再入",
+  "TOWER CATCH OVER TOWER": "筷子夹箭 · 塔后低空越塔",
   "RTLS 30 km / 450 m/s": "返场 · 30 km 分离 · 450 m/s",
   "RTLS 35 km / CROSSWIND": "返场 · 35 km 分离 · 强侧风",
   "RTLS 30 km / LOW FUEL": "返场 · 30 km 分离 · 推进剂 3 t",

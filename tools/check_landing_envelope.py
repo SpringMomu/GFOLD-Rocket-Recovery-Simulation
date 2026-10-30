@@ -4,7 +4,8 @@
 
 Beyond the regression limits this checks that the booster never hovers (sink
 rate stays >= 0.8 m/s above 1.5 m) and never rocks near the ground (pitch/yaw
-rate <= 12 deg/s below 8 m, touchdown tilt <= 1.5 deg).  Heights are above
+rate <= 12 deg/s below 8 m, touchdown tilt <= 1.5 deg); a scenario may set a
+lower "min_sink" (flying over the catch tower levels off above it).  Heights are above
 the end of the burn: the pad, or for a catch the collar on the arms.  Writes
 ``landing-envelope.json`` to DIR (default ``tools/out``); exit code 1 on failure.
 """
@@ -31,6 +32,7 @@ def check(index: int) -> dict:
     sim.load_scenario(index)
     vehicle = sim.vehicle
     min_sink = math.inf
+    sink_limit = SCENARIOS[index].get("min_sink", MIN_SINK)
     max_rate = 0.0
     while sim.time < 260 and vehicle.state == "FLYING":
         sim.step(PHYSICS_DT)
@@ -45,7 +47,7 @@ def check(index: int) -> dict:
     ok = (
         passed(vehicle, sim.tower is not None)
         and td.get("tilt", 99) <= MAX_TOUCHDOWN_TILT
-        and min_sink >= MIN_SINK
+        and min_sink >= sink_limit
         and max_rate <= MAX_LOW_RATE
     )
     return {"scenario": sim.scenario_name, "pass": ok, "minimum_sink_above_1_5m": min_sink,

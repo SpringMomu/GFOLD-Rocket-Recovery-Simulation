@@ -73,6 +73,10 @@ CARRIAGE_K, CARRIAGE_C = 2.0e5, 1.1e5
 CARRIAGE_TRAVEL = 1.5
 FACE_K, FACE_C, FACE_FORCE_MAX = 4.0e5, 4.0e4, 6.0e4
 ARM_IMPACT_SPEED = 3.0         # m/s at the face: faster is a collision
+# Keep-out boxes for the planner: margin beyond the barrel (sideways) and
+# beyond the base/top of the booster (vertically).
+KEEP_OUT_MARGIN = 2.0
+KEEP_OUT_MARGIN_Z = 1.5
 SETTLE_TIME = 0.8
 
 
@@ -106,6 +110,39 @@ class CatchTower:
     def catch_base_z(self) -> float:
         """World z of the booster base (body origin) when the collar rests on the unloaded arms."""
         return ARM_TOP - CATCH_COLLAR_Z
+
+    @staticmethod
+    def keep_out_boxes(spec):
+        """Obstacles for the booster's base point (world): the tower, both arms
+        in their READY pose (where they wait during the approach) and the
+        launch mount, each grown by the barrel radius, the body extent above
+        and below the base, and a margin.  Returned as
+        (centre, axes 3x3, half extents) tuples."""
+        r = BODY_RADIUS + KEEP_OUT_MARGIN
+        up = spec.length + KEEP_OUT_MARGIN_Z            # body above the base
+        down = -spec.nozzle_exit_z + KEEP_OUT_MARGIN_Z  # nozzle below the base
+        boxes = []
+
+        def add(c, axes, half):
+            boxes.append((np.asarray(c, float), np.asarray(axes, float), np.asarray(half, float)))
+
+        def span(z0, z1):                               # obstacle z-range -> base z-range
+            lo, hi = z0 - up, z1 + down
+            return 0.5 * (lo + hi), 0.5 * (hi - lo)
+
+        zc, zh = span(-100.0, TOWER_TOP)
+        add(((TOWER_X[0] + TOWER_X[1]) / 2, 0.0, zc), np.eye(3),
+            ((TOWER_X[1] - TOWER_X[0]) / 2 + r, TOWER_HALF_Y + r, zh))
+        zc, zh = span(-100.0, MOUNT_TOP)
+        add((0.0, 0.0, zc), np.eye(3), (MOUNT_RADIUS + r, MOUNT_RADIUS + r, zh))
+        zc, zh = span(ARM_TOP - ARM_DEPTH, ARM_TOP)
+        a = ARM_READY
+        for sgn in (1.0, -1.0):
+            d = np.array([math.cos(a), sgn * math.sin(a), 0.0])
+            n = np.array([math.sin(a), -sgn * math.cos(a), 0.0])
+            c = np.array([PIVOT_X, sgn * PIVOT_Y, 0.0]) + d * ARM_LENGTH / 2
+            add((c[0], c[1], zc), np.column_stack([d, n, [0.0, 0.0, 1.0]]), (ARM_LENGTH / 2 + r, ARM_HALF_WIDTH + r, zh))
+        return boxes
 
     def arms(self):
         """For each arm: (pivot, along-arm unit vector, inward unit normal)."""
