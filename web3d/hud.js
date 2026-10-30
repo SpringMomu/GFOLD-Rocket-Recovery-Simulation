@@ -7,7 +7,7 @@ import * as ZH from "./zh.js";
 
 const $ = (id) => document.getElementById(id);
 const PHASES = ["COAST", "BOOSTBACK", "LANDING BURN", "LANDED"];
-const PHASE_COL = { STANDBY: "#7f93a6", MANUAL: "#46d6ff", COAST: "#46d6ff", BOOSTBACK: "#ff5ef0", "LANDING BURN": "#ffb43c", TERMINAL: "#5dff9a", LANDED: "#5dff9a", CAUGHT: "#5dff9a", FALLBACK: "#ff5a4e" };
+const PHASE_COL = { STANDBY: "#7f93a6", MANUAL: "#46d6ff", COAST: "#46d6ff", BOOSTBACK: "#ff5ef0", "LANDING BURN": "#ffb43c", "CATCH HOLD": "#ffb43c", TERMINAL: "#5dff9a", LANDED: "#5dff9a", CAUGHT: "#5dff9a", FALLBACK: "#ff5a4e" };
 
 function fmt(x, d = 1) { return x === null || x === undefined || !isFinite(x) ? "--" : x.toFixed(d); }
 function kN(n) { return Math.abs(n) >= 1e5 ? (n / 1000).toFixed(0) + " kN" : (n / 1000).toFixed(1) + " kN"; }
@@ -280,7 +280,8 @@ export class HUD {
     }
     $("apMode").textContent = st.autopilot ? "G-FOLD 3D" : "手动";
     $("solver").textContent = ZH.backend(st.solver.backend);
-    $("solStat").textContent = ZH.solverStatus(st.solver.status) + (st.solver.locked ? " · 触地时间已锁定" : "");
+    $("solStat").textContent = ZH.solverStatus(st.solver.status) + (st.solver.locked ? " · 触地时间已锁定" : "")
+      + (st.solver.relax ? ` · 约束放宽 ${st.solver.relax} 级` : "");
     $("solves").textContent = st.solver.solves;
     $("margin").textContent = (st.solver.margin * 100).toFixed(0) + " %";
     $("cmdThr").textContent = st.cmd_throttle === null ? "--" : (st.cmd_throttle * 100).toFixed(0) + " %";

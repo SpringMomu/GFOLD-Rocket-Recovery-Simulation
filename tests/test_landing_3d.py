@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from lander3d.planner import KeepOutBox, along_path, detour_path, separating_planes
+from lander3d.planner import KeepOutBox, Plan3D, along_path, detour_path, separating_planes
 from lander3d.regression import run_scenario
 from lander3d.server import finite, snapshot
 from lander3d.sim import SCENARIOS, Sim3D
@@ -39,6 +39,20 @@ def test_keep_out_goes_over_the_tower_and_keeps_east_of_it_at_the_end():
     # at the gate the tower plane is its east face, which the gate satisfies
     (_, n, b), = [kp for kp in separating_planes(boxes[:1], [gate], target=gate)]
     assert np.allclose(n, [1.0, 0.0, 0.0]) and n @ gate >= b
+
+
+def test_relaxed_plans_are_judged_without_the_limits_they_relax():
+    z = np.zeros(3)
+    plan = Plan3D(t_f=10.0, dt=1.0, r=z, v=z, z=z, u=z, sigma=z, drag=z, status="Solved", objective=0.0,
+                  terminal_position_error=0.2, terminal_velocity_error=0.1, glide_violation=0.0, fuel_violation=0.0,
+                  lateral_violation=8.0, climb_violation=0.0)
+    assert not plan.reaches_pad                      # far too fast sideways for the normal limits
+    plan.relax = 1
+    assert not plan.reaches_pad                      # level 1 only frees the vertical profile
+    plan.relax = 2
+    assert plan.reaches_pad
+    plan.climb_violation = 3.0                       # ... but even relaxed, no climbing beyond 5 m/s
+    assert not plan.reaches_pad
 
 
 def test_snapshot_is_valid_json_for_the_browser():
