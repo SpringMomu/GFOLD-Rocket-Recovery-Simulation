@@ -2,7 +2,7 @@
 
     python deploy/build_web.py [out_dir]        (default: dist/web3d)
 
-Output: web3d/ front end + the simulator's Python sources (py/, listed in
+Output: web3d/ front end + LICENSE and NOTICE + the simulator's Python sources (py/, listed in
 py/manifest.json) + a trimmed
 Pyodide distribution (pyodide/: runtime, numpy, scipy, clarabel and their
 dependencies).  Serve the directory with any static web server; no Python
@@ -43,6 +43,8 @@ def main() -> None:
     if out.exists():
         shutil.rmtree(out)
     shutil.copytree(ROOT / "web3d", out)
+    for name in ("LICENSE", "NOTICE"):          # Apache-2.0: redistributions carry both
+        shutil.copy2(ROOT / name, out / name)
     sources = sorted(p.relative_to(ROOT).as_posix() for pkg in SIM_PACKAGES for p in (ROOT / pkg).rglob("*.py"))
     for rel in sources:
         target = out / "py" / rel
