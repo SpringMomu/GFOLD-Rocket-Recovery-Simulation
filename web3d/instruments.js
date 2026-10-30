@@ -354,7 +354,7 @@ export class LandingND {
     L.forEach((k, i) => this.keys.push({ x: 8, y: sy + i * (bh + gap), w: bw, h: bh, side: "L", label: k[0], sub: k[1], fn: k[2], on: k[3], dyn: k[4] }));
     Rk.forEach((k, i) => this.keys.push({ x: this.W - 8 - bw, y: sy + i * (bh + gap), w: bw, h: bh, side: "R", label: k[0], sub: k[1], fn: k[2], on: k[3], dyn: k[4] }));
     this.pressed = null;
-    canvas.addEventListener("mousedown", (e) => {
+    canvas.addEventListener("pointerdown", (e) => {
       const r = canvas.getBoundingClientRect();
       const x = (e.clientX - r.left) * this.W / r.width, y = (e.clientY - r.top) * this.H / r.height;
       for (const k of this.keys) if (x >= k.x && x <= k.x + k.w && y >= k.y && y <= k.y + k.h) {

@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>一级火箭回收着陆仿真 3D</title>
 <style>
 :root {
@@ -23,7 +23,7 @@
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: #04070c; color: var(--txt); font-family: var(--mono); overflow: hidden; user-select: none; }
-#view { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+#view { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; touch-action: none; }
 .panel {
   position: fixed; background: var(--glass); border: 1px solid var(--edge); border-radius: 6px;
   box-shadow: 0 6px 24px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.05);
@@ -143,13 +143,119 @@ kbd { font-family: var(--mono); background: rgba(255,255,255,0.08); border: 1px 
   color: rgba(255,255,255,0.72); font-weight: 400; letter-spacing: 0.32em; font-size: 10px; }
 #propPanel h3 .tag { color: rgba(255,255,255,0.9); letter-spacing: 0.2em; }
 #propCv { width: 320px; height: 200px; display: block; }
-@media (max-width: 1100px) { #events { display: none; } }
+#propPanel.collapsed > h3 { margin: -4px -10px; padding: 4px 10px; border-bottom: none; letter-spacing: 0.14em; font-size: 10.5px; }
+@media (max-width: 1100px) and (pointer: fine) { #events { display: none; } }
+
+/* ---------------------------------------------------------- folding panels */
+/* Every panel has a fold button (in its title bar, or in the corner); a
+   folded panel shrinks to a small labelled pill that can still be dragged,
+   and a tap on the pill opens it again. */
+.fold { flex: none; width: 20px; height: 18px; margin-left: 8px; padding: 0; border: 1px solid var(--edge); border-radius: 3px;
+  background: rgba(0,0,0,0.35); color: var(--txt); font: 600 13px/15px var(--mono); cursor: pointer; touch-action: manipulation; }
+.fold:hover { border-color: var(--edge-hi); color: #fff; }
+.panel > .fold { position: absolute; right: 4px; top: 4px; z-index: 4; margin: 0; }
+.panel h3 .ttl { flex: 1; }
+.panel h3 { touch-action: none; }
+.grip { touch-action: none; }
+.panel.collapsed { width: auto !important; height: auto !important; min-width: 0 !important; min-height: 0 !important; max-height: none !important;
+  resize: none !important; overflow: visible !important; padding: 4px 10px !important; background: var(--glass) !important;
+  border: 1px solid var(--edge) !important; border-radius: 6px !important; box-shadow: 0 4px 14px rgba(0,0,0,0.45) !important;
+  backdrop-filter: blur(6px) !important; cursor: grab; touch-action: none; }
+.panel.collapsed > :not(h3):not(.fold) { display: none !important; }
+.panel.collapsed > h3 { margin: -4px -10px; padding: 4px 10px; border-bottom: none; background: none; gap: 6px; }
+.panel.collapsed > h3 .tag { display: none; }
+.panel.notitle.collapsed { padding: 4px 32px 4px 10px !important; font-size: 10.5px; letter-spacing: 0.14em; color: var(--dim); font-weight: 600; }
+.panel.notitle.collapsed::before { content: attr(data-title); }
+.panel.notitle.collapsed > .fold { top: 50%; transform: translateY(-50%); }
+#tunnelPanel.collapsed::after { display: none; }
+
+/* -------------------------------------------------------------- menu bar */
+#toolbar { left: 50%; transform: translateX(-50%); top: 84px; width: 300px; }
+#toolbar .tb { display: flex; flex-wrap: wrap; gap: 5px; }
+#toolbar select, #toolbar button:not(.fold), #pad button:not(.fold) {
+  font: inherit; font-size: 11.5px; color: var(--txt); background: rgba(0,0,0,0.4); border: 1px solid rgba(140,190,225,0.32);
+  border-radius: 4px; padding: 4px 8px; cursor: pointer; touch-action: manipulation; }
+#toolbar select { width: 100%; padding: 5px 6px; background: rgba(4,8,14,0.85); }
+#toolbar button.on, #pad button.on { color: #00161f; background: var(--cyan); border-color: var(--cyan); }
+#toolbar button:not(.fold):hover { border-color: var(--edge-hi); }
+
+/* -------------------------------------------------------- touch flight pad */
+#pad { right: 10px; bottom: 10px; display: none; padding-bottom: 10px; }
+#pad .pad-body { display: flex; gap: 12px; align-items: flex-end; }
+#stick { position: relative; width: 132px; height: 132px; border-radius: 50%; touch-action: none;
+  background: radial-gradient(circle, rgba(70,214,255,0.10) 0 30%, rgba(0,0,0,0.35) 31%); border: 1px solid var(--edge-hi); }
+#stick::before, #stick::after { content: ""; position: absolute; background: rgba(140,210,255,0.18); }
+#stick::before { left: 50%; top: 8px; bottom: 8px; width: 1px; } #stick::after { top: 50%; left: 8px; right: 8px; height: 1px; }
+#stick .lbl { position: absolute; font-size: 9.5px; color: var(--dim); letter-spacing: 0.08em; }
+#knob { position: absolute; left: 50%; top: 50%; width: 46px; height: 46px; margin: -23px 0 0 -23px; border-radius: 50%;
+  background: radial-gradient(circle at 40% 35%, #5fc9ef, #1d5f7c); box-shadow: 0 2px 10px rgba(0,0,0,0.6); pointer-events: none; }
+#pad .col { display: flex; flex-direction: column; gap: 6px; }
+#pad .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+#pad button:not(.fold) { min-width: 54px; min-height: 38px; padding: 4px 6px; font-size: 12px; user-select: none; -webkit-user-select: none; }
+#pad button.held { color: #00161f; background: var(--amber); border-color: var(--amber); }
+#pad .sub { font-size: 9.5px; color: var(--dim); text-align: center; letter-spacing: 0.1em; }
+body.pad #pad { display: block; }
+body.pad #hint { display: none; }
+
+/* ------------------------------------------------------------- phone layout */
+@media (max-width: 760px), (max-height: 520px) {
+  .panel { font-size: 10.5px; padding: 6px 8px; max-width: calc(100vw - 12px); }
+  .panel h3 { margin: -6px -8px 6px; padding: 4px 8px; }
+  .panel:not(.collapsed) { max-height: calc(100vh - 20px); overflow: auto; }
+  #top { top: max(4px, env(safe-area-inset-top)); gap: 10px; padding: 4px 34px 4px 10px; max-width: calc(100vw - 8px); }
+  #top .cell { min-width: 0; white-space: nowrap; }
+  #scen { display: none; }
+  #top .big { font-size: 18px; } #top .mid { font-size: 12.5px; } #top .lbl { font-size: 9px; letter-spacing: 0.06em; }
+  #phaseBadge { font-size: 10.5px; padding: 2px 6px; }
+  /* folded pills along the left and right edges below the top strip */
+  #toolbar { left: 6px; transform: none; top: 58px; width: min(330px, calc(100vw - 12px)); }
+  #ap { left: 6px; top: 96px; width: 240px; }
+  #propPanel { left: 6px; top: 130px; width: auto; }
+  #events { left: 6px; top: 164px; width: 240px; display: block; }
+  #res { right: 6px; top: 96px; width: 240px; }
+  #aero { right: 6px; top: 130px; width: 240px; }
+  #tunnelPanel { right: 6px; top: 164px; width: calc(100vw - 12px); height: 55vh; min-width: 0; min-height: 0; resize: none; }
+  #scope { left: auto; bottom: auto; right: 6px; top: 198px; }
+  #cluster { left: 50%; bottom: auto; top: 96px; padding: 14px 6px 6px; gap: 4px; }
+  #navball { width: 150px; height: 150px; }
+  .gauge, .gauge canvas { width: 30px; height: 130px; }
+  .speedbox { font-size: 11px; top: -22px; }
+  #propCv { width: min(320px, calc(100vw - 30px)); height: auto; }
+  #scopeCv { width: 210px; height: 234px; }
+  #help { width: calc(100vw - 16px); max-height: 80vh; overflow: auto; }
+  #hint { display: none; }
+  /* the pad spreads to both thumbs; only its two clusters catch touches,
+     the view between them stays free for camera drags */
+  #pad { right: 6px; bottom: max(6px, env(safe-area-inset-bottom)); }
+  #pad:not(.collapsed) { left: 6px; padding: 0; background: none; border: none; box-shadow: none;
+    backdrop-filter: none; -webkit-backdrop-filter: none; pointer-events: none; }
+  #pad:not(.collapsed) > h3 { pointer-events: auto; width: fit-content; margin: 0 0 6px auto; gap: 8px;
+    background: var(--glass); border: 1px solid var(--edge); border-radius: 6px; }
+  #pad:not(.collapsed) .col { pointer-events: auto; background: var(--glass); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 6px; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+  #pad .pad-body { justify-content: space-between; }
+  #banner { font-size: 22px; }
+}
+@media (max-width: 480px) {
+  #top .cell:first-child { display: none; }
+  #top { gap: 12px; }
+}
+/* phone in landscape: pills in two short columns beside the data strip,
+   clear of the thumb clusters at the bottom corners */
+@media (max-height: 520px) {
+  #stick { width: 108px; height: 108px; }
+  #pad button:not(.fold) { min-height: 30px; }
+  #top { top: 4px; }
+  #toolbar { top: 6px; } #ap { top: 40px; } #events { top: 74px; } #propPanel { top: 108px; }
+  #res { top: 6px; } #aero { top: 40px; } #tunnelPanel { top: 74px; height: calc(100vh - 84px); } #scope { top: 108px; }
+  #cluster { top: 58px; }
+}
 </style>
 </head>
 <body>
 <canvas id="view"></canvas>
 
-<div id="top" class="panel">
+<div id="top" class="panel" data-title="飞行数据">
   <div class="cell"><span class="lbl">飞行时间</span><span class="mid" id="met">T+00:00.0</span></div>
   <div class="cell"><span class="lbl">高度</span><span><span class="big" id="alt">0</span><span class="unit" id="altU">m</span></span></div>
   <div class="cell"><span class="lbl">垂直速度</span><span class="mid" id="vs">0.0</span></div>
@@ -218,7 +324,7 @@ kbd { font-family: var(--mono); background: rgba(255,255,255,0.08); border: 1px 
   <div class="tn-foot"><span id="tnFoot">-</span><span class="tn-tip">滚轮缩放 · 双击复位 · 拖右下角调整大小</span></div>
 </div>
 
-<div id="cluster" class="panel"><div class="grip" title="拖动以移动姿态仪"></div>
+<div id="cluster" class="panel" data-title="姿态仪"><div class="grip" title="拖动以移动姿态仪"></div>
   <div class="gauge"><canvas id="thrG" width="92" height="400"></canvas></div>
   <div id="navwrap">
     <div class="speedbox"><span class="k" id="spdMode">对地速度</span><span id="spd">0.0 m/s</span></div>
@@ -227,7 +333,7 @@ kbd { font-family: var(--mono); background: rgba(255,255,255,0.08); border: 1px 
   <div class="gauge"><canvas id="vsG" width="92" height="400"></canvas></div>
 </div>
 
-<div id="scope" class="panel"><div class="grip" title="拖动以移动着陆区显示器"></div>
+<div id="scope" class="panel" data-title="着陆区显示"><div class="grip" title="拖动以移动着陆区显示器"></div>
   <canvas id="scopeCv" width="520" height="580"></canvas>
 </div>
 
@@ -235,8 +341,44 @@ kbd { font-family: var(--mono); background: rgba(255,255,255,0.08); border: 1px 
 
 <div id="events" class="panel"><h3>事件记录 <span class="tag" id="warp">1×</span></h3><div id="evList"></div></div>
 
+<div id="toolbar" class="panel">
+  <h3>菜单 <span class="tag" id="tbWarp">1×</span></h3>
+  <div class="tb">
+    <select id="scenSel" title="切换场景"></select>
+    <button data-cmd="m" id="tbAP">自动驾驶</button>
+    <button data-cmd="p" id="tbPause">暂停</button>
+    <button data-cmd=",">慢放</button>
+    <button data-cmd=".">快进</button>
+    <button data-cmd="v">相机</button>
+    <button data-cmd="f">气流</button>
+    <button data-cmd="b">显示量</button>
+    <button data-cmd="k">轨迹</button>
+    <button data-cmd="c">CFD 力</button>
+    <button data-cmd="y">风场</button>
+    <button data-cmd="pad" id="tbPad">操控按钮</button>
+    <button data-cmd="foldall">全部折叠</button>
+    <button data-cmd="l">布局复位</button>
+    <button data-cmd="h">帮助</button>
+  </div>
+</div>
+
+<div id="pad" class="panel">
+  <h3>手动操控 <span class="tag" id="padMode">手动</span></h3>
+  <div class="pad-body">
+    <div class="col">
+      <div id="stick"><span class="lbl" style="left:50%;top:3px;transform:translateX(-50%)">W 俯</span><span class="lbl" style="left:50%;bottom:3px;transform:translateX(-50%)">S 仰</span><span class="lbl" style="left:4px;top:50%;transform:translateY(-50%)">A</span><span class="lbl" style="right:4px;top:50%;transform:translateY(-50%)">D</span><div id="knob"></div></div>
+      <div class="grid2"><button data-hold="q">⟲ 滚转</button><button data-hold="e">滚转 ⟳</button></div>
+    </div>
+    <div class="col">
+      <div class="sub">油门</div>
+      <div class="grid2"><button data-hold="shift">＋</button><button data-hold="control">－</button><button data-cmd="z">满</button><button data-cmd="x">关机</button></div>
+      <div class="grid2"><button data-cmd="m" id="padAP">自动</button><button data-cmd="t" id="padSAS">增稳</button><button data-cmd="g" id="padLegs">着陆腿</button><button data-cmd="backspace">回发射台</button></div>
+    </div>
+  </div>
+</div>
+
 <div id="banner"></div>
-<div id="hint"><b>H</b> 帮助 · <b>M</b> 自动驾驶 · <b>F</b> 主视图气流 · <b>K</b> 轨迹 · <b>V</b> 相机 · <b>1-9 0</b> 场景</div>
+<div id="hint"><b>−</b> 折叠面板 · <b>H</b> 帮助 · <b>M</b> 自动驾驶 · <b>F</b> 主视图气流 · <b>K</b> 轨迹 · <b>V</b> 相机 · <b>1-9 0</b> 场景</div>
 
 <div id="help" class="panel">
   <h3>操作说明 <span class="tag">KSP 键位</span></h3>
@@ -258,7 +400,9 @@ kbd { font-family: var(--mono); background: rgba(255,255,255,0.08); border: 1px 
     <tr><td><kbd>Y</kbd></td><td>风场开 / 关</td></tr>
     <tr><td><kbd>V</kbd></td><td>相机：环绕（只随鼠标转动）/ 着陆台 / 侧视；拖动旋转，滚轮缩放，双击恢复自动距离</td></tr>
     <tr><td>风洞截面</td><td>截面取世界坐标系竖直面（东—天或北—天），过箭体中点，画面上方始终为天向；滚轮缩放，双击复位，拖右下角调整窗口大小</td></tr>
-    <tr><td>拖动面板标题</td><td>移动仪表面板（姿态仪拖顶部把手）；<kbd>L</kbd> 恢复默认布局与窗口大小</td></tr>
+    <tr><td>拖动面板标题</td><td>移动仪表面板（姿态仪拖顶部把手）；标题栏右侧 <kbd>−</kbd> 折叠成小标签，点小标签展开；<kbd>L</kbd> 恢复默认布局、折叠状态与窗口大小</td></tr>
+    <tr><td>菜单 / 手动操控</td><td>“菜单”面板：切换场景、自动驾驶、暂停、时间倍率、相机等；“操控按钮”打开触屏操控面板（手机上默认打开）：摇杆 = W/A/S/D，滚转、油门 ＋/－、满油门、关机、自动驾驶、增稳、着陆腿</td></tr>
+    <tr><td>手机 / 触屏</td><td>单指拖动旋转视角，双指捏合缩放，双击恢复自动距离；面板默认折叠，点小标签展开</td></tr>
     <tr><td><kbd>,</kbd> <kbd>.</kbd></td><td>时间倍率 − / +；<kbd>P</kbd> 暂停</td></tr>
   </table>
 </div>

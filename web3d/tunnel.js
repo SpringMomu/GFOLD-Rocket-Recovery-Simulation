@@ -73,7 +73,7 @@ export class TunnelView {
     this.partBtn = partBtn; this.forceBtn = forceBtn;
     partBtn.addEventListener("click", () => { this.particles = !this.particles; this._save(); this._sync(); });
     forceBtn.addEventListener("click", () => { this.forces = !this.forces; this._save(); this._sync(); });
-    for (const el of [modeBar, planeBar, partBtn, forceBtn]) el.addEventListener("mousedown", (e) => e.stopPropagation());
+    for (const el of [modeBar, planeBar, partBtn, forceBtn]) el.addEventListener("pointerdown", (e) => e.stopPropagation());
 
     // Zoom (wheel, towards the booster), double-click resets.
     canvas.addEventListener("wheel", (e) => {
@@ -82,7 +82,7 @@ export class TunnelView {
       this.parts = [];
     }, { passive: false });
     canvas.addEventListener("dblclick", (e) => { e.stopPropagation(); this.zoom = 1; this.parts = []; });
-    canvas.addEventListener("mousedown", (e) => e.stopPropagation());
+    canvas.addEventListener("pointerdown", (e) => e.stopPropagation());
 
     // Canvas follows the (resizable) panel.
     this.dpr = Math.min(2, window.devicePixelRatio || 1);

@@ -117,57 +117,118 @@ export class HUD {
     this._initDrag();
   }
 
-  // Panels can be dragged by their title bar (the attitude cluster by its grip).
+  // Panels can be dragged by their title bar (the attitude cluster and the
+  // landing display by their grip, the top strip anywhere) with the mouse or
+  // a finger.  Every panel can be folded to a small labelled pill (fold
+  // button); a folded pill is dragged anywhere and opens again on a tap.
+  // Positions, sizes and fold states are remembered (L resets them).
   _initDrag() {
-    const KEY = "booster3d.layout.v1";
-    let saved = {};
-    try { saved = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) { saved = {}; }
+    const KEY = "booster3d.layout.v1", FOLD_KEY = "booster3d.fold.v1";
+    const load = (k) => { try { return JSON.parse(localStorage.getItem(k) || "{}"); } catch (e) { return {}; } };
+    let saved = load(KEY), folds = load(FOLD_KEY);
+    const store = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* private mode */ } };
+    const persist = () => store(KEY, saved);
     const place = (el, p) => {
       el.style.left = p.x + "px"; el.style.top = p.y + "px";
       el.style.right = "auto"; el.style.bottom = "auto"; el.style.transform = "none";
     };
     const clampPos = (el, x, y) => [Math.max(0, Math.min(window.innerWidth - 40, x)), Math.max(0, Math.min(window.innerHeight - 30, y))];
+    // Phones start with only the flight data strip and the touch pad open.
+    this.phone = window.matchMedia("(max-width: 760px), (max-height: 520px)").matches;
+    const DEFAULT_FOLDED = this.phone
+      ? ["ap", "res", "aero", "tunnelPanel", "events", "propPanel", "scope", "cluster", "toolbar"]
+      : ["toolbar"];
+    const panels = [...document.querySelectorAll(".panel")].filter((el) => el.id && el.id !== "help");
+    this.panels = panels;
+    const keepOnScreen = (el) => {
+      const r = el.getBoundingClientRect();
+      if (r.right <= window.innerWidth && r.bottom <= window.innerHeight) return;
+      if (!el.style.left) return;                      // CSS default position: the layout handles it
+      const [x, y] = clampPos(el, Math.min(r.left, window.innerWidth - r.width - 4), Math.min(r.top, window.innerHeight - r.height - 4));
+      place(el, { x, y });
+    };
+    this.setFolded = (el, on, remember = true) => {
+      el.classList.toggle("collapsed", on);
+      const b = el.querySelector(".fold");
+      if (b) { b.textContent = on ? "+" : "−"; b.title = on ? "展开" : "折叠"; }
+      if (remember) { folds[el.id] = on; store(FOLD_KEY, folds); }
+      if (!on) requestAnimationFrame(() => keepOnScreen(el));
+    };
+    this.isFolded = (id) => { const el = document.getElementById(id); return !!el && el.classList.contains("collapsed"); };
+    // "Fold all" folds every panel but the menu; if all are folded, opens them.
+    this.foldAll = () => {
+      const rest = panels.filter((el) => el.id !== "toolbar" && el.offsetParent !== null);
+      const open = rest.some((el) => !el.classList.contains("collapsed"));
+      for (const el of rest) this.setFolded(el, open);
+    };
     this.resetLayout = () => {
-      try { localStorage.removeItem(KEY); } catch (e) { /* ignore */ }
-      for (const el of document.querySelectorAll(".panel")) {
+      try { localStorage.removeItem(KEY); localStorage.removeItem(FOLD_KEY); } catch (e) { /* ignore */ }
+      saved = {}; folds = {};
+      for (const el of panels) {
         el.style.left = el.style.top = el.style.right = el.style.bottom = el.style.transform = "";
         if (el.classList.contains("resizable")) el.style.width = el.style.height = "";
+        this.setFolded(el, DEFAULT_FOLDED.includes(el.id), false);
       }
-      saved = {};
     };
     // Resizable panels remember their size.
-    const persist = () => { try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch (e) { /* private mode */ } };
     for (const el of document.querySelectorAll(".panel.resizable")) {
       const sz = saved[el.id + ":size"];
       if (sz) { el.style.width = sz.w + "px"; el.style.height = sz.h + "px"; }
       let t = null;
       new ResizeObserver(() => {
         if (!el.style.width && !el.style.height) return;          // default size, nothing to save
+        if (el.classList.contains("collapsed")) return;
         clearTimeout(t);
         t = setTimeout(() => { saved[el.id + ":size"] = { w: el.offsetWidth, h: el.offsetHeight }; persist(); }, 300);
       }).observe(el);
     }
-    for (const el of document.querySelectorAll(".panel")) {
-      if (!el.id || el.id === "help") continue;
+    for (const el of panels) {
       if (saved[el.id]) place(el, saved[el.id]);
-      const handle = el.querySelector(":scope > .grip") || el.querySelector(":scope > h3") || (el.id === "top" ? el : null);
-      if (!handle) continue;
-      handle.addEventListener("mousedown", (ev) => {
-        if (ev.button !== 0) return;
+      // Fold button: in the title bar, or in the corner of title-less panels.
+      const h3 = el.querySelector(":scope > h3");
+      const fold = document.createElement("button");
+      fold.className = "fold"; fold.type = "button";
+      if (h3) {
+        h3.style.justifyContent = "flex-start";
+        const tag = h3.querySelector(".tag");
+        if (tag) tag.style.marginLeft = "auto";
+        h3.appendChild(fold);
+        if (!el.dataset.title) el.dataset.title = h3.firstChild.textContent.trim();
+      } else {
+        el.classList.add("notitle");
+        el.appendChild(fold);
+      }
+      fold.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+      fold.addEventListener("click", (ev) => { ev.stopPropagation(); this.setFolded(el, !el.classList.contains("collapsed")); });
+      this.setFolded(el, el.id in folds ? !!folds[el.id] : DEFAULT_FOLDED.includes(el.id), false);
+
+      const handle = el.querySelector(":scope > .grip") || h3 || (el.id === "top" ? el : null);
+      el.addEventListener("pointerdown", (ev) => {
+        if (ev.pointerType === "mouse" && ev.button !== 0) return;
+        const folded = el.classList.contains("collapsed");
+        if (!folded && !(handle && handle.contains(ev.target))) return;
         ev.preventDefault(); ev.stopPropagation();
         const r = el.getBoundingClientRect();
-        const off = [ev.clientX - r.left, ev.clientY - r.top];
-        place(el, { x: r.left, y: r.top });
+        const off = [ev.clientX - r.left, ev.clientY - r.top], start = [ev.clientX, ev.clientY];
+        let moved = false;
         el.classList.add("dragging");
-        const move = (e) => { const [x, y] = clampPos(el, e.clientX - off[0], e.clientY - off[1]); place(el, { x, y }); };
-        const up = () => {
-          window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up);
+        const move = (e) => {
+          if (e.pointerId !== ev.pointerId) return;
+          if (!moved && Math.hypot(e.clientX - start[0], e.clientY - start[1]) < 6) return;
+          if (!moved) { moved = true; place(el, { x: r.left, y: r.top }); }
+          const [x, y] = clampPos(el, e.clientX - off[0], e.clientY - off[1]);
+          place(el, { x, y });
+        };
+        const up = (e) => {
+          if (e.pointerId !== ev.pointerId) return;
+          window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", up);
           el.classList.remove("dragging");
+          if (!moved) { if (folded) this.setFolded(el, false); return; }      // a tap on a pill opens it
           const q = el.getBoundingClientRect();
           saved[el.id] = { x: q.left, y: q.top };
           persist();
         };
-        window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+        window.addEventListener("pointermove", move); window.addEventListener("pointerup", up); window.addEventListener("pointercancel", up);
       });
     }
   }
@@ -185,7 +246,7 @@ export class HUD {
   update(st, view) {
     if (!st) return;
     const propCv = document.getElementById("propCv");
-    if (propCv) {
+    if (propCv && !this.isFolded("propPanel")) {
       drawPropulsion(propCv, st);
       const burning = st.throttle > 0.01 && st.state === "FLYING";
       const tag = document.getElementById("propTag");
@@ -293,11 +354,9 @@ export class HUD {
     this.lastState = st.state;
     if (performance.now() > this.bannerUntil) $("banner").style.display = "none";
 
-    this.fdai.draw(st);
-    this._throttle(st);
-    this._vspeed(st);
-    this.nd.draw(st);
-    this.tunnel.draw(st, view, view.flowTime || 0);
+    if (!this.isFolded("cluster")) { this.fdai.draw(st); this._throttle(st); this._vspeed(st); }
+    if (!this.isFolded("scope")) this.nd.draw(st);
+    if (!this.isFolded("tunnelPanel")) this.tunnel.draw(st, view, view.flowTime || 0);
   }
 
   // ----------------------------------------------------------------- navball
