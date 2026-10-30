@@ -8,6 +8,7 @@ import { Scene } from "./scene.js";
 import { HUD } from "./hud.js";
 import { Fluid3D } from "./fluid.js";
 import { plumeParams } from "./plume.js";
+import { initControls } from "./controls.js";
 
 const canvas = document.getElementById("view");
 let scene;
@@ -115,11 +116,13 @@ function send() {
 setInterval(() => { if (dirty || Object.values(held).some(Boolean)) send(); }, 100);
 function act(a) { pending.push(a); send(); }
 
-window.addEventListener("keydown", (ev) => {
-  const k = ev.key.toLowerCase();
-  if (ev.ctrlKey && ["s", "d", "w", "q", "e", "a"].includes(k)) ev.preventDefault();
-  if (KEYMAP[k]) { if (!held[k]) { held[k] = true; dirty = true; send(); } ev.preventDefault(); return; }
-  if (ev.repeat) return;
+// Held keys (attitude, throttle): from the keyboard or the touch pad.
+function press(k, down) {
+  if (!!held[k] === down) return;
+  held[k] = down; dirty = true; send();
+}
+// One-shot commands, shared by the keyboard and the on-screen buttons.
+function command(k) {
   if (k >= "1" && k <= "9") act("scenario:" + (Number(k) - 1));
   else if (k === "0") act("scenario:9");
   else if (k === "m") act("autopilot");
@@ -128,7 +131,7 @@ window.addEventListener("keydown", (ev) => {
   else if (k === "z") act("full");
   else if (k === "x") act("cut");
   else if (k === "p") act("pause");
-  else if (k === "backspace") { act("pad"); ev.preventDefault(); }
+  else if (k === "backspace") act("pad");
   else if (k === ",") act("warp-");
   else if (k === ".") act("warp+");
   else if (k === "c") act("cfd_forces");
@@ -137,8 +140,20 @@ window.addEventListener("keydown", (ev) => {
   else if (k === "k") { view.showTraj = !view.showTraj; toast(view.showTraj ? "实际轨迹与预测轨迹：显示" : "实际轨迹与预测轨迹：隐藏"); }
   else if (k === "b") { view.volField = (view.volField + 1) % 3; hud.tunnel.setMode(VOL_TO_TUNNEL[view.volField]); toast("显示量：" + VOL_NAMES[view.volField]); }
   else if (k === "v") { view.cam = (view.cam + 1) % 3; toast("相机：" + CAM_NAMES[view.cam]); }
-  else if (k === "l") { hud.resetLayout(); toast("仪表布局与窗口大小已恢复默认"); }
+  else if (k === "l") { hud.resetLayout(); toast("仪表布局、折叠状态与窗口大小已恢复默认"); }
   else if (k === "h") hud.toggleHelp();
+  else if (k === "foldall") hud.foldAll();
+}
+const controls = initControls({ press, command, act });
+
+window.addEventListener("keydown", (ev) => {
+  if (ev.target && ev.target.tagName === "SELECT") return;
+  const k = ev.key.toLowerCase();
+  if (ev.ctrlKey && ["s", "d", "w", "q", "e", "a"].includes(k)) ev.preventDefault();
+  if (KEYMAP[k]) { press(k, true); ev.preventDefault(); return; }
+  if (ev.repeat) return;
+  if (k === "backspace") ev.preventDefault();
+  command(k);
 });
 window.addEventListener("keyup", (ev) => {
   const k = ev.key.toLowerCase();
@@ -159,15 +174,41 @@ function toast(msg) {
 
 // ------------------------------------------------------------------ camera
 const cam = { yaw: -2.25, pitch: 0.18, dist: 70, fov: 0.9, eye: [0, 0, 0], at: [0, 0, 0], smoothAt: null, auto: true };
-let drag = null;
-canvas.addEventListener("mousedown", (e) => { drag = { x: e.clientX, y: e.clientY }; cam.auto = false; });
-window.addEventListener("mouseup", () => { drag = null; });
-window.addEventListener("mousemove", (e) => {
-  if (!drag) return;
-  cam.yaw -= (e.clientX - drag.x) * 0.006;
-  cam.pitch = Math.max(-0.2, Math.min(1.45, cam.pitch + (e.clientY - drag.y) * 0.005));
-  drag = { x: e.clientX, y: e.clientY };
+// Mouse or one finger drags the orbit, two fingers pinch the distance,
+// wheel zooms, a double click / double tap restores the automatic distance.
+const ptrs = new Map();
+let pinch = null, tapT = 0, tapMoved = false;
+const pinchLen = () => { const [a, b] = [...ptrs.values()]; return Math.hypot(a[0] - b[0], a[1] - b[1]) || 1; };
+canvas.addEventListener("pointerdown", (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  ptrs.set(e.pointerId, [e.clientX, e.clientY]);
+  cam.auto = false; tapMoved = false;
+  if (ptrs.size === 2) pinch = { len: pinchLen(), dist: cam.dist };
 });
+canvas.addEventListener("pointermove", (e) => {
+  const prev = ptrs.get(e.pointerId);
+  if (!prev) return;
+  const cur = [e.clientX, e.clientY];
+  ptrs.set(e.pointerId, cur);
+  if (Math.hypot(cur[0] - prev[0], cur[1] - prev[1]) > 2) tapMoved = true;
+  if (ptrs.size === 1) {
+    const k = e.pointerType === "touch" ? 1.3 : 1;
+    cam.yaw -= (cur[0] - prev[0]) * 0.006 * k;
+    cam.pitch = Math.max(-0.2, Math.min(1.45, cam.pitch + (cur[1] - prev[1]) * 0.005 * k));
+  } else if (ptrs.size === 2 && pinch) {
+    cam.dist = Math.max(18, Math.min(6000, pinch.dist * pinch.len / pinchLen()));
+  }
+});
+const endPtr = (e) => {
+  if (!ptrs.delete(e.pointerId)) return;
+  if (ptrs.size < 2) pinch = null;
+  if (e.pointerType === "touch" && !tapMoved && ptrs.size === 0) {
+    const now = performance.now();
+    if (now - tapT < 320) { cam.auto = true; tapT = 0; } else tapT = now;
+  }
+};
+canvas.addEventListener("pointerup", endPtr);
+canvas.addEventListener("pointercancel", endPtr);
 canvas.addEventListener("wheel", (e) => { cam.dist = Math.max(18, Math.min(6000, cam.dist * Math.exp(e.deltaY * 0.0012))); cam.auto = false; e.preventDefault(); }, { passive: false });
 canvas.addEventListener("dblclick", () => { cam.auto = true; });
 
@@ -464,7 +505,7 @@ function frame(now) {
           else fetch("/api/cfd3d", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ c_world: fc.world, cn: fc.cn, ca: fc.ca, zcp: fc.zcp, t: st.t }) }).catch(() => {});
         }
       }
-      if (frameNo % 3 === 1) {
+      if (frameNo % 3 === 1 && !hud.isFolded("tunnelPanel")) {
         const box = fluid.box;
         const region = hud.tunnel.region(box);
         const sl = region && fluid.readSlice(region);
@@ -488,6 +529,7 @@ function frame(now) {
     }
     scene.render({ eye: cam.eye, at: cam.at, fov: cam.fov, dist: camDist(st.pos) }, stR, fx, view);
     hud.update(latest ? Object.assign({}, latest, { pos: st.pos, vel: st.vel, q: st.q, alt: st.alt }) : st, view);
+    if (frameNo % 6 === 0) controls.update(latest, view);
   }
   if (toastEl && now > toastUntil) toastEl.style.display = "none";
   requestAnimationFrame(frame);
