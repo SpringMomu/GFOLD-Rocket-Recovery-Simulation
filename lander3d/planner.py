@@ -56,6 +56,11 @@ class PlanConfig3D:
     # Final-approach sink envelope (soft): sink <= touchdown_speed + sink_gain * h.
     # Arrive slowly with thrust ~ weight instead of braking hard into contact.
     sink_gain: float = 0.0
+    # Angle-of-attack cap vs dynamic pressure ((Pa...), (deg...)): the angle
+    # between the thrust and the oncoming flow (engines-first attitude).  The
+    # drag model then also returns the predicted dynamic pressure and flow
+    # direction at each interval.
+    q_aoa: tuple | None = None
 
 
 @dataclass
@@ -130,6 +135,23 @@ class Planner3D:
     lateral_velocity_weight = 0.03
     lateral_jerk_factor = 8.0
     lateral_rate = 4.0             # m/s^3, limit on the change of planned lateral thrust
+    # Soft cap on the horizontal speed (a low divert): flying sideways faster
+    # than this needs thrust along the motion against the broadside drag,
+    # i.e. nose-first flight the booster cannot hold aerodynamically.
+    lateral_speed_max = 30.0       # m/s (or the current speed, bled at lateral_speed_decay)
+    lateral_speed_decay = 4.0      # m/s^2
+    lateral_speed_weight = 200.0
+    # ... and, like the sink envelope, the lower the slower: arrive over the
+    # pad nearly vertical instead of braking a sideways speed at the bottom.
+    lateral_speed_floor = 2.0      # m/s at the pad
+    lateral_speed_gain = 0.15      # + m/s per m of height
+    aoa_weight = 100.0
+    no_climb_weight = 100.0
+    min_sink = 1.0                 # m/s, the slowest planned descent
+    approach_cone_floor = 1.0      # m off the pad centre at the pad ...
+    approach_cone_gain = 0.35      # ... + m per m of height
+    approach_cone_weight = 60.0
+    approach_cone_t = (6.0, 10.0)  # s to go: full weight -> none
 
     def __init__(self) -> None:
         self.solve_count = 0
@@ -163,7 +185,11 @@ class Planner3D:
         isg = iem + 6
         ifs = isg + N
         isk = ifs + 1                  # sink-envelope slacks, knots 1..N
-        n = isk + N
+        ivs = isk + N                  # lateral-speed slacks, knots 1..N
+        iao = ivs + N                  # angle-of-attack slacks, knots 1..N
+        icl = iao + N                  # no-climb slacks, knots 1..N
+        iap = icl + N                  # final-approach-cone slacks, knots 1..N
+        n = iap + N
 
         def S(k, c):
             return NX * k + c
@@ -173,10 +199,13 @@ class Planner3D:
 
         mid = (np.arange(N) + 0.5) * dt
         Gm = None
+        q_mid = w_mid = None
         if cfg.drag_model is not None:
             res = cfg.drag_model(mid)
             if isinstance(res, tuple):
                 drag, Gm = np.asarray(res[0], float).reshape(N, 3), np.asarray(res[1], float).reshape(N, 3, 3)
+                if len(res) > 3:
+                    q_mid, w_mid = np.asarray(res[2], float).reshape(N), np.asarray(res[3], float).reshape(N, 3)
             else:
                 drag = np.asarray(res, float).reshape(N, 3)
         else:
@@ -227,6 +256,18 @@ class Planner3D:
         row([(ifs, -1.0)], 0.0)
         for k in range(N):
             row([(isk + k, -1.0)], 0.0)
+        for k in range(N):
+            row([(ivs + k, -1.0)], 0.0)
+        for k in range(N):
+            row([(iao + k, -1.0)], 0.0)
+        for k in range(N):
+            row([(icl + k, -1.0)], 0.0)
+        for k in range(N):
+            row([(iap + k, -1.0)], 0.0)
+        # The landing burn only descends (soft): a divert is flown sinking,
+        # never by climbing back up or hovering to wait.
+        for k in range(1, N + 1):
+            row([(S(k, 5), 1.0), (icl + k - 1, -1.0)], max(-self.min_sink, float(v0[2]) - g * t_k[k]))
         if cfg.sink_gain > 0.0:
             # vz_k >= -(v_td + c (h_k - h_target)) - s_k   (linear in the state)
             c_s = cfg.sink_gain
@@ -241,8 +282,30 @@ class Planner3D:
         # propellant: z_N >= ln(m_dry) - s_fuel
         row([(S(N, 6), -1.0), (ifs, -1.0)], -math.log(cfg.dry_mass))
         t_go = t_f - t_k
-        cos_tilt = np.cos(self._tilt_limit(t_go, cfg.max_tilt_deg))
-        cos_tilt[0] = min(cos_tilt[0], math.cos(math.radians(80.0)))
+        tilt = self._tilt_limit(t_go, cfg.max_tilt_deg)
+        if q_mid is not None and cfg.q_aoa is not None:
+            # Same angle-of-attack cap as the tracker (knots 1..N, flow of the
+            # interval before): the plan must not count on an attitude the
+            # booster cannot hold against the aerodynamic moment -- e.g.
+            # flying nose-first towards the pad in a fast low divert.  Kept
+            # compatible with the tilt cone, so the problem stays feasible.
+            for k in range(1, N + 1):
+                w = w_mid[k - 1]
+                if q_mid[k - 1] <= cfg.q_aoa[0][0] or not np.any(w):
+                    continue
+                aoa = math.radians(float(np.interp(q_mid[k - 1], *cfg.q_aoa)))
+                aoa = max(aoa, math.acos(float(np.clip(w[2], -1.0, 1.0))) - tilt[k] + math.radians(3.0))
+                if aoa < math.pi / 2:
+                    # soft (slack in m/s^2 of thrust off the allowed cone):
+                    # thrust-rate limits may not allow an instant turn
+                    row([(U(k, 3), math.cos(aoa)), (iao + k - 1, -1.0)] + [(U(k, c), -float(w[c])) for c in range(3)], 0.0)
+        # The first knot may keep the current thrust direction (attitude lag),
+        # but no more: a looser first knot is flown for the whole replan
+        # period and the tracker clips it anyway.
+        un = np.asarray(cfg.u_now, float)
+        tilt_now = math.atan2(float(np.linalg.norm(un[:2])), max(1e-6, float(un[2]))) if cfg.engine_on else math.radians(75.0)
+        tilt[0] = max(tilt[0], min(math.radians(80.0), tilt_now + math.radians(5.0)))
+        cos_tilt = np.cos(tilt)
         for k in range(N + 1):
             row([(U(k, 3), float(cos_tilt[k])), (U(k, 2), -1.0)], 0.0)
         rate_s = 0.8 * 1.2 * cfg.thrust_max / m0 * dt
@@ -277,6 +340,25 @@ class Planner3D:
             row([(S(k, 2), -tg), (isg + k - 1, -tg)], 0.0)
             row([(S(k, 0), -1.0)], 0.0)
             row([(S(k, 1), -1.0)], 0.0)
+            soc_dims.append(3)
+
+        v_cap = np.maximum(self.lateral_speed_max, math.hypot(v0[0], v0[1]) - self.lateral_speed_decay * t_k)
+        for k in range(1, N + 1):
+            row([(ivs + k - 1, -1.0)], float(v_cap[k]))
+            row([(S(k, 3), -1.0)], 0.0)
+            row([(S(k, 4), -1.0)], 0.0)
+            soc_dims.append(3)
+            row([(ivs + k - 1, -1.0), (S(k, 2), -self.lateral_speed_gain)],
+                self.lateral_speed_floor - self.lateral_speed_gain * cfg.target_alt)
+            row([(S(k, 3), -1.0)], 0.0)
+            row([(S(k, 4), -1.0)], 0.0)
+            soc_dims.append(3)
+            # Final approach cone (soft), much steeper than the glide slope:
+            # be over the pad before the last ~50 m, then come down upright.
+            row([(iap + k - 1, -1.0), (S(k, 2), -self.approach_cone_gain)],
+                self.approach_cone_floor - self.approach_cone_gain * cfg.target_alt)
+            row([(S(k, 0), -1.0)], -float(cfg.target_xy[0]))
+            row([(S(k, 1), -1.0)], -float(cfg.target_xy[1]))
             soc_dims.append(3)
 
         A = row.matrix(n)
@@ -354,6 +436,12 @@ class Planner3D:
         q[isg:isg + N] = self.glide_slope_weight
         q[ifs] = self.fuel_slack_weight
         q[isk:isk + N] = self.sink_envelope_weight
+        q[ivs:ivs + N] = self.lateral_speed_weight * dt
+        q[iao:iao + N] = self.aoa_weight * dt
+        q[icl:icl + N] = self.no_climb_weight * dt
+        # only the last seconds: earlier a low, far booster must not be
+        # pushed up to get inside it
+        q[iap:iap + N] = self.approach_cone_weight * dt * np.interp(t_f - t_k[1:], self.approach_cone_t, [1.0, 0.0])
         for i in range(n):
             add_p(i, i, 1e-7)
         P = hessian.matrix()
