@@ -920,7 +920,14 @@ ln -sf /etc/nginx/sites-available/rockt3d.conf /etc/nginx/sites-enabled/ && ngin
 
 ## 15. 许可证
 
-本项目采用 [MIT No Attribution（MIT-0）](LICENSE) 许可证：可以任意使用、复制、修改、合并、发布、分发、再许可和出售，无需保留版权声明或许可文本，也无需署名。软件按“原样”提供，不附带任何担保。
+本项目采用 [Apache License 2.0](LICENSE) 许可证，版权归 SpringMomu 所有，署名与声明见 [NOTICE](NOTICE)。可以免费使用、复制、修改、分发（包括商用），但需要：
+
+- 随代码或产品附上许可证全文和 `NOTICE` 文件，保留原有的版权、专利、商标和署名声明；
+- 在修改过的文件中注明改动。
+
+许可证还包含贡献者的专利授权：对本项目提起专利诉讼的一方，其获得的专利许可随即终止。软件按“原样”提供，不附带任何担保。
+
+截至提交 `eadc89c`（含）的版本以 MIT No Attribution（MIT-0）许可证发布，这些版本仍按 MIT-0 适用；之后的版本适用 Apache-2.0。
 
 ---
 
