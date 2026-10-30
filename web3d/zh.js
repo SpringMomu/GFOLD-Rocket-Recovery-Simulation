@@ -5,7 +5,7 @@
 export const PHASE = {
   STANDBY: "待命", MANUAL: "手动", COAST: "无动力滑行", BOOSTBACK: "反推返航",
   "LANDING BURN": "着陆点火", TERMINAL: "末端下降", LANDED: "已着陆", FALLBACK: "备份制导",
-  CRASHED: "箭体损毁", "ON PAD": "停放台上", FLYING: "飞行中",
+  CRASHED: "箭体损毁", "ON PAD": "停放台上", FLYING: "飞行中", CAUGHT: "筷子夹住",
 };
 
 export const SCENARIO = {
@@ -15,6 +15,9 @@ export const SCENARIO = {
   "BOOSTBACK +1000 m / 100 m/s": "反推返航 · +1000 m · 100 m/s",
   "DIVERT -1000 m / 3-D": "三维偏置 · −1000 m",
   "ENTRY 12 km / 280 m/s": "12 km 再入 · 280 m/s",
+  "TOWER CATCH 2000 m": "筷子夹箭 · 2000 m 下降",
+  "TOWER CATCH BOOSTBACK": "筷子夹箭 · 反推返航 +1000 m",
+  "TOWER CATCH ENTRY 12 km": "筷子夹箭 · 12 km 再入",
   "RTLS 30 km / 450 m/s": "返场 · 30 km 分离 · 450 m/s",
   "RTLS 35 km / CROSSWIND": "返场 · 35 km 分离 · 强侧风",
   "RTLS 30 km / LOW FUEL": "返场 · 30 km 分离 · 推进剂 3 t",
@@ -28,6 +31,9 @@ export const CRASH = {
   "HULL IMPACT": "箭体撞地",
   "IMPACT - LEGS NOT DEPLOYED": "撞地（着陆腿未展开）",
   "TIPPED OVER": "倾倒",
+  "TOWER COLLISION": "撞上发射塔",
+  "ARM COLLISION": "撞上筷子臂",
+  "HIT LAUNCH MOUNT": "未夹住，坠落在发射台上",
 };
 
 const SAS = { OFF: "关", STABILITY: "姿态保持", RETROGRADE: "对准逆速度" };
@@ -55,6 +61,9 @@ export function event(e) {
   if (e === "AERO FORCES: LIVE 3D CFD") return "气动力改由实时 3D CFD 给出";
   if (e === "AERO FORCES: ENGINEERING MODEL") return "气动力改由工程模型给出";
   if (e === "WIND ON") return "风场接通";
+  if (e === "ARMS READY") return "筷子臂预合拢，等待箭体";
+  if (e === "ARMS CLOSING") return "筷子臂合拢";
+  if (e === "CATCH CONTACT") return "挂点落上筷子臂，发动机关机";
   if (e === "WIND OFF") return "风场断开";
   if ((m = e.match(/^CRASHED(?:: (.*))?$/))) return "箭体损毁" + (m[1] ? "：" + crash(m[1]) : "");
   if (PHASE[e]) return PHASE[e];

@@ -1,10 +1,11 @@
-"""Terminal-flight envelope check for the six 3D scenarios.
+"""Terminal-flight envelope check for the 3D scenarios (pad landings and tower catches).
 
     python -m tools.check_landing_envelope [--out DIR]
 
 Beyond the regression limits this checks that the booster never hovers (sink
 rate stays >= 0.8 m/s above 1.5 m) and never rocks near the ground (pitch/yaw
-rate <= 12 deg/s below 8 m, touchdown tilt <= 1.5 deg).  Writes
+rate <= 12 deg/s below 8 m, touchdown tilt <= 1.5 deg).  Heights are above
+the end of the burn: the pad, or for a catch the collar on the arms.  Writes
 ``landing-envelope.json`` to DIR (default ``tools/out``); exit code 1 on failure.
 """
 
@@ -15,6 +16,7 @@ import json
 import math
 from pathlib import Path
 
+from lander3d.regression import passed
 from lander3d.sim import PHYSICS_DT, SCENARIOS, Sim3D
 
 MIN_SINK = 0.8          # m/s, while higher than HOVER_HEIGHT
@@ -33,22 +35,20 @@ def check(index: int) -> dict:
     while sim.time < 260 and vehicle.state == "FLYING":
         sim.step(PHYSICS_DT)
         if vehicle.touchdown is None and sim.autopilot.phase == "LANDING BURN":
-            if vehicle.altitude > HOVER_HEIGHT:
+            height = sim.autopilot._height(vehicle)
+            if height > HOVER_HEIGHT:
                 min_sink = min(min_sink, -float(vehicle.vel[2]))
-            if vehicle.altitude < LOW_HEIGHT:
+            if height < LOW_HEIGHT:
                 rate = math.degrees(max(abs(float(vehicle.omega[0])), abs(float(vehicle.omega[1]))))
                 max_rate = max(max_rate, rate)
     td = vehicle.touchdown or {}
-    passed = (
-        vehicle.state == "LANDED"
-        and td.get("error", 99) <= 3.5
-        and abs(td.get("vz", 99)) <= 2.5
-        and td.get("vh", 99) <= 1.5
+    ok = (
+        passed(vehicle, sim.tower is not None)
         and td.get("tilt", 99) <= MAX_TOUCHDOWN_TILT
         and min_sink >= MIN_SINK
         and max_rate <= MAX_LOW_RATE
     )
-    return {"scenario": sim.scenario_name, "pass": passed, "minimum_sink_above_1_5m": min_sink,
+    return {"scenario": sim.scenario_name, "pass": ok, "minimum_sink_above_1_5m": min_sink,
             "maximum_pitch_yaw_rate_below_8m": max_rate, "touchdown": td}
 
 

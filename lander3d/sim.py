@@ -13,6 +13,7 @@ import numpy as np
 from .aero import AeroModel, ExternalCFD
 from .attitude import attitude_control
 from .autopilot import Autopilot3D
+from .tower import CatchTower
 from .vehicle import Vehicle, Wind, quat_from_axis_angle
 
 PHYSICS_DT = 1.0 / 240.0
@@ -28,6 +29,13 @@ SCENARIOS = [
     {"name": "DIVERT -1000 m / 3-D", "pos": (-1000, 600, 2000), "vel": (100, -40, 0), "tilt": 10.0, "prop": 5500,
      "fins_stowed": True},
     {"name": "ENTRY 12 km / 280 m/s", "pos": (1800, -1100, 12000), "vel": (-88, 54, -260), "tilt": 8.0, "prop": 6000},
+    # Tower catches: the burn ends with the catch collar on the chopstick arms.
+    {"name": "TOWER CATCH 2000 m", "pos": (40, -30, 2000), "vel": (0, 0, -30), "tilt": 0.0, "prop": 4000,
+     "catch": True},
+    {"name": "TOWER CATCH BOOSTBACK", "pos": (1000, 300, 2000), "vel": (100, -20, 0), "tilt": 10.0, "prop": 5500,
+     "fins_stowed": True, "catch": True},
+    {"name": "TOWER CATCH ENTRY 12 km", "pos": (1800, -1100, 12000), "vel": (-88, 54, -260), "tilt": 8.0, "prop": 6000,
+     "catch": True},
 ]
 
 
@@ -48,6 +56,7 @@ class Sim3D:
         self.time_warp = 1.0
         self.paused = False
         self.trail: list = []
+        self.tower: CatchTower | None = None
         self.scenario_name = ""
         self.events: list = []
         self._hold_axis = None
@@ -66,6 +75,7 @@ class Sim3D:
             q = quat_from_axis_angle(axis, -tilt)
             self.vehicle.reset(position=sc["pos"], velocity=sc["vel"], attitude=q, propellant=sc["prop"], on_pad=False)
             self.vehicle.pos[2] += self.vehicle.rest_height
+            self._set_tower(CatchTower() if sc.get("catch", False) else None)
             if sc.get("fins_stowed", False):
                 # Before a boost-back the grid fins are still stowed.
                 self.vehicle.fins_deploy = 0.0
@@ -82,12 +92,22 @@ class Sim3D:
     def reset_to_pad(self) -> None:
         with self.lock:
             self.vehicle.reset(on_pad=True)
+            self._set_tower(None)
             self.autopilot.reset()
             self.autopilot_on = False
             self.throttle_manual = 0.0
             self.time = 0.0
             self.trail = [self.vehicle.pos.copy()]
             self.scenario_name = "ON PAD - MANUAL"
+
+    def _set_tower(self, tower: CatchTower | None) -> None:
+        self.tower = tower
+        self.vehicle.structure = tower
+        if tower is None:
+            self.autopilot.set_target()
+        else:
+            self.autopilot.set_target(tower.catch_base_z, self.vehicle.rest_height, legs=False)
+            self.vehicle.controls.legs_down = False
 
     # -- manual control (KSP layout) ---------------------------------------------
     def _manual(self, dt: float) -> None:
@@ -189,12 +209,17 @@ class Sim3D:
                 self.throttle_manual = v.controls.throttle
             else:
                 self._manual(dt)
+            if self.tower is not None:
+                self.tower.update(dt, v)
             v.step(dt, self.aero, self.wind)
             self.time += dt
             if len(self.trail) == 0 or np.linalg.norm(v.pos - self.trail[-1]) > 4.0:
                 self.trail.append(v.pos.copy())
                 if len(self.trail) > 1500:
                     self.trail.pop(0)
+            if self.tower is not None and self.tower.events:
+                self.events.extend((self.time, e) for e in self.tower.events)
+                self.tower.events.clear()
             if v.state != previous_state:
                 self.events.append((self.time, f"{v.state}{': ' + v.crash_reason if v.crash_reason else ''}"))
             if self.autopilot_on:

@@ -7,7 +7,7 @@ import * as ZH from "./zh.js";
 
 const $ = (id) => document.getElementById(id);
 const PHASES = ["COAST", "BOOSTBACK", "LANDING BURN", "LANDED"];
-const PHASE_COL = { STANDBY: "#7f93a6", MANUAL: "#46d6ff", COAST: "#46d6ff", BOOSTBACK: "#ff5ef0", "LANDING BURN": "#ffb43c", TERMINAL: "#5dff9a", LANDED: "#5dff9a", FALLBACK: "#ff5a4e" };
+const PHASE_COL = { STANDBY: "#7f93a6", MANUAL: "#46d6ff", COAST: "#46d6ff", BOOSTBACK: "#ff5ef0", "LANDING BURN": "#ffb43c", TERMINAL: "#5dff9a", LANDED: "#5dff9a", CAUGHT: "#5dff9a", FALLBACK: "#ff5a4e" };
 
 function fmt(x, d = 1) { return x === null || x === undefined || !isFinite(x) ? "--" : x.toFixed(d); }
 function kN(n) { return Math.abs(n) >= 1e5 ? (n / 1000).toFixed(0) + " kN" : (n / 1000).toFixed(1) + " kN"; }
@@ -250,7 +250,7 @@ export class HUD {
       drawPropulsion(propCv, st);
       const burning = st.throttle > 0.01 && st.state === "FLYING";
       const tag = document.getElementById("propTag");
-      const txt = st.state === "LANDED" ? "LANDED" : burning ? (st.phase === "BOOSTBACK" ? "BOOSTBACK BURN" : st.phase === "LANDING BURN" ? "LANDING BURN" : "ENGINE ON") : st.state === "FLYING" ? "COAST" : "STANDBY";
+      const txt = st.state === "LANDED" || st.state === "CAUGHT" ? st.state : burning ? (st.phase === "BOOSTBACK" ? "BOOSTBACK BURN" : st.phase === "LANDING BURN" ? "LANDING BURN" : "ENGINE ON") : st.state === "FLYING" ? "COAST" : "STANDBY";
       if (tag.textContent !== txt) tag.textContent = txt;
     }
     const phase = st.phase;
@@ -265,7 +265,7 @@ export class HUD {
     $("vs").style.color = vs < -60 ? "var(--amber)" : "";
     $("tgo").textContent = st.tgo === null || st.tgo < 0 ? "--.-" : st.tgo.toFixed(1) + " s";
     const pb = $("phaseBadge");
-    const shown = st.state === "CRASHED" ? "CRASHED" : st.state === "LANDED" ? "LANDED" : st.state === "ON PAD" ? "ON PAD" : phase;
+    const shown = st.state === "CRASHED" ? "CRASHED" : st.state === "LANDED" || st.state === "CAUGHT" ? st.state : st.state === "ON PAD" ? "ON PAD" : phase;
     pb.textContent = ZH.phase(shown);
     const pc = st.state === "CRASHED" ? "#ff5a4e" : PHASE_COL[shown] || "#46d6ff";
     pb.style.color = pc; pb.style.borderColor = pc; pb.style.background = pc + "22";
@@ -275,7 +275,7 @@ export class HUD {
     const visited = new Set(st.visited || []);
     for (const el of $("ladder").children) {
       const p = el.dataset.p;
-      const on = st.autopilot && (p === phase || (p === "LANDED" && st.state === "LANDED"));
+      const on = st.autopilot && (p === phase || (p === "LANDED" && (st.state === "LANDED" || st.state === "CAUGHT")));
       el.className = "step" + (on ? " on" : visited.has(p) ? " done" : "");
     }
     $("apMode").textContent = st.autopilot ? "G-FOLD 3D" : "手动";
@@ -302,7 +302,7 @@ export class HUD {
     setLamp($("lWIND"), st.wind_on ? "on" : "");
     const fuelFrac = (st.fuel.lox + st.fuel.rp1) / (st.fuel.lox_cap + st.fuel.rp1_cap);
     setLamp($("lFUEL"), fuelFrac < 0.03 ? "red" : fuelFrac < 0.1 ? "amb" : "");
-    setLamp($("lCONT"), st.feet > 0 ? "on" : "");
+    setLamp($("lCONT"), st.feet > 0 || st.catch > 0 ? "on" : "");
 
     // Resources.
     const f = st.fuel;

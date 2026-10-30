@@ -218,6 +218,7 @@ class Vehicle:
     def __init__(self, spec: VehicleSpec | None = None) -> None:
         self.spec = spec or VehicleSpec()
         self.controls = Controls()
+        self.structure = None            # catch tower (tower.CatchTower) or None: just the pad
         self.reset()
 
     # ----------------------------------------------------------- state
@@ -247,6 +248,7 @@ class Vehicle:
         self.time = 0.0
         self.settle_timer = 0.0
         self.feet_contact = 0
+        self.catch_contact = 0           # collar points resting on the catch arms
         self.last = {"thrust": np.zeros(3), "aero": np.zeros(3), "aero_moment": np.zeros(3), "mass_flow": 0.0, "isp": s.isp_sl,
                      "thrust_mag": 0.0, "g": G0}
         if on_pad:
@@ -339,7 +341,7 @@ class Vehicle:
         ``aero`` is a callable ``aero(vehicle, v_rel, rho, a, com_world)``
         returning ``(force_world, moment_world_about_com, info)``.
         """
-        if self.state in ("CRASHED", "LANDED"):
+        if self.state in ("CRASHED", "LANDED", "CAUGHT"):
             return
         s = self.spec
         c = self.controls
@@ -401,6 +403,10 @@ class Vehicle:
         f_contact, t_contact_b = self._contact(R, com, dt, m)
         force_w = force_w + f_contact
         torque_b = torque_b + t_contact_b
+        if self.structure is not None and self.state in ("FLYING", "CAUGHT"):
+            f_tower, t_tower_b = self.structure.contact(self, R, com, dt, m)
+            force_w = force_w + f_tower
+            torque_b = torque_b + t_tower_b
 
         if self.state == "ON PAD":
             if (R @ f_thrust_b)[2] <= m * g * 1.001:
