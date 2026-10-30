@@ -22,7 +22,9 @@ TILT_BUDGET = ([0.3, 1.5, 3.0, 12.0, 40.0], [0.6, 2.0, 5.0, 10.0, 75.0])
 # free at low speed; tight where the aerodynamic moment and the body lift of the
 # engines-first booster (opposing its tilt) outweigh TVC and the thrust's side
 # part -- e.g. a fast low divert cannot be flown nose-first towards the pad.
-Q_AOA_BUDGET = ([500.0, 1500.0, 2500.0, 8000.0], [90.0, 60.0, 30.0, 12.0])
+# Below ~0.5 kPa slightly nose-first is still holdable (a slow sideways cruise
+# needs it against the broadside drag).
+Q_AOA_BUDGET = ([300.0, 800.0, 1500.0, 2500.0, 8000.0], [115.0, 90.0, 60.0, 30.0, 12.0])
 
 
 class Autopilot3D:
@@ -238,7 +240,7 @@ class Autopilot3D:
             max_tilt_deg=float(max(np.interp(veh.altitude, [20.0, 120.0, 500.0], [6.0, 14.0, self.divert_tilt_deg]),
                                    min(self.divert_tilt_deg, 2.0 * float(np.linalg.norm(veh.vel[:2]))))),
             touchdown_speed=self.gate_speed, target_alt=self.gate_height, target_xy=tuple(self._gate_xy),
-            sink_gain=self.sink_gain, q_aoa=Q_AOA_BUDGET,
+            sink_gain=self.sink_gain,
         )
 
     @staticmethod
@@ -528,6 +530,11 @@ class Autopilot3D:
         if sn < 1e-9:
             return accel
         d_new = w * math.cos(aoa) + side / sn * math.sin(aoa)
+        if d_new[2] > 0.2 and accel[2] > 0.0:
+            # Keep the commanded vertical acceleration: the limit only gives
+            # up horizontal thrust (with a sideways flow, turning the thrust
+            # towards it would otherwise turn lost push into lift -- a climb).
+            return d_new * float(accel[2]) / float(d_new[2])
         # the part of the command along the allowed direction
         return d_new * an * max(0.0, math.cos(ang - aoa))
 
@@ -642,7 +649,16 @@ class Autopilot3D:
         self.phase = "COAST"
         c.fins_deploy = True                    # grid fins out after the boost-back
         self._mark()
-        if ignite_now:
+        # Low, slow and far off (no boost-back, too little speed to glide):
+        # falling first only loses the height the divert needs -- light now
+        # and let the landing burn fly it.
+        divert_now = (not self._boostback_done and r[2] < self.boostback_min_alt and airspeed < 100.0
+                      and miss > max(150.0, 0.5 * r[2]))
+        if ignite_now or divert_now:
+            if not math.isfinite(t_burn):
+                # not falling yet: fall time plus the sideways transfer
+                h, vz = max(0.0, float(r[2])), float(v[2])
+                t_burn = (vz + math.sqrt(vz * vz + 2.0 * G0 * h)) / G0 + 2.0 * math.sqrt(miss / 3.0)
             self._ignite(veh, r, v, m, wind_now, t_burn)
             return
         c.throttle = 0.0
