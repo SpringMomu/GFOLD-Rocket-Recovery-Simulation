@@ -13,6 +13,8 @@ Second-order-cone program over N+1 knots with first-order-hold thrust:
                                                            the max-burn mass z0_k)
     z_N >= ln(m_dry) - s_fuel                             (propellant limit)
     ||(x_k, y_k)|| <= tan(gamma) (h_k + s_k)              (glide-slope cone, soft)
+    n_j . r_k >= b_j - s_j                                (keep-out half-spaces, soft:
+                                                           obstacles, see separating_planes)
     u_z,k >= cos(theta(t_go)) sigma_k                     (pointing: vertical at the end)
     |sigma_{k+1} - sigma_k|, |u_{x/y,k+1} - u_{x/y,k}| <= rate * dt
     r_N = 0, v_N = (0, 0, -v_td)                           (exact L1 penalty)
@@ -61,6 +63,134 @@ class PlanConfig3D:
     # drag model then also returns the predicted dynamic pressure and flow
     # direction at each interval.
     q_aoa: tuple | None = None
+    # Obstacles (soft): callable(knot times) -> [(k, n, b), ...], each asking
+    # n . r_k >= b; see separating_planes.
+    keep_out: Callable | None = None
+
+
+@dataclass
+class KeepOutBox:
+    """Obstacle for the planned base point: an oriented box, already grown
+    by the vehicle's radius, length and a margin (planner coordinates)."""
+
+    center: np.ndarray
+    axes: np.ndarray          # 3x3, columns = unit axes
+    half: np.ndarray          # half extents along the axes
+
+
+def _inside(box, p) -> bool:
+    return bool(np.all(np.abs(box.axes.T @ (np.asarray(p, float) - box.center)) < box.half))
+
+
+def _segment_hit(boxes, a, b, step=1.0):
+    """First box the segment a -> b passes through: (box, last point before
+    it, first point after it), or None."""
+    n = max(2, int(np.linalg.norm(b - a) / step) + 2)
+    pts = a + np.outer(np.linspace(0.0, 1.0, n), b - a)
+    first = None
+    for box in boxes:
+        inside = np.all(np.abs((pts - box.center) @ box.axes) < box.half, axis=1)
+        if inside.any():
+            i = int(np.argmax(inside))
+            if first is None or i < first[0]:
+                first = (i, box, inside)
+    if first is None:
+        return None
+    i, box, inside = first
+    out = np.nonzero(~inside[i:])[0]
+    return box, (pts[i - 1] if i > 0 else a), (pts[i + int(out[0])] if len(out) else b)
+
+
+def detour_path(boxes, start, end, z_min=-math.inf, climb_cost=5.0, rounds=4):
+    """Reference path from ``start`` to ``end`` around the keep-out boxes.
+
+    Where the straight line crosses a box, its last point before and first
+    point after the box are both moved just outside one side (over the top,
+    round a side, or underneath; whichever is shortest, climbing counting
+    ``climb_cost`` times).  The path only serves to pick the face each knot
+    must stay outside of -- the trajectory itself is optimised by the SOCP.
+    """
+    pts = [np.asarray(start, float), np.asarray(end, float)]
+    for _ in range(rounds):
+        for j in range(len(pts) - 1):
+            a, b = pts[j], pts[j + 1]
+            hit = _segment_hit(boxes, a, b)
+            if hit is not None:
+                break
+        else:
+            return pts
+        box, p_in, p_out = hit
+        l_in = box.axes.T @ (p_in - box.center)
+        l_out = box.axes.T @ (p_out - box.center)
+        best = None
+        for i in range(3):
+            for sgn in (1.0, -1.0):
+                w1, w2 = l_in.copy(), l_out.copy()
+                w1[i] = w2[i] = sgn * (box.half[i] + 1.0)
+                w1, w2 = box.center + box.axes @ w1, box.center + box.axes @ w2
+                if min(w1[2], w2[2]) < z_min or any(_inside(o, w) for o in boxes for w in (w1, w2)):
+                    continue
+                legs = ((a, w1), (w1, w2), (w2, b))
+                if any(_segment_hit([box], p, q) is not None for p, q in legs):
+                    continue
+                cost = sum(float(np.linalg.norm(q - p)) + climb_cost * max(0.0, float(q[2] - p[2])) for p, q in legs)
+                if best is None or cost < best[0]:
+                    best = (cost, w1, w2)
+        if best is None:
+            return pts
+        pts[j + 1:j + 1] = [best[1], best[2]]
+    return pts
+
+
+def along_path(pts, fractions):
+    """Points at the given fractions (0..1) of the length of a polyline."""
+    pts = np.asarray(pts, float)
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = max(cum[-1], 1e-9)
+    out = []
+    for f in fractions:
+        s = float(np.clip(f, 0.0, 1.0)) * total
+        j = min(int(np.searchsorted(cum, s, side="right")) - 1, len(seg) - 1)
+        u = (s - cum[j]) / max(seg[j], 1e-9)
+        out.append(pts[j] + (pts[j + 1] - pts[j]) * u)
+    return out
+
+
+def separating_planes(boxes, points, target=None, reach=60.0):
+    """Linearised obstacle avoidance (successive convexification).
+
+    Keeping a point out of a convex box is not convex, but staying on the
+    outer side of one of its faces is (a half-space).  For each reference
+    point (the previous plan, or a detour, at the new knot times) and each
+    box within ``reach``, pick a face the point is outside of and require
+    that half-space: ``[(k, n, b)]`` with n . r_k >= b.  A face the
+    ``target`` is outside of too is preferred: it never conflicts with
+    arriving (e.g. "stay east of the tower" rather than "stay above it",
+    which would hold the descent up); otherwise the face the point is most
+    clearly outside of (or least inside).  The segment between two knots on
+    the same side of a face stays out of the box too; only turning a corner
+    between knots can clip it, which the margin covers.
+    """
+    out = []
+    for k, p in enumerate(points):
+        for box in boxes:
+            rel = box.axes.T @ (np.asarray(p, float) - box.center)
+            rel_t = None if target is None else box.axes.T @ (np.asarray(target, float) - box.center)
+            best = None
+            for i in range(3):
+                for sgn in (1.0, -1.0):
+                    d = sgn * rel[i] - box.half[i]
+                    shared = rel_t is not None and d >= 0.0 and sgn * rel_t[i] - box.half[i] >= 0.0
+                    key = (shared, d)
+                    if best is None or key > best[0]:
+                        best = (key, d, i, sgn)
+            _, d, i, sgn = best
+            if d > reach:
+                continue
+            n = sgn * box.axes[:, i]
+            out.append((k, n, float(n @ box.center + box.half[i])))
+    return out
 
 
 @dataclass
@@ -83,6 +213,7 @@ class Plan3D:
     lateral_violation: float = 0.0
     aoa_violation: float = 0.0
     climb_violation: float = 0.0
+    keep_out_violation: float = 0.0
     created_at: float = 0.0
 
     @property
@@ -94,9 +225,15 @@ class Plan3D:
         # Reaching the pad by breaking the flyability limits (much faster
         # sideways than allowed, nose-first, climbing) does not count: the
         # tracker cannot follow such a plan, so the time must move instead.
+        return self.reaches()
+
+    def reaches(self, climb_ok: bool = False) -> bool:
+        """``reaches_pad``; with ``climb_ok`` a climb is allowed (e.g. a hop
+        over an obstacle that stands between a low booster and the gate)."""
         return (self.terminal_position_error < 1.0 and self.terminal_velocity_error < 0.8
                 and self.glide_violation < 1.0 and self.fuel_violation < 1e-3
-                and self.lateral_violation < 3.0 and self.climb_violation < 2.0)
+                and self.lateral_violation < 3.0 and (climb_ok or self.climb_violation < 2.0)
+                and self.keep_out_violation < 0.5)
 
     @property
     def final_mass(self) -> float:
@@ -161,6 +298,7 @@ class Planner3D:
     approach_cone_gain = 0.35      # ... + m per m of height
     approach_cone_weight = 60.0
     approach_cone_t = (6.0, 10.0)  # s to go: full weight -> none
+    keep_out_weight = 2000.0       # per m inside an obstacle's half-space (per s)
 
     def __init__(self) -> None:
         self.solve_count = 0
@@ -198,7 +336,10 @@ class Planner3D:
         iao = ivs + N                  # angle-of-attack slacks, knots 1..N
         icl = iao + N                  # no-climb slacks, knots 1..N
         iap = icl + N                  # final-approach-cone slacks, knots 1..N
-        n = iap + N
+        ikp = iap + N                  # keep-out slacks, one per half-space
+        t_k = np.arange(N + 1) * dt
+        keep = [kp for kp in cfg.keep_out(t_k) if kp[0] >= 1] if cfg.keep_out is not None else []
+        n = ikp + len(keep)
 
         def S(k, c):
             return NX * k + c
@@ -219,7 +360,6 @@ class Planner3D:
                 drag = np.asarray(res, float).reshape(N, 3)
         else:
             drag = np.zeros((N, 3))
-        t_k = np.arange(N + 1) * dt
         m_ref = np.maximum(cfg.dry_mass, m0 - alpha * cfg.thrust_max * t_k)
         z0 = np.log(m_ref)
         mu2 = cfg.thrust_max * np.exp(-z0)
@@ -273,6 +413,10 @@ class Planner3D:
             row([(icl + k, -1.0)], 0.0)
         for k in range(N):
             row([(iap + k, -1.0)], 0.0)
+        # Obstacles: n . r_k + s >= b  ->  -n . r_k - s <= -b
+        for j, (k, nrm, b_) in enumerate(keep):
+            row([(ikp + j, -1.0)], 0.0)
+            row([(S(k, c), -float(nrm[c])) for c in range(3) if nrm[c] != 0.0] + [(ikp + j, -1.0)], -b_)
         # The landing burn only descends (soft): a divert is flown sinking,
         # never by climbing back up or hovering to wait.
         for k in range(1, N + 1):
@@ -451,10 +595,12 @@ class Planner3D:
         # only the last seconds: earlier a low, far booster must not be
         # pushed up to get inside it
         q[iap:iap + N] = self.approach_cone_weight * dt * np.interp(t_f - t_k[1:], self.approach_cone_t, [1.0, 0.0])
+        q[ikp:n] = self.keep_out_weight * dt
         for i in range(n):
             add_p(i, i, 1e-7)
         P = hessian.matrix()
-        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, isg=isg, ifs=ifs, ivs=ivs, iao=iao, icl=icl, NX=NX, G=Gm)
+        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, isg=isg, ifs=ifs, ivs=ivs, iao=iao, icl=icl, ikp=ikp, n=n,
+                      NX=NX, G=Gm)
         return P, q, A, b_vec, n_zero, n_nonneg, soc_dims, layout, drag, const
 
     def solve(self, r0, v0, m0, t_f, cfg: PlanConfig3D) -> Plan3D | None:
@@ -481,6 +627,7 @@ class Planner3D:
             lateral_violation=float(np.max(x[L["ivs"]: L["ivs"] + N], initial=0.0)),
             aoa_violation=float(np.max(x[L["iao"]: L["iao"] + N], initial=0.0)),
             climb_violation=float(np.max(x[L["icl"]: L["icl"] + N], initial=0.0)),
+            keep_out_violation=float(np.max(x[L["ikp"]: L["n"]], initial=0.0)),
         )
 
     def search(self, r0, v0, m0, lo, hi, cfg, evaluations=10):
