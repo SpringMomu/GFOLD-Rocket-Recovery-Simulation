@@ -74,6 +74,12 @@ class PlanConfig3D:
     # plan: the envelope widens with height, and without this a plan would
     # climb just to fly sideways faster.  Normally the height at ignition.
     lateral_ref_height: float | None = None
+    # Wind trim (m/s^2, x and y): the sideways thrust acceleration that holds
+    # the upright booster against the wind near the end.  The tilt cone is
+    # centred on the trim axis (lean into the wind) instead of the vertical,
+    # like the tracker's tilt budget.
+    tilt_trim: tuple = (0.0, 0.0)
+    trim_fade: tuple = (0.5, 5.5)    # m above the gate: upright below, full trim above
 
 
 @dataclass
@@ -434,6 +440,9 @@ class Planner3D:
         row([(S(N, 6), -1.0), (ifs, -1.0)], -math.log(cfg.dry_mass))
         t_go = t_f - t_k
         tilt = self._tilt_limit(t_go, cfg.max_tilt_deg)
+        # Height the final approach (sink envelope) is at t_go before the end.
+        c_s = cfg.sink_gain if cfg.sink_gain > 0.0 else 0.5
+        h_go = abs(cfg.touchdown_speed) / c_s * np.expm1(c_s * np.minimum(t_go, 20.0))
         if q_mid is not None and cfg.q_aoa is not None:
             # Same angle-of-attack cap as the tracker (knots 1..N, flow of the
             # interval before): the plan must not count on an attitude the
@@ -457,8 +466,13 @@ class Planner3D:
         tilt_now = math.atan2(float(np.linalg.norm(un[:2])), max(1e-6, float(un[2]))) if cfg.engine_on else math.radians(75.0)
         tilt[0] = max(tilt[0], min(math.radians(80.0), tilt_now + math.radians(5.0)))
         cos_tilt = np.cos(tilt)
+        fade = np.interp(h_go, cfg.trim_fade, (0.0, 1.0))
         for k in range(N + 1):
-            row([(U(k, 3), float(cos_tilt[k])), (U(k, 2), -1.0)], 0.0)
+            # u . axis >= cos(tilt) sigma  (cone about the wind-trim axis,
+            # upright at the very end like the tracker's)
+            axis = np.array([float(cfg.tilt_trim[0]) * fade[k], float(cfg.tilt_trim[1]) * fade[k], G0])
+            axis /= np.linalg.norm(axis)
+            row([(U(k, 3), float(cos_tilt[k]))] + [(U(k, c), -float(axis[c])) for c in range(3) if axis[c] != 0.0], 0.0)
         rate_s = 0.8 * 1.2 * cfg.thrust_max / m0 * dt
         lat = self.lateral_rate * dt
         for k in range(N):

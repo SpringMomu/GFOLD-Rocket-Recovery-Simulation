@@ -15,8 +15,14 @@ from .attitude import attitude_control
 from .planner import KeepOutBox, Plan3D, PlanConfig3D, Planner3D, along_path, detour_path, separating_planes
 from .vehicle import G0, atmosphere
 
-# Landing-burn tilt budget vs height (m -> deg): upright at contact.
-TILT_BUDGET = ([0.3, 1.5, 3.0, 12.0, 40.0], [0.6, 2.0, 5.0, 10.0, 75.0])
+# Landing-burn tilt budget vs height (m -> deg): upright at contact.  It is
+# measured from the wind trim (Autopilot3D._trim_xy: in a cross wind the
+# booster holds its place leaning into the wind), which fades out over the
+# last TRIM_FADE metres.  (Holding the planner to this budget too was tried:
+# it then gives up the last-seconds corrections the tracker can still
+# partly fly, and lands further off in wind.)
+TILT_BUDGET = ([0.3, 1.5, 3.0, 8.0, 15.0, 40.0], [0.6, 2.0, 5.0, 12.0, 20.0, 75.0])
+TRIM_FADE = (0.5, 5.5)          # m: upright below the first height, full trim above the second
 # Angle of attack (thrust vs the oncoming flow) vs dynamic pressure (Pa -> deg):
 # free at low speed; tight where the aerodynamic moment and the body lift of the
 # engines-first booster (opposing its tilt) outweigh TVC and the thrust's side
@@ -117,6 +123,20 @@ class Autopilot3D:
     catch_settle_speed = 0.6
     catch_hold_max = 25.0         # s; then settle anyway
     glide_gain = 1.5
+    # Wind profile for the predictions: the wind measured now, extrapolated
+    # to other heights with a log-law profile whose shear strength k (as in
+    # vehicle.Wind: 0 = the same at every height, 1 = the standard log law)
+    # is fitted to the winds measured on the way down; with little height
+    # spread in the samples the prior k = 1 wins.
+    wind_sample_period = 0.25     # s
+    wind_memory = 60.0            # s, e-folding age of the samples
+    wind_shear_prior_weight = 0.003   # (shapes of nearby k differ little: a stronger prior hides real shear)
+    # Wind trim: the sideways thrust acceleration that cancels the aerodynamic
+    # force on the upright booster (lean into the wind).  The tracker's tilt
+    # budget and the planner's tilt cone are both centred on it (fading to
+    # upright over the last TRIM_FADE metres).
+    trim_max_deg = 12.0
+    trim_filter = 0.5             # s
     # attitude loop
     k_angle = 2.0
     k_rate = 4.0
@@ -159,6 +179,11 @@ class Autopilot3D:
         self.burn_fraction = self.burn_fraction_nominal
         self.thrust_scale = 1.0       # measured / modelled engine thrust (accelerometer estimate)
         self._wind_ref = (np.zeros(3), 10.0)
+        self._wind_samples: list = []   # (time, height, wind x, wind y)
+        self._next_wind_sample = 0.0
+        self._next_shear_fit = 0.0
+        self.wind_shear_est = 1.0
+        self._trim_xy = np.zeros(2)
         self._failed = 0
         self._boostback = False
         self._boostback_done = False
@@ -244,8 +269,8 @@ class Autopilot3D:
                     m = float(math.exp(prev.z[k]))
                     sig = max(3.0, prev.sigma_at(tau))
                     u_ref = acc
-                rho, _, _, a = atmosphere(max(0.0, h))
-                vr = v - wind_now
+                rho, _, _, a = atmosphere(max(0.0, h + self.h_off))
+                vr = v - self._wind(h)          # the wind where the plan will be, not the wind here
                 sp = float(np.linalg.norm(vr))
                 qd[i] = 0.5 * rho * sp * sp
                 if sp < 3.0:
@@ -336,6 +361,7 @@ class Autopilot3D:
             touchdown_speed=self.gate_speed, target_alt=self.gate_height, target_xy=tuple(self._gate_xy),
             sink_gain=self.sink_gain, keep_out=keep_out, relax=self.relax,
             lateral_ref_height=self._h_ignition,
+            tilt_trim=tuple(self._gate_trim(veh)), trim_fade=TRIM_FADE,
         )
 
     @staticmethod
@@ -345,12 +371,72 @@ class Autopilot3D:
         return s.thrust_vac - (s.thrust_vac - s.thrust_sl) * min(1.0, p / 101_325.0)
 
     # ------------------------------------------------------- predictions
+    @staticmethod
+    def _profile(z, k):
+        """Log-law shear profile of strength k relative to the 10 m wind (vehicle.Wind)."""
+        f = np.clip(np.log(np.maximum(0.5, z) / 0.05) / math.log(10.0 / 0.05), 0.25, 2.6)
+        return np.maximum(0.05, 1.0 + k * (f - 1.0))
+
     def _wind(self, z):
-        """Wind assumed at height ``z`` for the predictions: the wind measured
-        now, scaled with a standard log-law shear profile (roughness 5 cm)."""
+        """Wind assumed at height ``z`` (planner coordinates) for the
+        predictions: the wind measured now, scaled with the estimated profile."""
         w, z_now = self._wind_ref
-        shape = math.log(max(0.5, z + self.h_off) / 0.05) / math.log(max(0.5, z_now) / 0.05)
-        return w * float(np.clip(shape, 0.3, 3.0))
+        k = self.wind_shear_est
+        shape = float(self._profile(z + self.h_off, k) / self._profile(z_now, k))
+        return w * min(6.0, shape)
+
+    def _update_trim(self, veh, wind_now, dt):
+        """Filtered wind trim (sideways thrust acceleration that holds the
+        upright booster against the aerodynamic force on it)."""
+        if self.aero is None:
+            return
+        rho, _, _, a_s = atmosphere(max(0.0, float(veh.pos[2])))
+        f = self.aero.quick_force(veh.vel - wind_now, np.array([0.0, 0.0, 1.0]), rho, a_s, veh.legs)
+        target = -f[:2] / veh.mass
+        cap = math.tan(math.radians(self.trim_max_deg)) * G0
+        n = float(np.linalg.norm(target))
+        if n > cap:
+            target *= cap / n
+        self._trim_xy += (target - self._trim_xy) * min(1.0, dt / self.trim_filter)
+
+    def _gate_trim(self, veh) -> np.ndarray:
+        """Wind trim (sideways thrust acceleration, m/s^2) near the end of the
+        burn in the predicted wind: the planner's tilt cone is centred on it."""
+        if self.aero is None:
+            return np.zeros(2)
+        z = self.gate_height + 2.0
+        rho, _, _, a_s = atmosphere(max(0.0, z + self.h_off))
+        vr = np.array([0.0, 0.0, -self.gate_speed]) - self._wind(z)
+        t = -self.aero.quick_force(vr, np.array([0.0, 0.0, 1.0]), rho, a_s, 1.0)[:2] / veh.mass
+        cap = math.tan(math.radians(self.trim_max_deg)) * G0
+        n = float(np.linalg.norm(t))
+        return t * (cap / n) if n > cap else t
+
+    def _update_wind_profile(self, veh, wind_now):
+        """Record the measured wind and refit the shear strength (every 1 s)."""
+        if self.elapsed >= self._next_wind_sample:
+            self._next_wind_sample = self.elapsed + self.wind_sample_period
+            self._wind_samples.append((self.elapsed, max(0.5, float(veh.altitude)), float(wind_now[0]), float(wind_now[1])))
+            cut = self.elapsed - 3.0 * self.wind_memory
+            while self._wind_samples and self._wind_samples[0][0] < cut:
+                self._wind_samples.pop(0)
+        if self.elapsed < self._next_shear_fit or len(self._wind_samples) < 8:
+            return
+        self._next_shear_fit = self.elapsed + 1.0
+        a = np.asarray(self._wind_samples)
+        wt = np.exp(-(self.elapsed - a[:, 0]) / self.wind_memory)
+        w = a[:, 2:4]
+        scale = float(np.sum(wt * np.sum(w * w, axis=1)) / np.sum(wt)) + 1e-6
+        best = None
+        for k in np.linspace(0.0, 3.0, 31):
+            sh = self._profile(a[:, 1], k)
+            c = (wt * sh) @ w / max(1e-9, float(np.sum(wt * sh * sh)))       # 10 m wind (2-vector)
+            res = w - np.outer(sh, c)
+            cost = float(np.sum(wt * np.sum(res * res, axis=1)) / np.sum(wt)) / scale
+            cost += self.wind_shear_prior_weight * (k - 1.0) ** 2
+            if best is None or cost < best[0]:
+                best = (cost, float(k))
+        self.wind_shear_est = best[1]
 
     def _burn_need(self, veh, r, v, m, drag_up):
         """(thrust fraction needed for a landing burn started now, burn time, thrust direction)."""
@@ -570,6 +656,7 @@ class Autopilot3D:
         self.elapsed += dt
         self._dt = dt
         self._wind_ref = (np.asarray(wind_now, float).copy(), max(0.5, float(veh.altitude)))
+        self._update_wind_profile(veh, wind_now)
         s = veh.spec
         r, v, m = self._state(veh)
         g = G0
@@ -589,6 +676,7 @@ class Autopilot3D:
             c.legs_down = True
         if self.burn_locked:
             c.fins_deploy = True
+            self._update_trim(veh, wind_now, dt)
 
         if not self.burn_locked:
             self._pre_ignition(veh, r, v, m, wind_now)
@@ -648,15 +736,18 @@ class Autopilot3D:
             # booster opposes its tilt and outweighs the thrust's sideways
             # part, so more tilt would push the wrong way (and feed back).
             max_tilt = math.radians(float(np.interp(h, *TILT_BUDGET)))
-            accel = self._aoa_limit(veh, accel, wind_now, max_tilt)
+            center = self._trim_xy * float(np.interp(h, TRIM_FADE, (0.0, 1.0)))
+            trim_tilt = math.atan2(float(np.linalg.norm(center)), G0)
+            accel = self._aoa_limit(veh, accel, wind_now, max_tilt + trim_tilt)
         else:
             self.phase = "FALLBACK"
             a_max_now = s.thrust_sl / m
             vz_ref = -math.sqrt(2 * 0.5 * (a_max_now - g) * max(h, 0.0)) - self.touchdown_speed
             accel = np.array([-0.08 * r[0] - 0.9 * v[0], -0.08 * r[1] - 0.9 * v[1], g + 1.5 * (vz_ref - v[2])])
             max_tilt = math.radians(35.0)
+            center = None
         self._mark()
-        self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 else None)
+        self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 else None, center=center)
 
     def _catch_hold(self, veh, r, v, dt):
         """Tower catch: hold the collar just above the arm tops, centred on the
@@ -687,7 +778,12 @@ class Autopilot3D:
         self.time_to_go = max(0.0, float(r[2]) / self.catch_settle_speed) if settle else math.nan
         self._mark()
         tilt = math.radians(1.0 if settle else 4.0)
-        self._fly_accel(veh, np.array([a_xy[0], a_xy[1], a_z]), tilt, floor=0.9 * self.minimum_throttle)
+        # Holding: lean into the wind (else it drifts out of the capture
+        # window and the arms never close).  Settling on closed arms: upright,
+        # they hold it sideways.
+        secured = settle and bool(self.catch_link())
+        self._fly_accel(veh, np.array([a_xy[0], a_xy[1], a_z]), tilt, floor=0.9 * self.minimum_throttle,
+                        center=None if secured else self._trim_xy)
 
     @staticmethod
     def _aoa_limit(veh, accel, wind_now, max_tilt):
@@ -719,15 +815,19 @@ class Autopilot3D:
         # the part of the command along the allowed direction
         return d_new * an * max(0.0, math.cos(ang - aoa))
 
-    def _fly_accel(self, veh, accel, max_tilt, floor=None, align_gate=0.35):
+    def _fly_accel(self, veh, accel, max_tilt, floor=None, align_gate=0.35, center=None):
+        """Fly an acceleration command.  The horizontal part is kept within
+        ``max_tilt`` of ``center`` (the wind trim, or upright)."""
         c = veh.controls
         m = veh.mass
         horiz = accel[:2].copy()
         az = max(float(accel[2]), 1e-3)
-        hn = float(np.linalg.norm(horiz))
+        c0 = np.zeros(2) if center is None else np.asarray(center, float) * (az / G0)
+        off = horiz - c0
+        on = float(np.linalg.norm(off))
         lim = math.tan(max_tilt) * az
-        if hn > lim:
-            horiz *= lim / hn
+        if on > lim:
+            horiz = c0 + off * (lim / on)
         accel = np.array([horiz[0], horiz[1], az])
         self.cmd_accel = accel
         mag = float(np.linalg.norm(accel))
