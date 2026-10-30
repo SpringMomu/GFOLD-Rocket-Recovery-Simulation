@@ -66,6 +66,11 @@ export function event(e) {
   if (e === "ARMS CLOSING") return "筷子臂合拢";
   if (e === "CATCH CONTACT") return "挂点落上筷子臂，发动机关机";
   if (e === "WIND OFF") return "风场断开";
+  if ((m = e.match(/^WIND CFG (\d+)-(\d+) ([\d.]+)-([\d.]+) ([\d.]+)$/))) {
+    const dir = m[1] === m[2] ? `来向 ${m[1]}°` : `来向 ${m[1]}°→${m[2]}°`;
+    const spd = m[3] === m[4] ? `${m[3]} m/s` : `${m[3]}–${m[4]} m/s`;
+    return `风场设置：${dir}，风速 ${spd}，切变 ×${m[5]}`;
+  }
   if ((m = e.match(/^CRASHED(?:: (.*))?$/))) return "箭体损毁" + (m[1] ? "：" + crash(m[1]) : "");
   if (PHASE[e]) return PHASE[e];
   return e;

@@ -1,7 +1,8 @@
 // On-screen controls: the menu panel (scenario selector + the keyboard
-// commands as buttons) and the touch flight pad (virtual stick = W/A/S/D,
-// roll, throttle, autopilot / SAS / legs).  Both only send the same inputs as
-// the keyboard; the state they show is read from the snapshot.
+// commands as buttons + the wind sliders) and the touch flight pad (virtual
+// stick = W/A/S/D, roll, throttle, autopilot / SAS / legs).  Both only send
+// inputs (the wind sliders the action "windcfg:<json>"); the state they show
+// is read from the snapshot.
 import * as ZH from "./zh.js";
 
 const $ = (id) => document.getElementById(id);
@@ -10,6 +11,10 @@ const SCENARIOS = ["HOVER-SLAM 100 m", "2000 m / +30 m/s UP", "2000 m / -30 m/s 
   "DIVERT -1000 m / 3-D", "ENTRY 12 km / 280 m/s", "TOWER CATCH 2000 m", "TOWER CATCH BOOSTBACK", "TOWER CATCH ENTRY 12 km",
   "TOWER CATCH OVER TOWER"];
 const PAD_KEY = "booster3d.pad.v1";
+const WIND_KEY = "booster3d.wind.v1";
+// Same as lander3d/vehicle.py Wind(): steady 6 m/s from the west, log-law shear.
+const WIND_DEFAULT = { from: [270, 270], speed: [6, 6], shear: 1 };
+const COMPASS = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"];
 
 export function initControls({ press, command, act }) {
   // ---- touch pad visibility: on by default on touch screens, remembered.
@@ -83,11 +88,70 @@ export function initControls({ press, command, act }) {
   stick.addEventListener("pointercancel", release);
   stick.addEventListener("lostpointercapture", () => { if (sid !== null) release(); });
 
+  // ---- wind: direction range (FROM, clockwise from the first thumb to the
+  // second; first > second wraps through north), speed range at 10 m, shear.
+  const dirIn = [...$("wDir").querySelectorAll("input")];
+  const spdIn = [...$("wSpd").querySelectorAll("input")];
+  const shIn = $("wSh").querySelector("input");
+  let windHold = 0;           // until then the snapshot does not move the sliders (being dragged)
+  let windSent = null, windSentUntil = 0;   // ... nor until it shows what was sent (or 5 s)
+  const sameWind = (a, b) => [0, 1].every((k) => Math.abs(a.from[k] - b.from[k]) < 0.01 && Math.abs(a.speed[k] - b.speed[k]) < 0.01)
+    && Math.abs(a.shear - b.shear) < 0.01;
+  const seg = (el, a, b, max) => {
+    el.style.display = "";
+    el.style.left = `calc(7px + (100% - 14px) * ${a / max})`;
+    el.style.width = `calc((100% - 14px) * ${(b - a) / max})`;
+  };
+  const dirName = (d) => `${Math.round(d)}° ${COMPASS[Math.round((d % 360) / 45) % 8]}`;
+  const windCfg = () => {
+    const sp = spdIn.map((i) => Number(i.value)).sort((x, y) => x - y);
+    return { from: dirIn.map((i) => Number(i.value)), speed: sp, shear: Number(shIn.value) };
+  };
+  const paintWind = () => {
+    const c = windCfg();
+    const [a, b] = c.from;
+    const fd = $("wDir").querySelectorAll(".fill");
+    if (a <= b) { seg(fd[0], a, b, 360); fd[1].style.display = "none"; } else { seg(fd[0], a, 360, 360); seg(fd[1], 0, b, 360); }
+    $("wDirT").textContent = a === b || (a === 0 && b === 360) ? (a === b ? `${dirName(a)} 定常` : "全向") : `${dirName(a)} → ${dirName(b)}`;
+    seg($("wSpd").querySelector(".fill"), c.speed[0], c.speed[1], 30);
+    $("wSpdT").textContent = c.speed[0] === c.speed[1] ? `${c.speed[0].toFixed(1)} m/s 定常` : `${c.speed[0].toFixed(1)}–${c.speed[1].toFixed(1)} m/s`;
+    seg($("wSh").querySelector(".fill"), 0, c.shear, 3);
+    $("wShT").textContent = `×${c.shear.toFixed(1)}` + (c.shear === 0 ? " 各高度相同" : c.shear === 1 ? " 对数风廓线" : "");
+  };
+  const setWind = (c) => {
+    dirIn[0].value = c.from[0]; dirIn[1].value = c.from[1];
+    spdIn[0].value = c.speed[0]; spdIn[1].value = c.speed[1];
+    shIn.value = c.shear;
+    paintWind();
+  };
+  const sendWind = () => {
+    const c = windCfg();
+    act("windcfg:" + JSON.stringify(c));
+    try { localStorage.setItem(WIND_KEY, JSON.stringify(c)); } catch (e) { /* ignore */ }
+    windSent = c; windSentUntil = performance.now() + 5000;
+  };
+  for (const i of [...dirIn, ...spdIn, shIn]) {
+    i.addEventListener("input", () => { windHold = performance.now() + 1500; paintWind(); });
+    i.addEventListener("change", sendWind);
+    i.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+  }
+  $("wReset").addEventListener("click", (ev) => { ev.stopPropagation(); setWind(WIND_DEFAULT); sendWind(); $("wReset").blur(); });
+  // The last settings are remembered (the browser simulator starts afresh on
+  // every load; the server keeps its own until told otherwise).
+  let stored = null;
+  try { stored = JSON.parse(localStorage.getItem(WIND_KEY) || "null"); } catch (e) { stored = null; }
+  if (stored && Array.isArray(stored.from) && Array.isArray(stored.speed) && typeof stored.shear === "number") {
+    setWind(stored); sendWind();
+  } else setWind(WIND_DEFAULT);
+
   // ---- live state of the toggle buttons
   const on = (id, v) => { const el = $(id); if (el) el.classList.toggle("on", !!v); };
   return {
     update(st, view) {
       if (!st) return;
+      const wc = st.wind_cfg, now = performance.now();
+      if (wc && windSent && (sameWind(wc, windSent) || now > windSentUntil)) windSent = null;
+      if (wc && !windSent && now > windHold && !$("windCfg").contains(document.activeElement) && !sameWind(wc, windCfg())) setWind(wc);
       on("tbAP", st.autopilot); on("padAP", st.autopilot);
       on("tbPause", st.paused);
       on("padSAS", st.sas && st.sas !== "OFF");

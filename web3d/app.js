@@ -147,7 +147,7 @@ function command(k) {
 const controls = initControls({ press, command, act });
 
 window.addEventListener("keydown", (ev) => {
-  if (ev.target && ev.target.tagName === "SELECT") return;
+  if (ev.target && (ev.target.tagName === "SELECT" || ev.target.tagName === "INPUT")) return;   // menu controls keep their keys
   const k = ev.key.toLowerCase();
   if (ev.ctrlKey && ["s", "d", "w", "q", "e", "a"].includes(k)) ev.preventDefault();
   if (KEYMAP[k]) { press(k, true); ev.preventDefault(); return; }

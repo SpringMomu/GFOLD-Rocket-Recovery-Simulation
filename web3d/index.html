@@ -179,6 +179,28 @@ kbd { font-family: var(--mono); background: rgba(255,255,255,0.08); border: 1px 
 #toolbar button.on, #pad button.on { color: #00161f; background: var(--cyan); border-color: var(--cyan); }
 #toolbar button:not(.fold):hover { border-color: var(--edge-hi); }
 
+/* wind settings (menu panel): two range sliders + the shear slider.  A range
+   slider is two overlaid <input type=range>; only their thumbs take the
+   pointer, so either end can be dragged. */
+#windCfg { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--edge); }
+#windCfg .wl { display: flex; justify-content: space-between; gap: 8px; margin-top: 4px; color: var(--dim); font-size: 10.5px; }
+#windCfg .wl b { color: var(--cyan); font-weight: 600; font-variant-numeric: tabular-nums; }
+#windCfg .sl { position: relative; height: 22px; touch-action: none; }
+#windCfg .sl .trk, #windCfg .sl .fill { position: absolute; top: 9px; height: 4px; border-radius: 2px; pointer-events: none; }
+#windCfg .sl .trk { left: 7px; right: 7px; background: rgba(140,190,225,0.22); }
+#windCfg .sl .fill { background: var(--cyan); }
+#windCfg input[type=range] { position: absolute; left: 0; top: 0; width: 100%; height: 22px; margin: 0; background: none;
+  -webkit-appearance: none; appearance: none; pointer-events: none; outline: none; }
+#windCfg input[type=range]::-webkit-slider-runnable-track { background: none; border: none; height: 22px; }
+#windCfg input[type=range]::-moz-range-track { background: none; border: none; }
+#windCfg input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; pointer-events: auto; width: 14px; height: 14px; margin-top: 4px;
+  border-radius: 50%; background: #dff6ff; border: 2px solid var(--cyan); cursor: pointer; }
+#windCfg input[type=range]::-moz-range-thumb { pointer-events: auto; width: 10px; height: 10px; border-radius: 50%;
+  background: #dff6ff; border: 2px solid var(--cyan); cursor: pointer; }
+#windCfg input[type=range]:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px rgba(70,214,255,0.35); }
+#windCfg .ticks { display: flex; justify-content: space-between; padding: 0 3px; font-size: 9px; color: var(--dim); margin-top: -3px; }
+#windCfg .wb { display: flex; justify-content: flex-end; margin-top: 4px; }
+
 /* -------------------------------------------------------- touch flight pad */
 #pad { right: 10px; bottom: 10px; display: none; padding-bottom: 10px; }
 #pad .pad-body { display: flex; gap: 12px; align-items: flex-end; }
@@ -360,6 +382,21 @@ body.pad #hint { display: none; }
     <button data-cmd="l">布局复位</button>
     <button data-cmd="h">帮助</button>
   </div>
+  <div id="windCfg">
+    <div class="wl"><span>风向范围（来向）</span><b id="wDirT">-</b></div>
+    <div class="sl" id="wDir"><div class="trk"></div><div class="fill"></div><div class="fill"></div>
+      <input type="range" min="0" max="360" step="5" value="270" aria-label="风向范围起点（来向，度）">
+      <input type="range" min="0" max="360" step="5" value="270" aria-label="风向范围终点（来向，度）"></div>
+    <div class="ticks"><span>北</span><span>东</span><span>南</span><span>西</span><span>北</span></div>
+    <div class="wl"><span>风速范围（10 m 高）</span><b id="wSpdT">-</b></div>
+    <div class="sl" id="wSpd"><div class="trk"></div><div class="fill"></div>
+      <input type="range" min="0" max="30" step="0.5" value="6" aria-label="风速下限（m/s）">
+      <input type="range" min="0" max="30" step="0.5" value="6" aria-label="风速上限（m/s）"></div>
+    <div class="wl"><span>风切变强度</span><b id="wShT">-</b></div>
+    <div class="sl" id="wSh"><div class="trk"></div><div class="fill"></div>
+      <input type="range" min="0" max="3" step="0.1" value="1" aria-label="风切变强度"></div>
+    <div class="wb"><button id="wReset" title="恢复默认：西风 6 m/s，对数风廓线">默认风场</button></div>
+  </div>
 </div>
 
 <div id="pad" class="panel">
@@ -398,6 +435,7 @@ body.pad #hint { display: none; }
     <tr><td><kbd>B</kbd></td><td>切换显示量：染料 / 涡量 / 速度（主视图与风洞截面同步）</td></tr>
     <tr><td><kbd>C</kbd></td><td>作用在箭体上的气动力：工程模型 ↔ 实时 3D CFD（在工程模型 0.5–2 倍范围内采信）</td></tr>
     <tr><td><kbd>Y</kbd></td><td>风场开 / 关</td></tr>
+    <tr><td>风场滑条</td><td>“菜单”面板下方。风向范围（来向，北 → 东 → 南 → 西 → 北，顺时针从左端滑块到右端滑块；左端在右端右边时跨过正北）与风速范围（10 m 高处）：风在范围内缓慢地来回变化（周期约 0.5–1.5 分钟），两端拖到一起就是定常风。风切变强度：0 = 各高度风速相同，1 = 标准对数风廓线（高空约为 10 m 处的 2.6 倍），越大高空风越强。设置会记住；“默认风场”恢复西风 6 m/s、切变 1。自动驾驶只测当前风、按标准对数风廓线外推，风速约 10 m/s 以内、切变不超过 2 时基本能落台，更强的风可能落不准甚至坠毁</td></tr>
     <tr><td><kbd>V</kbd></td><td>相机：环绕（只随鼠标转动）/ 着陆台 / 侧视；拖动旋转，滚轮缩放，双击恢复自动距离</td></tr>
     <tr><td>风洞截面</td><td>截面取世界坐标系竖直面（东—天或北—天），过箭体中点，画面上方始终为天向；滚轮缩放，双击复位，拖右下角调整窗口大小</td></tr>
     <tr><td>拖动面板标题</td><td>移动仪表面板（姿态仪拖顶部把手）；标题栏右侧 <kbd>−</kbd> 折叠成小标签，点小标签展开；<kbd>L</kbd> 恢复默认布局、折叠状态与窗口大小</td></tr>

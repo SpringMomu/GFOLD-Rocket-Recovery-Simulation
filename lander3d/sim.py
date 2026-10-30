@@ -5,6 +5,7 @@ Used by the web server / browser worker and by the headless tests.
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 
@@ -194,6 +195,15 @@ class Sim3D:
         elif action == "wind":
             self.wind.enabled = not self.wind.enabled
             self.events.append((self.time, "WIND " + ("ON" if self.wind.enabled else "OFF")))
+        elif action.startswith("windcfg:"):
+            # {"from": [first, last] deg, "speed": [min, max] m/s, "shear": k}
+            try:
+                cfg = json.loads(action[len("windcfg:"):])
+                self.wind.configure(cfg.get("from"), cfg.get("speed"), cfg.get("shear"))
+            except (ValueError, TypeError, AttributeError, IndexError):
+                return
+            c = self.wind.config()
+            self.events.append((self.time, "WIND CFG {:.0f}-{:.0f} {:.1f}-{:.1f} {:.1f}".format(*c["from"], *c["speed"], c["shear"])))
 
     def handle_input(self, keys: dict, actions: list[str]) -> None:
         """Replace the held-key state and run the queued actions."""

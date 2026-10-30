@@ -129,23 +129,108 @@ def atmosphere(h: float):
     return rho, p, T, math.sqrt(1.4 * 287.05 * T)
 
 
-@dataclass
 class Wind:
-    """Wind toward +x (from the west) with a log shear profile and gusts."""
+    """Wind with a log-law shear profile, gusts, and a direction and speed that
+    wander slowly inside set ranges.
 
-    speed_10m: float = 6.0
-    heading_deg: float = 90.0  # direction the wind blows TOWARD, from north
-    gust: float = 1.8
-    enabled: bool = True
+    ``from_deg`` = (first, last): the arc, clockwise from first to last, that
+    the wind blows FROM (meteorological, degrees from north; last < first
+    wraps through north, (0, 360) is every direction).  ``speed_range`` =
+    (min, max) at 10 m.  Inside the ranges the wind drifts smoothly (periods
+    of ~0.5-1.5 min); equal ends give a steady wind.  ``shear`` scales how far
+    the profile departs from the 10 m speed: 0 = the same speed at every
+    height, 1 = the log law (roughness 5 cm, 0.25-2.6x), 2 = twice the
+    gradient.  The defaults are a steady 6 m/s from the west."""
+
+    SPEED_MAX = 30.0               # m/s at 10 m (front-end slider range)
+    SHEAR_MAX = 3.0
+
+    def __init__(self, speed_10m: float = 6.0, heading_deg: float = 90.0, gust: float = 1.8,
+                 enabled: bool = True, shear: float = 1.0) -> None:
+        self.gust = gust
+        self.enabled = enabled
+        self.shear = shear
+        self.speed_10m = speed_10m
+        self.heading_deg = heading_deg
+
+    # Single-value access (tools, scripts): setting one collapses its range.
+    @property
+    def speed_10m(self) -> float:
+        return 0.5 * (self.speed_range[0] + self.speed_range[1])
+
+    @speed_10m.setter
+    def speed_10m(self, v: float) -> None:
+        self.speed_range = (float(v), float(v))
+
+    @property
+    def heading_deg(self) -> float:
+        """Direction the wind blows TOWARD (middle of the range), from north."""
+        a, span = self._arc()
+        return (a + 0.5 * span + 180.0) % 360.0
+
+    @heading_deg.setter
+    def heading_deg(self, v: float) -> None:
+        f = (float(v) + 180.0) % 360.0
+        self.from_deg = (f, f)
+
+    def configure(self, from_deg=None, speed=None, shear=None) -> None:
+        """Set the ranges (clamped to the front end's slider ranges).  Raises
+        ValueError, changing nothing, unless each given range is two finite
+        numbers and the shear one."""
+
+        def pair(v, hi):
+            if len(v) != 2:
+                raise ValueError("a range needs two values")
+            x = [float(e) for e in v]
+            if not all(math.isfinite(e) for e in x):
+                raise ValueError("non-finite value")
+            return tuple(min(hi, max(0.0, e)) for e in x)
+
+        frm = None if from_deg is None else pair(from_deg, 360.0)
+        spd = None if speed is None else tuple(sorted(pair(speed, self.SPEED_MAX)))
+        k = None if shear is None else float(shear)
+        if k is not None and not math.isfinite(k):
+            raise ValueError("non-finite shear")
+        if frm is not None:
+            self.from_deg = frm
+        if spd is not None:
+            self.speed_range = spd
+        if k is not None:
+            self.shear = min(self.SHEAR_MAX, max(0.0, k))
+
+    def config(self) -> dict:
+        return {"from": [round(x, 1) for x in self.from_deg], "speed": [round(x, 2) for x in self.speed_range],
+                "shear": round(self.shear, 2)}
+
+    def _arc(self):
+        a, b = self.from_deg
+        span = b - a if b >= a else b - a + 360.0
+        return a, span
+
+    @staticmethod
+    def _wander(t: float, p1: float, p2: float, ph: float) -> float:
+        """Smooth, deterministic 0..1 drift (two incommensurate periods)."""
+        x = 0.6 * math.sin(2.0 * math.pi * t / p1 + ph) + 0.4 * math.sin(2.0 * math.pi * t / p2 + 2.1 * ph + 0.9)
+        return 0.5 + 0.5 * x
+
+    def mean_at(self, t: float):
+        """(direction the wind blows TOWARD in degrees, speed at 10 m) at time t."""
+        a, span = self._arc()
+        lo, hi = self.speed_range
+        frm = a + span * self._wander(t, 83.0, 37.0, 0.3)
+        return (frm + 180.0) % 360.0, lo + (hi - lo) * self._wander(t, 61.0, 29.0, 1.7)
 
     def at(self, pos, t: float) -> np.ndarray:
         if not self.enabled:
             return np.zeros(3)
         z = max(0.5, float(pos[2]))
-        profile = self.speed_10m * min(2.6, max(0.25, math.log(z / 0.05) / math.log(10.0 / 0.05)))
+        log_law = min(2.6, max(0.25, math.log(z / 0.05) / math.log(10.0 / 0.05)))
+        toward, s10 = self.mean_at(t)
+        # (shear 1 exactly as before: the regression results stay bit for bit)
+        profile = s10 * (log_law if self.shear == 1.0 else max(0.0, 1.0 + self.shear * (log_law - 1.0)))
         g = self.gust * (0.55 * math.sin(0.31 * t + 0.002 * pos[0]) + 0.3 * math.sin(0.97 * t + 1.7) + 0.15 * math.sin(2.3 * t + 0.4))
         s = profile + g
-        a = math.radians(self.heading_deg)
+        a = math.radians(toward)
         gy = self.gust * 0.35 * math.sin(0.53 * t + 0.8)
         return np.array([math.sin(a) * s, math.cos(a) * s + gy, 0.25 * g])
 

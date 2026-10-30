@@ -83,7 +83,7 @@ def snapshot(sim: Sim3D) -> dict:
                      "cp_z": round(float(a.get("cp_z", zc)), 3), "com_z": round(zc, 3), "source": a.get("source", "MODEL"),
                      "force": _vec(a.get("force", np.zeros(3))), "tail_first": bool(a.get("tail_first", True)),
                      "rho": round(rho, 4), "cfd_forces": sim.aero.cfd_forces},
-            "wind": _vec(wind), "wind_on": sim.wind.enabled,
+            "wind": _vec(wind), "wind_on": sim.wind.enabled, "wind_cfg": sim.wind.config(),
             "plan": [_vec(pt) for pt in plan], "trail": [_vec(pt) for pt in trail],
             "touchdown": v.touchdown, "tower": None if sim.tower is None else sim.tower.snapshot(), "events": [[round(t, 1), e] for t, e in sim.events[-6:]],
             "cfd": None if cfd is None else {"fresh": cfd.fresh},
