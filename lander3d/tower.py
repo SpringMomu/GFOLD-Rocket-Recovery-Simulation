@@ -65,6 +65,7 @@ CLOSE_HEIGHT = 4.5             # close when the collar is this far above the arm
 CLOSE_LEAD_TIME = 1.7          # ... or will arrive within this time
 CAPTURE_ALONG = 2.5            # capture window: along the arms (|x|) ...
 CAPTURE_ACROSS = 1.2           # ... and across them (|y|)
+CLOSE_SIDE_SPEED = 1.0         # m/s: no closing on a booster still moving sideways faster
 
 # --- dynamics ---------------------------------------------------------------
 CONTACT_K, CONTACT_C, CONTACT_MU = 2.0e6, 6.0e4, 0.6
@@ -100,6 +101,7 @@ class CatchTower:
         self.events: list[str] = []
         self._settle = 0.0
         self._face_hit = False
+        self.secured = False           # arms closed round the barrel (told to the booster)
 
     # ------------------------------------------------------------ geometry
     @property
@@ -197,7 +199,8 @@ class CatchTower:
         if self.mode == "READY":
             sink = max(0.3, -float(veh.vel[2]))
             in_window = abs(float(xy[0])) < CAPTURE_ALONG and abs(float(xy[1])) < CAPTURE_ACROSS
-            if in_window and -0.3 < h < max(CLOSE_HEIGHT, sink * CLOSE_LEAD_TIME):
+            steady = math.hypot(float(veh.vel[0]), float(veh.vel[1])) < CLOSE_SIDE_SPEED
+            if in_window and steady and -0.3 < h < max(CLOSE_HEIGHT, sink * CLOSE_LEAD_TIME):
                 self.mode = "CLOSING"
                 self.events.append("ARMS CLOSING")
         target = {"OPEN": ARM_OPEN, "READY": ARM_READY}.get(self.mode, ARM_CLOSED)
@@ -213,6 +216,8 @@ class CatchTower:
             step = max(-rate * dt, target - self.angle)
             if self.mode == "CLOSING" and target - self.angle >= -1e-4:
                 self.mode = "CLOSED"
+            # closed, or stopped against the barrel
+            self.secured = self.mode == "CLOSED" or (self.mode == "CLOSING" and rate == 0.0)
         self.rate = step / dt if dt > 0 else 0.0
         self.angle += step
 

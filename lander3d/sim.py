@@ -18,7 +18,7 @@ from .vehicle import Vehicle, Wind, quat_from_axis_angle
 
 PHYSICS_DT = 1.0 / 240.0
 MAX_STEPS_PER_CALL = 2400
-LOGGED_PHASES = ("COAST", "BOOSTBACK", "LANDING BURN")
+LOGGED_PHASES = ("COAST", "BOOSTBACK", "LANDING BURN", "CATCH HOLD")
 
 SCENARIOS = [
     {"name": "HOVER-SLAM 100 m", "pos": (0, 0, 100), "vel": (0, 0, 0), "tilt": 0.0, "prop": 2500},
@@ -37,10 +37,10 @@ SCENARIOS = [
     {"name": "TOWER CATCH ENTRY 12 km", "pos": (1800, -1100, 12000), "vel": (-88, 54, -260), "tilt": 8.0, "prop": 6000,
      "catch": True},
     # Low behind the tower: the straight way to the arms goes through it, the
-    # plan goes over it (keep-out constraints).  Levelling off just above the
-    # tower is part of that, so the no-hover check allows a slower sink here.
+    # plan goes over it (keep-out constraints).  Levelling off before the
+    # tower is part of that, so the no-hover check only asks for no climb here.
     {"name": "TOWER CATCH OVER TOWER", "pos": (-150, 0, 100), "vel": (0, 0, -5), "tilt": 0.0, "prop": 4000,
-     "catch": True, "min_sink": 0.5},
+     "catch": True, "min_sink": -0.1},
 ]
 
 
@@ -112,7 +112,8 @@ class Sim3D:
             self.autopilot.set_target()
         else:
             self.autopilot.set_target(tower.catch_base_z, self.vehicle.rest_height, legs=False,
-                                      obstacles=tower.keep_out_boxes(self.vehicle.spec))
+                                      obstacles=tower.keep_out_boxes(self.vehicle.spec),
+                                      catch_link=lambda: tower.secured)
             self.vehicle.controls.legs_down = False
 
     # -- manual control (KSP layout) ---------------------------------------------

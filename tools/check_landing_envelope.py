@@ -37,12 +37,14 @@ def check(index: int) -> dict:
     while sim.time < 260 and vehicle.state == "FLYING":
         sim.step(PHYSICS_DT)
         if vehicle.touchdown is None and sim.autopilot.phase == "LANDING BURN":
-            height = sim.autopilot._height(vehicle)
+            # above the end of the burn (a catch ends in a hold just above the arms)
+            height = sim.autopilot._height(vehicle) - sim.autopilot.gate_height
             if height > HOVER_HEIGHT:
                 min_sink = min(min_sink, -float(vehicle.vel[2]))
-            if height < LOW_HEIGHT:
-                rate = math.degrees(max(abs(float(vehicle.omega[0])), abs(float(vehicle.omega[1]))))
-                max_rate = max(max_rate, rate)
+        low = sim.autopilot._height(vehicle) < LOW_HEIGHT
+        if vehicle.touchdown is None and sim.autopilot.phase in ("LANDING BURN", "CATCH HOLD") and low:
+            rate = math.degrees(max(abs(float(vehicle.omega[0])), abs(float(vehicle.omega[1]))))
+            max_rate = max(max_rate, rate)
     td = vehicle.touchdown or {}
     ok = (
         passed(vehicle, sim.tower is not None)

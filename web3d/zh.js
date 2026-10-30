@@ -4,7 +4,7 @@
 
 export const PHASE = {
   STANDBY: "待命", MANUAL: "手动", COAST: "无动力滑行", BOOSTBACK: "反推返航",
-  "LANDING BURN": "着陆点火", TERMINAL: "末端下降", LANDED: "已着陆", FALLBACK: "备份制导",
+  "LANDING BURN": "着陆点火", "CATCH HOLD": "悬停待夹", TERMINAL: "末端下降", LANDED: "已着陆", FALLBACK: "备份制导",
   CRASHED: "箭体损毁", "ON PAD": "停放台上", FLYING: "飞行中", CAUGHT: "筷子夹住",
 };
 

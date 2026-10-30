@@ -8,7 +8,6 @@ allocation are in ``attitude.py``.
 from __future__ import annotations
 
 import math
-from functools import partial
 
 import numpy as np
 
@@ -93,6 +92,14 @@ class Autopilot3D:
     boostback_gamma_ok = 10.0     # deg: flight path at ignition steeper than this needs no loft
     boostback_loft_max = 80.0     # m/s of extra climb the boost-back may add for a longer, steeper fall
     boostback_solve_period = 0.3
+    search_backoff = 1.0          # s between earliest-time searches / relaxation retries
+    # Tower catch: the burn ends with the collar this high above the arm tops,
+    # sinking this slowly; there the booster holds, centred, until the arms
+    # have closed round the barrel, and then settles onto them.
+    catch_gate_height = 1.2
+    catch_gate_speed = 0.5
+    catch_settle_speed = 0.6
+    catch_hold_max = 25.0         # s; then settle anyway
     glide_gain = 1.5
     # attitude loop
     k_angle = 2.0
@@ -105,17 +112,23 @@ class Autopilot3D:
         self.set_target()
         self.reset()
 
-    def set_target(self, base_z=None, rest_height=0.0, legs=True, obstacles=()) -> None:
+    def set_target(self, base_z=None, rest_height=0.0, legs=True, obstacles=(), catch_link=None) -> None:
         """Where the burn ends.  Default: standing on the pad (legs).  For a
         tower catch, ``base_z`` is the world height of the booster's base when
         its catch collar rests on the arms; the whole guidance then works in
         heights above that point (``h_off`` above the pad altitude) and the
         legs stay stowed.  ``obstacles`` are keep-out boxes for the base point
         in world coordinates (``(centre, axes, half)``, e.g. the catch tower);
-        the landing burn plans around them."""
+        the landing burn plans around them.  ``catch_link`` (a tower catch)
+        reports whether the arms are closed round the barrel: the burn then
+        ends in a hold just above the arms (``_catch_hold``)."""
         self.h_off = 0.0 if base_z is None else float(base_z) - float(rest_height)
         self.use_legs = legs
-        self._climb_ok = False
+        self._relax_floor = 0
+        self.catch_link = catch_link
+        cls = type(self)
+        self.gate_height = cls.catch_gate_height if catch_link is not None else cls.gate_height
+        self.gate_speed = cls.catch_gate_speed if catch_link is not None else cls.gate_speed
         z0 = 0.0 if base_z is None else float(base_z)
         self._z_ground = -z0                 # the ground, in planner heights (base point)
         self.obstacles = [KeepOutBox(np.asarray(c, float) - np.array([0.0, 0.0, z0]), np.asarray(ax, float), np.asarray(hf, float))
@@ -135,6 +148,13 @@ class Autopilot3D:
         self._boostback = False
         self._boostback_done = False
         self._touched = False
+        self.relax = 0                # planner relaxation level in use (PlanConfig3D.relax)
+        self._next_search = 0.0
+        self._search_fails = 0
+        self._holding = False
+        self._hold_h = 0.0
+        self._hold_i = np.zeros(2)
+        self._hold_t = 0.0
         self._dir_prev = None
         self._gate_xy = np.zeros(2)
         self._dir_rate = np.zeros(3)
@@ -267,10 +287,11 @@ class Autopilot3D:
         r0 = self._state(veh)[0]
         boxes = self.obstacles
         path = detour_path(boxes, r0, np.zeros(3), z_min=self._z_ground + 1.0)
-        # Below the top of what stands in the way: the only way is up and over.
-        self._climb_ok = max(float(p[2]) for p in path) > float(r0[2]) + 1.0
+        # Below the top of what stands in the way: the only way is up and over,
+        # so the descent need not be monotonic (relaxation level 1 at least).
+        self._relax_floor = 1 if max(float(p[2]) for p in path) > float(r0[2]) + 1.0 else 0
         prev = self.plan if self.burn_locked else None
-        if prev is not None and not prev.reaches(self._climb_ok):
+        if prev is not None and not prev.reaches_pad:
             prev = None
 
         def planes(t_knots):
@@ -285,6 +306,7 @@ class Autopilot3D:
 
     def _config(self, veh, frac):
         s = veh.spec
+        keep_out = self._keep_out(veh)
         return PlanConfig3D(
             mode="smooth", thrust_min=self.minimum_throttle * s.thrust_sl * self.thrust_scale,
             thrust_max=frac * s.thrust_sl * self.thrust_scale, isp=s.isp_sl,
@@ -297,7 +319,7 @@ class Autopilot3D:
             max_tilt_deg=float(max(np.interp(self._height(veh), [20.0, 120.0, 500.0], [6.0, 14.0, self.divert_tilt_deg]),
                                    min(self.divert_tilt_deg, 2.0 * float(np.linalg.norm(veh.vel[:2]))))),
             touchdown_speed=self.gate_speed, target_alt=self.gate_height, target_xy=tuple(self._gate_xy),
-            sink_gain=self.sink_gain, keep_out=self._keep_out(veh),
+            sink_gain=self.sink_gain, keep_out=keep_out, relax=max(self.relax, self._relax_floor),
         )
 
     @staticmethod
@@ -402,19 +424,36 @@ class Autopilot3D:
         # the plan misses the pad by far: then only the earliest time that
         # does reach it can save the landing.
         lost = plan is None or plan.terminal_position_error > 10.0
-        if (plan is None or not plan.reaches(self._climb_ok)) and (t_go > 5.0 or lost):
-            found = self._earliest(r, v, m, cfg, t_go, veh)
+        if (plan is None or not plan.reaches_pad) and (t_go > 5.0 or lost):
+            # The search is the expensive part (a dozen solves): after one
+            # that found nothing, wait before the next -- no stalls when
+            # nothing works.
+            searching = self.elapsed >= self._next_search
+            found = self._earliest(r, v, m, cfg, t_go, veh) if searching else None
+            if searching:
+                # back off after every search; longer after repeated failures
+                self._search_fails = 0 if found is not None else min(self._search_fails + 1, 2)
+                self._next_search = self.elapsed + self.search_backoff * 2 ** self._search_fails
             if found is not None:
-                t_new, frac = found
+                t_new, frac, level = found
                 # Earliest reachable time at this thrust level plus a small
                 # tracking margin (the smooth plan then is not saturated).
                 t_new = t_new + min(1.0, 0.08 * t_new)
                 self.burn_fraction = max(self.burn_fraction, frac)
+                self.relax = cfg.relax = level
                 cfg.thrust_max = self.burn_fraction * veh.spec.thrust_sl * self.thrust_scale
                 cfg.drag_model = self._drag_model(veh, wind_now, t_new)
                 smooth = P.solve(r, v, m, t_new, cfg)
                 if smooth is not None:
                     plan = smooth
+        elif plan is not None and cfg.relax > self._relax_floor and self.elapsed >= self._next_search:
+            # Back to the stricter limits as soon as they can be met again.
+            cfg.relax -= 1
+            strict = P.solve(r, v, m, t_go, cfg)
+            if strict is not None and strict.reaches_pad:
+                plan = strict
+                self.relax = cfg.relax
+            self._next_search = self.elapsed + self.search_backoff
         self.last_status = P.last_status
         if plan is not None:
             plan.created_at = self.elapsed
@@ -435,29 +474,38 @@ class Autopilot3D:
         # may otherwise have no reachable time at all and fly a plan that misses.
         P = self.planner
         t_far = max(t_far, t_fall + d / max(3.0, 0.5 * (P.lateral_speed_floor + P.lateral_speed_gain * h)))
-        for frac in (self.burn_fraction, 0.92, 0.97):
-            chk = PlanConfig3D(**{**cfg.__dict__, "mode": "fuel", "thrust_max": frac * veh.spec.thrust_sl * self.thrust_scale})
-            ok = partial(self._reaches_pad, r, v, m, chk)
-            lo = max(0.8, 0.6 * t_go)
-            hi = max(t_go + 1.5, 1.5 * t_go)
-            if not ok(hi):
-                if t_far <= hi or not ok(t_far):
-                    continue
-                lo, hi = hi, t_far
-            if ok(lo):
-                return lo, frac
-            for _ in range(6):
-                mid = 0.5 * (lo + hi)
-                if ok(mid):
-                    hi = mid
+        lo = max(0.8, 0.6 * t_go)
+        hi = max(t_go + 1.5, 1.5 * t_go)
+        ends = [hi] + ([t_far] if t_far > hi else [])
+
+        def ok(frac, level, t_f):
+            chk = PlanConfig3D(**{**cfg.__dict__, "mode": "fuel", "relax": level,
+                                  "thrust_max": frac * veh.spec.thrust_sl * self.thrust_scale})
+            return self._reaches_pad(r, v, m, chk, t_f)
+
+        # The strictest relaxation level that can reach the gate at all (at
+        # the highest thrust), then the lowest thrust that still does, then
+        # the earliest time (bisection).  At most ~12 solves.
+        for level in range(cfg.relax, 3):
+            end = next((t for t in ends if ok(0.97, level, t)), None)
+            if end is None:
+                continue
+            frac = next((f for f in dict.fromkeys((self.burn_fraction, 0.92)) if f < 0.97 and ok(f, level, end)), 0.97)
+            a, b = (hi, end) if end > hi else (lo, end)
+            if ok(frac, level, a):
+                return a, frac, level
+            for _ in range(4):
+                mid = 0.5 * (a + b)
+                if ok(frac, level, mid):
+                    b = mid
                 else:
-                    lo = mid
-            return hi, frac
+                    a = mid
+            return b, frac, level
         return None
 
     def _reaches_pad(self, r, v, m, cfg, t_f):
         plan = self.planner.solve(r, v, m, t_f, cfg)
-        return plan is not None and plan.reaches(self._climb_ok)
+        return plan is not None and plan.reaches_pad
 
     def _publish(self):
         p = self.plan
@@ -528,12 +576,19 @@ class Autopilot3D:
         # descending instead of hovering.
         # Past the plan's end but still high or off the pad (the plan could
         # not be tracked): re-plan from here instead of trusting the old end.
+        if self.catch_link is not None and (self._holding or (
+                (t_go <= 0.6 or h <= self.gate_height + 0.2) and h < self.gate_height + 5.0
+                and float(np.linalg.norm(r[:2])) < 6.0)):
+            self._catch_hold(veh, r, v, dt)
+            return
         stranded = t_go <= 0.6 and (h > 20.0 or float(np.linalg.norm(r[:2])) > 15.0)
         if self.planner.available and self.elapsed >= self.next_replan and (t_go > 0.6 or stranded):
             self._replan(veh, wind_now)
             self._publish()
-            self.next_replan = self.elapsed + self.burn_replan_period
             t_go = self.touchdown_time - self.elapsed
+            # Long burns re-plan less often early on (each solve of a long,
+            # 70-knot horizon costs ~0.1 s); 5 Hz over the last ~8 s.
+            self.next_replan = self.elapsed + float(np.interp(t_go, [8.0, 30.0], [self.burn_replan_period, 0.6]))
         self.time_to_go = max(0.0, t_go)
         if t_go < 8.0 and self.use_legs:
             c.legs_down = True
@@ -547,7 +602,7 @@ class Autopilot3D:
             if nfb > 5.0:
                 fb *= 5.0 / nfb
             accel = u_ff + fb
-            if h < 10.0 and v[2] > -0.6 * self.touchdown_speed:
+            if h < 10.0 and v[2] > -0.6 * self.touchdown_speed and self.catch_link is None:
                 accel[2] = min(accel[2], 0.9 * g)     # never stall or climb above the pad
             if h < self.sink_track_height:
                 # Final approach envelope (same as the planner's): if sinking
@@ -571,6 +626,38 @@ class Autopilot3D:
             max_tilt = math.radians(35.0)
         self._mark()
         self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 else None)
+
+    def _catch_hold(self, veh, r, v, dt):
+        """Tower catch: hold the collar just above the arm tops, centred on the
+        catch axis, until the tower reports the arms closed round the barrel;
+        then settle onto them (the engine is cut at contact).  The arms close
+        only on a booster that is in their capture window and slow, so a
+        booster that arrives a little off is caught after it has centred,
+        instead of drifting past while they close."""
+        if not self._holding:
+            self._holding = True
+            self._hold_t = 0.0
+            self._hold_i = np.zeros(2)
+            # no climbing back up to the gate height: hold where it arrived
+            self._hold_h = float(np.clip(r[2], 0.6, self.gate_height))
+        self._hold_t += dt
+        settle = bool(self.catch_link()) or self._hold_t > self.catch_hold_max or veh.propellant < 80.0
+        if settle:
+            vz_ref = -self.catch_settle_speed
+            self._hold_h -= self.catch_settle_speed * dt
+        else:
+            vz_ref = 0.0
+        e = -np.asarray(r[:2], float)
+        self._hold_i = np.clip(self._hold_i + e * dt, -4.0, 4.0)
+        # settling: the closed arms hold it sideways -- gentle and upright
+        k_xy = 0.5 if settle else 1.0
+        a_xy = k_xy * (0.6 * e - 1.6 * v[:2] + 0.1 * self._hold_i)
+        a_z = G0 + 1.2 * (self._hold_h - r[2]) + 2.0 * (vz_ref - v[2])
+        self.phase = "CATCH HOLD"
+        self.time_to_go = max(0.0, float(r[2]) / self.catch_settle_speed) if settle else math.nan
+        self._mark()
+        tilt = math.radians(1.0 if settle else 4.0)
+        self._fly_accel(veh, np.array([a_xy[0], a_xy[1], a_z]), tilt, floor=0.9 * self.minimum_throttle)
 
     @staticmethod
     def _aoa_limit(veh, accel, wind_now, max_tilt):

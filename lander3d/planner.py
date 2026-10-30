@@ -66,6 +66,11 @@ class PlanConfig3D:
     # Obstacles (soft): callable(knot times) -> [(k, n, b), ...], each asking
     # n . r_k >= b; see separating_planes.
     keep_out: Callable | None = None
+    # Relaxation level when nothing is reachable otherwise: 1 = descent no
+    # longer monotonic (climbing up to Planner3D.relaxed_climb, sink envelope
+    # nearly free), 2 = also the lateral-speed envelope, approach cone and
+    # glide slope.
+    relax: int = 0
 
 
 @dataclass
@@ -214,6 +219,7 @@ class Plan3D:
     aoa_violation: float = 0.0
     climb_violation: float = 0.0
     keep_out_violation: float = 0.0
+    relax: int = 0
     created_at: float = 0.0
 
     @property
@@ -225,15 +231,12 @@ class Plan3D:
         # Reaching the pad by breaking the flyability limits (much faster
         # sideways than allowed, nose-first, climbing) does not count: the
         # tracker cannot follow such a plan, so the time must move instead.
-        return self.reaches()
-
-    def reaches(self, climb_ok: bool = False) -> bool:
-        """``reaches_pad``; with ``climb_ok`` a climb is allowed (e.g. a hop
-        over an obstacle that stands between a low booster and the gate)."""
+        # A relaxed plan (``relax``) is judged without the limits it relaxed
+        # (level 1 keeps a looser climb limit of its own).
         return (self.terminal_position_error < 1.0 and self.terminal_velocity_error < 0.8
-                and self.glide_violation < 1.0 and self.fuel_violation < 1e-3
-                and self.lateral_violation < 3.0 and (climb_ok or self.climb_violation < 2.0)
-                and self.keep_out_violation < 0.5)
+                and self.fuel_violation < 1e-3 and self.keep_out_violation < 0.5
+                and self.climb_violation < 2.0
+                and (self.relax >= 2 or (self.glide_violation < 1.0 and self.lateral_violation < 3.0)))
 
     @property
     def final_mass(self) -> float:
@@ -294,6 +297,7 @@ class Planner3D:
     no_climb_weight = 300.0
     min_sink = 1.0                 # m/s, the slowest planned descent
     climb_decay = 1.5              # m/s^2: a climb now must end at least this fast
+    relaxed_climb = 5.0            # m/s: the climb a relaxed plan (relax >= 1) may use
     approach_cone_floor = 1.0      # m off the pad centre at the pad ...
     approach_cone_gain = 0.35      # ... + m per m of height
     approach_cone_weight = 60.0
@@ -419,8 +423,12 @@ class Planner3D:
             row([(S(k, c), -float(nrm[c])) for c in range(3) if nrm[c] != 0.0] + [(ikp + j, -1.0)], -b_)
         # The landing burn only descends (soft): a divert is flown sinking,
         # never by climbing back up or hovering to wait.
+        # Relaxed (nothing reachable otherwise): no longer monotonic, but a
+        # climb stays moderate (fast climbing is what a time-optimal search
+        # would pick to earn a wider lateral-speed envelope).
+        floor_vz = self.relaxed_climb if cfg.relax >= 1 else -self.min_sink
         for k in range(1, N + 1):
-            row([(S(k, 5), 1.0), (icl + k - 1, -1.0)], max(-self.min_sink, float(v0[2]) - self.climb_decay * t_k[k]))
+            row([(S(k, 5), 1.0), (icl + k - 1, -1.0)], max(floor_vz, float(v0[2]) - self.climb_decay * t_k[k]))
         if cfg.sink_gain > 0.0:
             # vz_k >= -(v_td + c (h_k - h_target)) - s_k   (linear in the state)
             c_s = cfg.sink_gain
@@ -586,15 +594,18 @@ class Planner3D:
             wgt = self.terminal_position_weight if c < 3 else self.terminal_velocity_weight
             q[iep + c] = wgt
             q[iem + c] = wgt
-        q[isg:isg + N] = self.glide_slope_weight
+        # Relaxed levels keep the limits as (cheap) preferences only.
+        lax1 = 0.02 if cfg.relax >= 1 else 1.0
+        lax2 = 0.05 if cfg.relax >= 2 else 1.0
+        q[isg:isg + N] = self.glide_slope_weight * lax2
         q[ifs] = self.fuel_slack_weight
-        q[isk:isk + N] = self.sink_envelope_weight
-        q[ivs:ivs + N] = self.lateral_speed_weight * dt
+        q[isk:isk + N] = self.sink_envelope_weight * lax1
+        q[ivs:ivs + N] = self.lateral_speed_weight * dt * lax2
         q[iao:iao + N] = self.aoa_weight * dt
         q[icl:icl + N] = self.no_climb_weight * dt
         # only the last seconds: earlier a low, far booster must not be
         # pushed up to get inside it
-        q[iap:iap + N] = self.approach_cone_weight * dt * np.interp(t_f - t_k[1:], self.approach_cone_t, [1.0, 0.0])
+        q[iap:iap + N] = self.approach_cone_weight * dt * lax2 * np.interp(t_f - t_k[1:], self.approach_cone_t, [1.0, 0.0])
         q[ikp:n] = self.keep_out_weight * dt
         for i in range(n):
             add_p(i, i, 1e-7)
@@ -627,7 +638,7 @@ class Planner3D:
             lateral_violation=float(np.max(x[L["ivs"]: L["ivs"] + N], initial=0.0)),
             aoa_violation=float(np.max(x[L["iao"]: L["iao"] + N], initial=0.0)),
             climb_violation=float(np.max(x[L["icl"]: L["icl"] + N], initial=0.0)),
-            keep_out_violation=float(np.max(x[L["ikp"]: L["n"]], initial=0.0)),
+            keep_out_violation=float(np.max(x[L["ikp"]: L["n"]], initial=0.0)), relax=int(cfg.relax),
         )
 
     def search(self, r0, v0, m0, lo, hi, cfg, evaluations=10):
