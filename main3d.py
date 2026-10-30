@@ -2,7 +2,7 @@
 
     python main3d.py                 start the server and open the browser
     python main3d.py --port 8765 --no-browser
-    python main3d.py --test          headless regression of the six scenarios
+    python main3d.py --test          headless regression of all scenarios (pad landings + tower catches)
 """
 
 from __future__ import annotations

@@ -174,6 +174,7 @@ export class Scene {
     this.terrain = createMesh(gl, t.d, t.idx);
     this._buildRocket();
     this._buildPadProps();
+    this._buildTower();
     const q = { d: [0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 0, 1], idx: [0, 1, 2, 0, 2, 3] };
     this.quad = createMesh(gl, q.d, q.idx);
     this.points = createDynamic(gl, 6000);
@@ -493,6 +494,101 @@ export class Scene {
     this.padGlow = glow;
   }
 
+  // Catch tower ("chopsticks"), only shown in the tower-catch scenarios.  The
+  // lattice tower and the launch mount are static (world space); the carriage
+  // sinks on its shock absorbers and the two arms swing about their pivots
+  // (arm mesh in arm coordinates: x along the arm, top surface at z = 0).
+  // Dimensions match lander3d/tower.py.
+  _buildTower() {
+    const gl = this.gl;
+    const steel = [], dark = [], hazard = [], concrete = [];
+    const X0 = -15, X1 = -9, HY = 3, TOP = 48;
+    const corners = [[X0, -HY], [X1, -HY], [X1, HY], [X0, HY]];
+    for (const [x, y] of corners) steel.push(box(0.7, 0.7, TOP, x, y, TOP / 2));
+    for (let z = 0; z <= TOP; z += 4) {
+      for (let k = 0; k < 4; k++) {
+        const a = corners[k], b = corners[(k + 1) % 4];
+        steel.push(beamBetween([a[0], a[1], z], [b[0], b[1], z], 0.32));
+        if (z < TOP) {
+          // X-bracing on each face of every 4 m bay.
+          steel.push(beamBetween([a[0], a[1], z], [b[0], b[1], z + 4], 0.18));
+          steel.push(beamBetween([b[0], b[1], z], [a[0], a[1], z + 4], 0.18));
+        }
+      }
+    }
+    // Inner elevator core, top deck, lightning mast and obstruction light.
+    dark.push(box(2.6, 2.6, TOP - 1, (X0 + X1) / 2, 0, (TOP - 1) / 2));
+    steel.push(box(X1 - X0 + 1.2, 2 * HY + 1.2, 0.4, (X0 + X1) / 2, 0, TOP + 0.2));
+    steel.push(transformPart(frustum(0.15, 0.06, TOP + 0.4, TOP + 7, 8), M4.translate([(X0 + X1) / 2, 0, 0])));
+    this.towerGlow = [[(X0 + X1) / 2, 0, TOP + 7.2]];
+    // Launch mount under the catch point: six legs and a ring table (MOUNT_TOP = 8 m).
+    for (let k = 0; k < 6; k++) {
+      const a = (k / 6) * Math.PI * 2 + Math.PI / 6;
+      concrete.push(box(1.3, 1.3, 6.6, 4.9 * Math.cos(a), 4.9 * Math.sin(a), 3.3));
+    }
+    for (let k = 0; k < 20; k++) {
+      const a = (k / 20) * Math.PI * 2;
+      const seg = transformPart(box(2.4, 2 * 4.8 * Math.tan(Math.PI / 20) + 0.05, 1.4, 4.8, 0, 7.3), M4.rotAxis([0, 0, 1], a));
+      steel.push(seg);
+      // hold-down clamps around the opening
+      if (k % 5 === 0) dark.push(transformPart(box(0.7, 0.5, 0.5, 3.9, 0, 8.25), M4.rotAxis([0, 0, 1], a + Math.PI / 20)));
+    }
+    hazard.push(transformPart(frustum(6.02, 6.02, 7.7, 8.0, 48, false), M4.ident()));
+    // Carriage around the tower at arm height (moves with the shock absorbers).
+    const car = [];
+    const C0 = 26.0, C1 = 31.2;
+    for (const [x, y] of corners) car.push(box(0.5, 0.5, C1 - C0, x + Math.sign(x - (X0 + X1) / 2) * 0.55, y + Math.sign(y) * 0.55, (C0 + C1) / 2));
+    for (const z of [C0, C1]) for (let k = 0; k < 4; k++) {
+      const a = corners[k], b = corners[(k + 1) % 4];
+      const o = (p) => [p[0] + Math.sign(p[0] - (X0 + X1) / 2) * 0.55, p[1] + Math.sign(p[1]) * 0.55, z];
+      car.push(beamBetween(o(a), o(b), 0.45));
+    }
+    for (const y of [-HY, HY]) {
+      car.push(beamBetween([X1 + 0.55, y + Math.sign(y) * 0.55, C0], [X1 + 0.55, y + Math.sign(y) * 0.55, C1], 0.9));
+      car.push(transformPart(frustum(0.75, 0.75, 27.6, 30.4, 20), M4.translate([X1, y, 0])));    // arm hinge drum
+    }
+    // Shock absorbers between the carriage and the tower (visual).
+    const absorbers = [];
+    for (const [x, y] of corners) absorbers.push(transformPart(frustum(0.22, 0.22, C1, C1 + 3.0, 10), M4.translate([x + Math.sign(x - (X0 + X1) / 2) * 0.55, y + Math.sign(y) * 0.55, 0])));
+    // Arm: truss with four chords, verticals and diagonals, a top plate and
+    // the yellow catch rail on the inner top edge where the collar rests.
+    const L = 10.5, W = 1.0, D = 1.6;
+    const arm = [], rail = [];
+    for (const y of [-W / 2 + 0.12, W / 2 - 0.12]) for (const z of [-0.12, -D + 0.12]) arm.push(box(L, 0.24, 0.24, L / 2, y, z));
+    for (let x = 0; x <= L + 1e-6; x += 1.5) {
+      for (const y of [-W / 2 + 0.12, W / 2 - 0.12]) arm.push(box(0.16, 0.16, D - 0.24, x, y, -D / 2));
+      if (x + 1.5 <= L + 1e-6) for (const y of [-W / 2 + 0.12, W / 2 - 0.12]) arm.push(beamBetween([x, y, -D + 0.12], [x + 1.5, y, -0.12], 0.12));
+    }
+    arm.push(box(L, W, 0.12, L / 2, 0, -0.06));
+    arm.push(box(0.6, W + 0.3, D + 0.2, 0.3, 0, -D / 2));          // root fitting at the hinge
+    rail.push(box(L - 1.5, 0.35, 0.1, L / 2 + 0.6, 0, 0.05));
+    const mk = (list) => { const g = merge(list); return createMesh(gl, g.d, g.idx); };
+    this.tower = {
+      parts: [[mk(steel), 2, [0.50, 0.52, 0.55]], [mk(dark), 1, [0.16, 0.16, 0.17]], [mk(hazard), 6, [1, 1, 1]], [mk(concrete), 5, [0.62, 0.62, 0.60]]],
+      carriage: [[mk(car), 2, [0.42, 0.44, 0.47]], [mk(absorbers), 2, [0.75, 0.76, 0.78]]],
+      arm: [[mk(arm), 2, [0.36, 0.37, 0.40]], [mk(rail), 6, [1, 1, 1]]],
+    };
+    // Catch collar on the booster (body z = 15): band + eight hardpoint pins.
+    const collar = [frustum(1.56, 1.56, 14.75, 15.25, 64)];
+    for (let k = 0; k < 8; k++) collar.push(transformPart(box(0.62, 0.32, 0.36, 1.82, 0, 15.0), M4.rotAxis([0, 0, 1], (k / 8) * Math.PI * 2 + Math.PI / 8)));
+    this.meshCollar = mk(collar);
+  }
+
+  // (mesh, material, model, colour) of the tower parts for this frame.
+  towerParts(st) {
+    const tw = st.tower;
+    if (!tw || !this.tower) return [];
+    const g = tw.geom, sink = tw.sink || 0, a = (tw.arm || 0) * Math.PI / 180;
+    const out = this.tower.parts.map(([m, mat, c]) => [m, mat, M4.ident(), c]);
+    const down = M4.translate([0, 0, -sink]);
+    for (const [m, mat, c] of this.tower.carriage) out.push([m, mat, down, c]);
+    for (const sgn of [1, -1]) {
+      const M = M4.mul(M4.translate([g.pivot[0], sgn * g.pivot[1], g.arm_top - sink]), M4.rotAxis([0, 0, 1], sgn * a));
+      for (const [m, mat, c] of this.tower.arm) out.push([m, mat, M, c]);
+    }
+    return out;
+  }
+
   _drawPadProps(pl, t) {
     const gl = this.gl;
     gl.uniformMatrix4fv(pl.u.u_model, false, M4.ident());
@@ -528,6 +624,7 @@ export class Scene {
       if (kind === 1) out.push([x, y, z, 1.0, 0.93, 0.75, 0.22, 2.4]);
       else if (red) out.push([x, y, z, 1.0, 0.15, 0.08, 0.9, 1.6]);
     }
+    if (this.towerShown && red) for (const [x, y, z] of this.towerGlow) out.push([x, y, z, 1.0, 0.15, 0.08, 0.9, 2.2]);
     return out;
   }
 
@@ -556,6 +653,7 @@ export class Scene {
     const pivot = M4.translate([0, 0, 0.3]), unpivot = M4.translate([0, 0, -0.3]);
     const g = M4.mul(M4.rotAxis([0, 1, 0], gy), M4.rotAxis([1, 0, 0], gx));
     parts.push([this.meshBell, 10, M4.mul(base, M4.mul(pivot, M4.mul(g, unpivot))), null, engineOn ? 0.4 + 0.6 * st.throttle : 0]);
+    if (st.tower) parts.push([this.meshCollar, 2, base, [0.30, 0.31, 0.33]]);
     const deploy = st.legs;
     const theta = (145 * Math.PI / 180) * deploy;
     for (let k = 0; k < 4; k++) {
@@ -614,6 +712,7 @@ export class Scene {
     this.invVP = M4.invert(vp); this.logFC = LOG_FC;
     const camR = [view[0], view[4], view[8]], camU = [view[1], view[5], view[9]], camF = [-view[2], -view[6], -view[10]];
     const parts = this.rocketParts(st);
+    this.towerShown = !!st.tower;
     const P = fx.plume || plumeParams(st, this.time);
     const Lt = this._lights(P);
 
@@ -633,6 +732,8 @@ export class Scene {
     if (st.pos[2] < 400) for (const [mesh, , m] of parts) { gl.uniformMatrix4fv(this.progDepth.u.u_model, false, m); drawMesh(gl, mesh); }
     gl.uniformMatrix4fv(this.progDepth.u.u_model, false, M4.ident());
     for (const p of this.padProps) drawMesh(gl, p.mesh);
+    const towerParts = this.towerParts(st);
+    for (const [mesh, , m] of towerParts) { gl.uniformMatrix4fv(this.progDepth.u.u_model, false, m); drawMesh(gl, mesh); }
 
     // ---- opaque HDR pass (MSAA)
     gl.bindFramebuffer(gl.FRAMEBUFFER, T.msFbo);
@@ -691,7 +792,7 @@ export class Scene {
     gl.uniform1i(pl.u.u_cpMode, 0);
     gl.uniform3fv(pl.u.u_flowB, flowB);
     gl.uniform1f(pl.u.u_sinA, Math.sin(((st.aero && st.aero.alpha) || 0) * Math.PI / 180));
-    for (const [mesh, mat, m, color, glow] of parts) {
+    for (const [mesh, mat, m, color, glow] of parts.concat(towerParts)) {
       gl.uniform1i(pl.u.u_mat, mat);
       gl.uniform3fv(pl.u.u_color, color || [0.9, 0.9, 0.9]);
       gl.uniform1f(pl.u.u_glow, glow || 0);

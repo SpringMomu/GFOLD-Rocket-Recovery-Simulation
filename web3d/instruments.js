@@ -408,7 +408,7 @@ export class LandingND {
     ctx.fillStyle = bg; ctx.fillRect(s.x, s.y, s.w, s.h);
 
     const dist = Math.hypot(st.pos[0], st.pos[1]);
-    const final = st.alt < 50 || st.state === "LANDED";
+    const final = st.alt < 50 || st.state === "LANDED" || st.state === "CAUGHT";
     if (this.opt.auto) {
       const need = final ? 12 : Math.max(25, dist * 1.3);
       this.opt.rangeIdx = RANGES.findIndex((r) => r >= need);
@@ -461,6 +461,21 @@ export class LandingND {
       ctx.beginPath(); ctx.moveTo(cx - 8, cy); ctx.lineTo(cx + 8, cy); ctx.moveTo(cx, cy - 8); ctx.lineTo(cx, cy + 8); ctx.stroke();
     }
     if (final) { pad(1, "#4dff8e", 1.5, [4, 3]); pad(3, "rgba(255,180,60,0.9)", 1.2, [6, 5]); }
+    if (st.tower) {
+      // catch tower footprint and the two arms (top view)
+      const g = st.tower.geom, a = st.tower.arm * D2R;
+      ctx.strokeStyle = "rgba(200,210,220,0.85)"; ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      [[g.tower_x[0], -g.tower_half_y], [g.tower_x[1], -g.tower_half_y], [g.tower_x[1], g.tower_half_y], [g.tower_x[0], g.tower_half_y]]
+        .forEach((q, i) => { const p = P(...q); i ? ctx.lineTo(...p) : ctx.moveTo(...p); });
+      ctx.closePath(); ctx.stroke();
+      ctx.strokeStyle = st.tower.mode === "OPEN" ? "rgba(200,210,220,0.85)" : "#ffb43c";
+      ctx.lineWidth = Math.max(2, 2 * g.arm_half_width * k);
+      for (const sgn of [1, -1]) {
+        const p0 = [g.pivot[0], sgn * g.pivot[1]], p1 = [p0[0] + g.arm_length * Math.cos(a), p0[1] + sgn * g.arm_length * Math.sin(a)];
+        ctx.beginPath(); ctx.moveTo(...P(...p0)); ctx.lineTo(...P(...p1)); ctx.stroke();
+      }
+    }
 
     // history breadcrumbs
     if (this.opt.hist && st.trail) {
@@ -552,6 +567,7 @@ export class LandingND {
       txt(`Δ东 ${de >= 0 ? "+" : ""}${de.toFixed(2)}  Δ北 ${dn >= 0 ? "+" : ""}${dn.toFixed(2)}`, cx, s.y + 60, "#ffffff", "center", 16);
     }
     if (st.state === "LANDED") txt("已落台 · 发动机已安全", cx, s.y + s.h - 58, "#4dff8e", "center", 15);
+    else if (st.state === "CAUGHT") txt("筷子已夹住 · 发动机已安全", cx, s.y + s.h - 58, "#4dff8e", "center", 15);
     else if (st.state === "CRASHED") txt("箭体损毁", cx, s.y + s.h - 58, "#ff5a4e", "center", 16);
     else if (st.tgo !== null && st.tgo >= 0 && st.autopilot) txt(`剩余 ${st.tgo.toFixed(1)} s`, cx, s.y + s.h - 58, "#ff4fe0", "center", 15);
 

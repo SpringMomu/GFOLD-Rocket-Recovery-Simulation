@@ -93,7 +93,17 @@ class Autopilot3D:
     def __init__(self, aero_model=None) -> None:
         self.planner = Planner3D()
         self.aero = aero_model
+        self.set_target()
         self.reset()
+
+    def set_target(self, base_z=None, rest_height=0.0, legs=True) -> None:
+        """Where the burn ends.  Default: standing on the pad (legs).  For a
+        tower catch, ``base_z`` is the world height of the booster's base when
+        its catch collar rests on the arms; the whole guidance then works in
+        heights above that point (``h_off`` above the pad altitude) and the
+        legs stay stowed."""
+        self.h_off = 0.0 if base_z is None else float(base_z) - float(rest_height)
+        self.use_legs = legs
 
     def reset(self) -> None:
         self.elapsed = 0.0
@@ -133,8 +143,12 @@ class Autopilot3D:
 
     # ------------------------------------------------------------ helpers
     def _state(self, veh):
-        r = np.array([veh.pos[0], veh.pos[1], veh.altitude])
+        r = np.array([veh.pos[0], veh.pos[1], veh.altitude - self.h_off])
         return r, veh.vel.copy(), veh.mass
+
+    def _height(self, veh) -> float:
+        """Height of the base above the end of the burn (the pad or the catch point)."""
+        return float(veh.altitude) - self.h_off
 
     def _drag_model(self, veh, wind_now, t_guess):
         """Aerodynamics along the previous plan (or a decelerating guess).
@@ -237,7 +251,7 @@ class Autopilot3D:
             # Low, short burns get a small tilt budget: a big lateral swing
             # close to the ground is exactly the "rocking" to avoid.
             # ... unless there is real sideways speed to kill (divert).
-            max_tilt_deg=float(max(np.interp(veh.altitude, [20.0, 120.0, 500.0], [6.0, 14.0, self.divert_tilt_deg]),
+            max_tilt_deg=float(max(np.interp(self._height(veh), [20.0, 120.0, 500.0], [6.0, 14.0, self.divert_tilt_deg]),
                                    min(self.divert_tilt_deg, 2.0 * float(np.linalg.norm(veh.vel[:2]))))),
             touchdown_speed=self.gate_speed, target_alt=self.gate_height, target_xy=tuple(self._gate_xy),
             sink_gain=self.sink_gain,
@@ -254,7 +268,7 @@ class Autopilot3D:
         """Wind assumed at height ``z`` for the predictions: the wind measured
         now, scaled with a standard log-law shear profile (roughness 5 cm)."""
         w, z_now = self._wind_ref
-        shape = math.log(max(0.5, z) / 0.05) / math.log(max(0.5, z_now) / 0.05)
+        shape = math.log(max(0.5, z + self.h_off) / 0.05) / math.log(max(0.5, z_now) / 0.05)
         return w * float(np.clip(shape, 0.3, 3.0))
 
     def _burn_need(self, veh, r, v, m, drag_up):
@@ -405,18 +419,18 @@ class Autopilot3D:
         pts = []
         for t in np.linspace(start, p.t_f, n):
             pos, _, _ = p.sample(float(t))
-            pts.append((float(pos[0]), float(pos[1]), float(max(0.0, pos[2]))))
+            pts.append((float(pos[0]), float(pos[1]), float(max(0.0, pos[2])) + self.h_off))
         self.predicted_points = pts
 
     # ------------------------------------------------------------ command
     def command(self, veh, wind_now, dt):
         c = veh.controls
-        if veh.state in ("CRASHED", "LANDED"):
+        if veh.state in ("CRASHED", "LANDED", "CAUGHT"):
             c.throttle = 0.0
             c.rcs = (0.0, 0.0, 0.0)
             c.gimbal = (0.0, 0.0)
             c.fins = (0.0, 0.0, 0.0)
-            self.phase = "LANDED" if veh.state == "LANDED" else "STANDBY"
+            self.phase = "LANDED" if veh.state in ("LANDED", "CAUGHT") else "STANDBY"
             self._mark()
             return
         if veh.state == "ON PAD":
@@ -431,8 +445,9 @@ class Autopilot3D:
         g = G0
         h = r[2]
 
-        # Touchdown: cut the engine as soon as a foot is on the ground.
-        if veh.feet_contact > 0 or self._touched:
+        # Touchdown: cut the engine as soon as a foot is on the ground (or the
+        # catch collar is on the arms).
+        if veh.feet_contact > 0 or veh.catch_contact > 0 or self._touched:
             self._touched = True
             c.throttle = 0.0
             self.phase = "LANDING BURN"
@@ -440,7 +455,7 @@ class Autopilot3D:
             self._mark()
             return
 
-        if h < self.legs_deploy_height:
+        if h < self.legs_deploy_height and self.use_legs:
             c.legs_down = True
         if self.burn_locked:
             c.fins_deploy = True
@@ -471,7 +486,7 @@ class Autopilot3D:
             self.next_replan = self.elapsed + self.burn_replan_period
             t_go = self.touchdown_time - self.elapsed
         self.time_to_go = max(0.0, t_go)
-        if t_go < 8.0:
+        if t_go < 8.0 and self.use_legs:
             c.legs_down = True
 
         if self.plan is not None:
@@ -555,7 +570,7 @@ class Autopilot3D:
         # size cannot follow direction jumps between replans, and chasing
         # them is what makes it rock.  Slower near the ground.
         if self._dir_prev is not None:
-            slew = math.radians(float(np.interp(veh.altitude, [2.0, 30.0, 300.0], [8.0, 15.0, 25.0]))) * self._dt
+            slew = math.radians(float(np.interp(self._height(veh), [2.0, 30.0, 300.0], [8.0, 15.0, 25.0]))) * self._dt
             ang = math.acos(max(-1.0, min(1.0, float(np.dot(self._dir_prev, d)))))
             if ang > slew:
                 axis_r = np.cross(self._dir_prev, d)
@@ -589,7 +604,7 @@ class Autopilot3D:
         self.cmd_axis = d
         c.throttle = thr
         attitude_control(veh, d, self.k_angle, self.k_rate, self.max_rate,
-                         veh.throttle < 0.25 or veh.altitude < self.low_rcs_height, hold_roll=True)
+                         veh.throttle < 0.25 or self._height(veh) < self.low_rcs_height, hold_roll=True)
 
     # ----------------------------------------------------- before ignition
     def _pre_ignition(self, veh, r, v, m, wind_now):
@@ -599,7 +614,7 @@ class Autopilot3D:
             pts, impact, t_imp, t_ign, t_burn = self._ballistic(veh, r, v, m, wind_now)
             self.impact = impact
             self.ignition_in = t_ign
-            self.predicted_points = [(float(p[0]), float(p[1]), float(max(0.0, p[2]))) for p in pts[:: max(1, len(pts) // 120)]]
+            self.predicted_points = [(float(p[0]), float(p[1]), float(max(0.0, p[2])) + self.h_off) for p in pts[:: max(1, len(pts) // 120)]]
             self.time_to_go = t_ign + t_burn if math.isfinite(t_ign) else t_imp
             self.next_predict = self.elapsed + self.coast_predict_period
         miss = float(np.linalg.norm(self.impact))
