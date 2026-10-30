@@ -75,13 +75,16 @@ class Autopilot3D:
     sink_gain = 0.5               # final approach: sink <= 1.2 + 0.5 h (m/s): 6.2 at 10 m, 2.2 at 2 m
     sink_track_height = 15.0      # the tracker enforces the envelope below this height
     legs_deploy_height = 450.0
-    # Boost-back from about this predicted miss on.  The glide cannot be relied
-    # on beyond ~100 m: a slow fall from 2 km (e.g. 180 m off at -30 m/s)
-    # reaches ignition fast (~120 m/s, ~9 kPa), where the angle-of-attack
-    # budget allows no sideways thrust, so the burn would divert only once
-    # slow -- near the ground, i.e. hovering sideways at ~80 m.  A boost-back
-    # of ~15 m/s up high costs far less and the burn stays nearly vertical.
-    boostback_miss = 120.0
+    # Boost-back from this predicted miss on.  A fast fall is steered by the
+    # glide (body lift ~ q), but a slow one is not: e.g. 180 m off from 2 km
+    # at -30 m/s, the glide removes less than half and ignition comes fast
+    # (~120 m/s, ~9 kPa), where the angle-of-attack budget allows no sideways
+    # thrust -- the burn would divert only once slow, near the ground, i.e.
+    # hover sideways at ~80 m.  There a boost-back of ~15 m/s up high is far
+    # cheaper and the burn stays nearly vertical.
+    boostback_miss = 350.0
+    boostback_miss_slow = 120.0   # below boostback_slow_speed[0] airspeed ...
+    boostback_slow_speed = (80.0, 140.0)   # ... blending to boostback_miss at [1]
     boostback_min_alt = 900.0     # start a boost-back only above this height ...
     boostback_end_alt = 500.0     # ... and stop it below this one (the landing burn diverts the rest)
     aero_steer_max_deg = 15.0
@@ -636,7 +639,8 @@ class Autopilot3D:
         up_only = np.array([0.0, 0.0, 1.0])
         f_v, t_v, _ = self._burn_need(veh, r * up_only, v * up_only, m, drag_up)
         burn_due = f_v >= self._ignition_threshold(t_v, up_only)
-        start = miss > self.boostback_miss and r[2] > self.boostback_min_alt and airspeed < 180.0 and not ignite_now
+        bb_miss = float(np.interp(airspeed, self.boostback_slow_speed, (self.boostback_miss_slow, self.boostback_miss)))
+        start = miss > bb_miss and r[2] > self.boostback_min_alt and airspeed < 180.0 and not ignite_now
         if not self._boostback_done and (self._boostback or start):
             self._boostback = True
             self.phase = "BOOSTBACK"
