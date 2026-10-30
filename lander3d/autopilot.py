@@ -92,6 +92,22 @@ class Autopilot3D:
     boostback_gamma_ok = 10.0     # deg: flight path at ignition steeper than this needs no loft
     boostback_loft_max = 80.0     # m/s of extra climb the boost-back may add for a longer, steeper fall
     boostback_solve_period = 0.3
+    # Hop: low (below boostback_min_alt), slow and far off.  The landing burn
+    # would fly the divert as a long traverse at its lateral-speed limit
+    # (~30 m/s: faster needs thrust along the motion, nose-first, which the
+    # angle-of-attack budget does not allow), paying gravity loss all the
+    # way -- e.g. 2 km from 600 m at rest: ~75 s and ~3.4 t, about all the
+    # propellant.  A lofted boost-back instead (engine off on the arc, then
+    # the normal landing burn) is far cheaper.
+    hop_miss = 500.0              # m of predicted miss ...
+    hop_min_alt = 150.0           # ... from this height up (lower: no room to turn and climb)
+    hop_end_frac = 0.7            # a hop ends if it sinks below this fraction of its start height
+    # Any boost-back thrusting nose-first (along the motion) above this
+    # airspeed keeps its thrust within nose_first_aoa_deg of the flow: low
+    # down, a thrust that turns away from the flow puts the booster broadside
+    # and the air flips it (fins stowed, RCS too weak to bring it back).
+    nose_first_speed = 50.0       # m/s (~1.5 kPa low down)
+    nose_first_aoa_deg = 20.0
     search_backoff = 1.0          # s between earliest-time searches / relaxation retries
     # Tower catch: the burn ends with the collar this high above the arm tops,
     # sinking this slowly; there the booster holds, centred, until the arms
@@ -124,7 +140,6 @@ class Autopilot3D:
         ends in a hold just above the arms (``_catch_hold``)."""
         self.h_off = 0.0 if base_z is None else float(base_z) - float(rest_height)
         self.use_legs = legs
-        self._relax_floor = 0
         self.catch_link = catch_link
         cls = type(self)
         self.gate_height = cls.catch_gate_height if catch_link is not None else cls.gate_height
@@ -147,6 +162,9 @@ class Autopilot3D:
         self._failed = 0
         self._boostback = False
         self._boostback_done = False
+        self._hop = False
+        self._bb_floor = self.boostback_end_alt
+        self._h_ignition = None
         self._touched = False
         self.relax = 0                # planner relaxation level in use (PlanConfig3D.relax)
         self._next_search = 0.0
@@ -287,9 +305,6 @@ class Autopilot3D:
         r0 = self._state(veh)[0]
         boxes = self.obstacles
         path = detour_path(boxes, r0, np.zeros(3), z_min=self._z_ground + 1.0)
-        # Below the top of what stands in the way: the only way is up and over,
-        # so the descent need not be monotonic (relaxation level 1 at least).
-        self._relax_floor = 1 if max(float(p[2]) for p in path) > float(r0[2]) + 1.0 else 0
         prev = self.plan if self.burn_locked else None
         if prev is not None and not prev.reaches_pad:
             prev = None
@@ -319,7 +334,8 @@ class Autopilot3D:
             max_tilt_deg=float(max(np.interp(self._height(veh), [20.0, 120.0, 500.0], [6.0, 14.0, self.divert_tilt_deg]),
                                    min(self.divert_tilt_deg, 2.0 * float(np.linalg.norm(veh.vel[:2]))))),
             touchdown_speed=self.gate_speed, target_alt=self.gate_height, target_xy=tuple(self._gate_xy),
-            sink_gain=self.sink_gain, keep_out=keep_out, relax=max(self.relax, self._relax_floor),
+            sink_gain=self.sink_gain, keep_out=keep_out, relax=self.relax,
+            lateral_ref_height=self._h_ignition,
         )
 
     @staticmethod
@@ -446,7 +462,20 @@ class Autopilot3D:
                 smooth = P.solve(r, v, m, t_new, cfg)
                 if smooth is not None:
                     plan = smooth
-        elif plan is not None and cfg.relax > self._relax_floor and self.elapsed >= self._next_search:
+            elif plan is None or t_go < 2.0:
+                # Nothing reaches the gate, and the plan in hand has run out
+                # (or is about to): flying its end point would hold the
+                # booster where it is.  Plan afresh from here, at the most
+                # relaxed level and a generous time -- the closest approach
+                # there is, refined as the search finds better.
+                t_new = max(3.0, self._far_time(r, v))
+                cfg.relax = 2
+                cfg.drag_model = self._drag_model(veh, wind_now, t_new)
+                rescue = P.solve(r, v, m, t_new, cfg)
+                if rescue is not None:
+                    plan = rescue
+                    self.relax = 2
+        elif plan is not None and cfg.relax > 0 and self.elapsed >= self._next_search:
             # Back to the stricter limits as soon as they can be met again.
             cfg.relax -= 1
             strict = P.solve(r, v, m, t_go, cfg)
@@ -461,19 +490,23 @@ class Autopilot3D:
             self.touchdown_time = self.elapsed + plan.t_f
             self.last_status = plan.status
 
+    def _far_time(self, r, v):
+        """A generous time to the gate from here: a vertical fall plus the
+        sideways transfer at a modest acceleration -- or, low down, at the
+        planner's lateral-speed envelope (2 + 0.15 h, about half of it on
+        average over the descent)."""
+        h, vz = max(0.0, float(r[2]) - self.gate_height), float(v[2])
+        t_fall = (vz + math.sqrt(vz * vz + 2.0 * G0 * h)) / G0
+        d = float(np.linalg.norm(r[:2] - self._gate_xy))
+        t_far = t_fall + 2.0 * math.sqrt(d / 3.0) + float(np.linalg.norm(v[:2])) / 3.0
+        P = self.planner
+        return max(t_far, t_fall + d / max(3.0, 0.5 * (P.lateral_speed_floor + P.lateral_speed_gain * h)))
+
     def _earliest(self, r, v, m, cfg, t_go, veh):
         # A far divert may need more time than the locked one: widen the
-        # bracket up to the time a vertical fall from here takes plus the
-        # sideways transfer at a modest acceleration.
-        h, vz = max(0.0, float(r[2])), float(v[2])
-        t_fall = (vz + math.sqrt(vz * vz + 2.0 * G0 * h)) / G0
-        d = float(np.linalg.norm(r[:2]))
-        t_far = t_fall + 2.0 * math.sqrt(d / 3.0) + float(np.linalg.norm(v[:2])) / 3.0
-        # ... or, low down, at the planner's lateral-speed envelope (2 + 0.15 h,
-        # about half of it on average over the descent): a low, far booster
-        # may otherwise have no reachable time at all and fly a plan that misses.
-        P = self.planner
-        t_far = max(t_far, t_fall + d / max(3.0, 0.5 * (P.lateral_speed_floor + P.lateral_speed_gain * h)))
+        # bracket up to _far_time (a low, far booster may otherwise have no
+        # reachable time at all and fly a plan that misses).
+        t_far = self._far_time(r, v)
         lo = max(0.8, 0.6 * t_go)
         hi = max(t_go + 1.5, 1.5 * t_go)
         ends = [hi] + ([t_far] if t_far > hi else [])
@@ -602,8 +635,6 @@ class Autopilot3D:
             if nfb > 5.0:
                 fb *= 5.0 / nfb
             accel = u_ff + fb
-            if h < 10.0 and v[2] > -0.6 * self.touchdown_speed and self.catch_link is None:
-                accel[2] = min(accel[2], 0.9 * g)     # never stall or climb above the pad
             if h < self.sink_track_height:
                 # Final approach envelope (same as the planner's): if sinking
                 # faster than 1.2 + 0.5 h m/s, brake the excess.  Near the pad
@@ -638,8 +669,7 @@ class Autopilot3D:
             self._holding = True
             self._hold_t = 0.0
             self._hold_i = np.zeros(2)
-            # no climbing back up to the gate height: hold where it arrived
-            self._hold_h = float(np.clip(r[2], 0.6, self.gate_height))
+            self._hold_h = self.gate_height
         self._hold_t += dt
         settle = bool(self.catch_link()) or self._hold_t > self.catch_hold_max or veh.propellant < 80.0
         if settle:
@@ -768,7 +798,12 @@ class Autopilot3D:
         burn_due = f_v >= self._ignition_threshold(t_v, up_only)
         bb_miss = float(np.interp(airspeed, self.boostback_slow_speed, (self.boostback_miss_slow, self.boostback_miss)))
         start = miss > bb_miss and r[2] > self.boostback_min_alt and airspeed < 180.0 and not ignite_now
-        if not self._boostback_done and (self._boostback or start):
+        hop = (not start and self.hop_min_alt < r[2] <= self.boostback_min_alt and airspeed < 100.0
+               and miss > self.hop_miss and not ignite_now)
+        if not self._boostback_done and (self._boostback or start or hop):
+            if not self._boostback:
+                self._hop = hop
+                self._bb_floor = self.hop_end_frac * float(r[2]) if hop else self.boostback_end_alt
             self._boostback = True
             self.phase = "BOOSTBACK"
             self._mark()
@@ -780,15 +815,42 @@ class Autopilot3D:
                 self._bb_v = v.copy()
             dv = self._bb_dv
             dvn = float(np.linalg.norm(dv)) if dv is not None else 0.0
-            if (dv is None or dvn < self.boostback_done_dv or r[2] < self.boostback_end_alt or burn_due
-                    or veh.propellant < self._bb_reserve):
+            # Nose-first at speed (see nose_first_speed): keep within the flow
+            # cone (a gravity turn); once the horizontal change still wanted
+            # points back (more nose-first thrust only overshoots), or the air
+            # has already turned the booster round (engines-first: the stable
+            # attitude, from which the thrust cannot be pointed along the
+            # motion again -- it would wait at zero throttle), the
+            # engines-first coast and the landing burn take over.  A hop also
+            # ends once the change wanted points against the flow (braking):
+            # it starts slow, so there is no retrograde phase to fly.
+            d = None if dv is None or dvn <= 0.0 else dv / dvn
+            braking = False
+            if d is not None and airspeed > self.nose_first_speed:
+                u_air = (v - wind_now) / airspeed
+                cos_f = float(np.dot(d, u_air))
+                cap = math.radians(self.nose_first_aoa_deg)
+                if cos_f > 0.0:
+                    if float(np.dot(dv[:2], v[:2])) < 0.0 or float(np.dot(veh.axis, u_air)) < 0.0:
+                        braking = True
+                    elif cos_f < math.cos(cap):
+                        side = d - u_air * cos_f
+                        d = u_air * math.cos(cap) + side / float(np.linalg.norm(side)) * math.sin(cap)
+                elif self._hop:
+                    braking = True
+            if (dv is None or dvn < self.boostback_done_dv or r[2] < self._bb_floor or burn_due
+                    or veh.propellant < self._bb_reserve or braking):
                 self._boostback = False
                 self._boostback_done = True
             else:
-                d = dv / dvn
                 c.fins_deploy = False           # grid fins stay stowed for the boost-back
                 err = math.acos(max(-1.0, min(1.0, float(np.dot(veh.axis, d)))))
                 thr = float(np.clip(dvn / 8.0, 0.4, 1.0)) if err < math.radians(25.0) else 0.0
+                if self._hop and thr == 0.0 and veh.axis[2] > 0.3:
+                    # still turning: hold the height meanwhile (a hop starts
+                    # low and slow -- falling now only steepens the flow it
+                    # must then fly against)
+                    thr = float(np.clip(1.1 * m * G0 / (self._thrust_available(veh, r[2]) * float(veh.axis[2])), 0.0, 1.0))
                 c.throttle = thr
                 self.cmd_throttle = thr
                 self.cmd_axis = d
@@ -909,8 +971,15 @@ class Autopilot3D:
         at ignition is shallower than ``boostback_gamma_ok``: a longer,
         steeper fall lets drag bleed the horizontal speed off.  Warm-started
         between solves (every ``boostback_solve_period``)."""
-        dv = np.zeros(3) if self._bb_dv is None else self._bb_dv.copy()
-        if self._bb_v is not None:
+        if self._bb_dv is None:
+            dv = np.zeros(3)
+            if self._hop:
+                # start lofted: from low down a flat shot just falls short
+                # (and the booster must not sink while it turns)
+                dv[2] = float(np.clip(0.5 * math.sqrt(G0 * float(np.linalg.norm(self.impact))), 20.0, self.boostback_loft_max))
+        else:
+            dv = self._bb_dv.copy()
+        if self._bb_v is not None and self._bb_dv is not None:
             dv -= v - self._bb_v
         dv[2] = max(0.0, dv[2])
 
@@ -1014,6 +1083,7 @@ class Autopilot3D:
         self._gate_xy = np.zeros(2)          # the burn itself lands on the pad centre
         self.burn_locked = True
         self._boostback = False
+        self._h_ignition = float(r[2])
         self.touchdown_time = self.elapsed + max(1.5, 1.05 * t_burn) + 2.0   # + gentle final approach
         self.next_replan = self.elapsed
         self.plan = None

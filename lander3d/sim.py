@@ -37,10 +37,9 @@ SCENARIOS = [
     {"name": "TOWER CATCH ENTRY 12 km", "pos": (1800, -1100, 12000), "vel": (-88, 54, -260), "tilt": 8.0, "prop": 6000,
      "catch": True},
     # Low behind the tower: the straight way to the arms goes through it, the
-    # plan goes over it (keep-out constraints).  Levelling off before the
-    # tower is part of that, so the no-hover check only asks for no climb here.
+    # plan goes over it (keep-out constraints).
     {"name": "TOWER CATCH OVER TOWER", "pos": (-150, 0, 100), "vel": (0, 0, -5), "tilt": 0.0, "prop": 4000,
-     "catch": True, "min_sink": -0.1},
+     "catch": True},
 ]
 
 

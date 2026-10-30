@@ -438,10 +438,17 @@ class Vehicle:
     def _consume(self, mdot, dt):
         if mdot <= 0.0:
             return
-        use = min(self.propellant, mdot * dt)
+        use = mdot * dt
         ratio = self.spec.lox_capacity / self.spec.propellant_capacity
-        self.lox = max(0.0, self.lox - use * ratio)
-        self.rp1 = max(0.0, self.rp1 - use * (1.0 - ratio))
+        if self.lox <= use * ratio or self.rp1 <= use * (1.0 - ratio):
+            # Either tank running dry ends the burn (the engine needs both);
+            # the rest is unusable.  Taking min(propellant, use) in the mix
+            # ratio instead left a geometric tail in the other tank that
+            # never quite ran out: endless thrust on an empty booster.
+            self.lox = self.rp1 = 0.0
+            return
+        self.lox -= use * ratio
+        self.rp1 -= use * (1.0 - ratio)
 
     def _store(self, thrust_w, thrust_mag, mdot, isp, g, wind_v, v_rel, rho, a_snd, aero_info, m, zc):
         self.last.update({"thrust": thrust_w, "thrust_mag": thrust_mag, "mass_flow": mdot, "isp": isp, "g": g,

@@ -66,7 +66,7 @@ def snapshot(sim: Sim3D) -> dict:
             "phase": ap.phase if sim.autopilot_on else "MANUAL", "visited": ap.visited, "tgo": None if not math.isfinite(ap.time_to_go) else round(ap.time_to_go, 2),
             "solver": {"status": ap.last_status, "backend": ap.planner.backend, "solves": ap.planner.solve_count,
                        "margin": round(1.0 - ap.burn_fraction, 3), "locked": ap.burn_locked,
-                       "relax": max(ap.relax, ap._relax_floor) if ap.burn_locked else 0},
+                       "relax": ap.relax if ap.burn_locked else 0},
             "pos": _vec(v.pos), "vel": _vec(v.vel), "q": _vec(v.q), "omega": _vec(v.omega), "alt": round(v.altitude, 2),
             "heading": round(heading, 2), "pitch": round(pitch, 2), "roll": round(roll, 2), "tilt": round(v.tilt_deg(), 2),
             "throttle": round(v.throttle, 4), "cmd_throttle": round(ap.cmd_throttle, 4) if sim.autopilot_on else None,
