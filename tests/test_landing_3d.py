@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 
 from lander3d.planner import KeepOutBox, Plan3D, along_path, detour_path, separating_planes
-from lander3d.regression import run_scenario
+from lander3d.regression import passed, run_scenario
 from lander3d.server import finite, snapshot
-from lander3d.sim import SCENARIOS, Sim3D
+from lander3d.sim import PHYSICS_DT, SCENARIOS, Sim3D
 from lander3d.tower import ARM_CLOSED, FACE_CLEARANCE, CatchTower
 from lander3d.vehicle import Vehicle
 
@@ -45,14 +45,39 @@ def test_relaxed_plans_are_judged_without_the_limits_they_relax():
     z = np.zeros(3)
     plan = Plan3D(t_f=10.0, dt=1.0, r=z, v=z, z=z, u=z, sigma=z, drag=z, status="Solved", objective=0.0,
                   terminal_position_error=0.2, terminal_velocity_error=0.1, glide_violation=0.0, fuel_violation=0.0,
-                  lateral_violation=8.0, climb_violation=0.0)
+                  lateral_violation=8.0)
     assert not plan.reaches_pad                      # far too fast sideways for the normal limits
     plan.relax = 1
-    assert not plan.reaches_pad                      # level 1 only frees the vertical profile
+    assert not plan.reaches_pad                      # level 1 only frees the sink envelope
     plan.relax = 2
     assert plan.reaches_pad
-    plan.climb_violation = 3.0                       # ... but even relaxed, no climbing beyond 5 m/s
-    assert not plan.reaches_pad
+
+
+def test_past_its_end_a_plan_keeps_descending_instead_of_holding():
+    # A plan that ends a little above the pad, still braking: past its end the
+    # reference must carry on down at the final velocity with hover thrust,
+    # not hold the end point with the braking thrust (that balances the
+    # tracker's feedback a few metres up -- a hover).
+    n = 4
+    r = np.array([[0.0, 0.0, 10.0 - 3.0 * k] for k in range(n + 1)])
+    v = np.tile([0.0, 0.0, -1.2], (n + 1, 1))
+    u = np.tile([0.0, 0.0, 13.0], (n + 1, 1))
+    plan = Plan3D(t_f=4.0, dt=1.0, r=r, v=v, z=np.zeros(n + 1), u=u, sigma=np.full(n + 1, 13.0),
+                  drag=np.zeros((n, 3)), status="Solved", objective=0.0, terminal_position_error=0.0,
+                  terminal_velocity_error=0.0, glide_violation=0.0, fuel_violation=0.0)
+    pos, vel, acc = plan.sample(6.0)
+    assert pos[2] < r[-1, 2] - 2.0 and vel[2] < 0.0
+    assert abs(acc[2] - 9.80665) < 0.01
+
+
+def test_an_empty_tank_ends_the_burn():
+    veh = Vehicle()
+    veh.reset(position=(0.0, 0.0, 500.0), propellant=1.0, on_pad=False)
+    veh.rp1 = 0.0                                   # one tank dry, some LOX left
+    veh.controls.throttle = 1.0
+    for _ in range(10):
+        veh.step(1.0 / 240.0)
+    assert veh.propellant == 0.0 and veh.throttle == 0.0
 
 
 def test_snapshot_is_valid_json_for_the_browser():
@@ -79,3 +104,27 @@ def test_mid_range_miss_boosts_back_instead_of_a_low_sideways_burn():
     assert _first_phase((150.0, 100.0, 2000.0), (0.0, 0.0, -30.0)) == "BOOSTBACK"
     # A small (wind) drift is left to the glide.
     assert _first_phase((0.0, 0.0, 2000.0), (0.0, 0.0, -30.0)) == "COAST"
+
+
+def test_low_far_booster_hops_instead_of_a_long_powered_traverse():
+    # 2 km off at 600 m, at rest: the landing burn would traverse at ~20 m/s
+    # for ~75 s (gravity loss all the way) and run the tank dry.
+    assert _first_phase((2000.0, 0.0, 600.0), (0.0, 0.0, 0.0)) == "BOOSTBACK"
+
+
+def _fly(pos, vel, propellant=4000, t_max=260.0):
+    sim = Sim3D(cfd=False)
+    sim.vehicle.reset(position=pos, velocity=vel, propellant=propellant, on_pad=False)
+    sim.vehicle.pos[2] += sim.vehicle.rest_height
+    sim.autopilot.reset()
+    sim.autopilot_on = True
+    while sim.time < t_max and sim.vehicle.state == "FLYING":
+        sim.step(PHYSICS_DT)
+    return sim.vehicle
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("pos", [(2000.0, 0.0, 600.0), (800.0, 0.0, 100.0)], ids=["hop-2km-600m", "low-800m-100m"])
+def test_extreme_start_is_recovered(pos):
+    veh = _fly(pos, (0.0, 0.0, 0.0))
+    assert passed(veh, catch=False), (veh.state, veh.touchdown)

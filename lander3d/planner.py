@@ -66,11 +66,14 @@ class PlanConfig3D:
     # Obstacles (soft): callable(knot times) -> [(k, n, b), ...], each asking
     # n . r_k >= b; see separating_planes.
     keep_out: Callable | None = None
-    # Relaxation level when nothing is reachable otherwise: 1 = descent no
-    # longer monotonic (climbing up to Planner3D.relaxed_climb, sink envelope
-    # nearly free), 2 = also the lateral-speed envelope, approach cone and
+    # Relaxation level when nothing is reachable otherwise: 1 = sink envelope
+    # nearly free, 2 = also the lateral-speed envelope, approach cone and
     # glide slope.
     relax: int = 0
+    # Height (planner coordinates) whose lateral-speed envelope also caps the
+    # plan: the envelope widens with height, and without this a plan would
+    # climb just to fly sideways faster.  Normally the height at ignition.
+    lateral_ref_height: float | None = None
 
 
 @dataclass
@@ -214,10 +217,9 @@ class Plan3D:
     terminal_velocity_error: float
     glide_violation: float
     fuel_violation: float
-    # largest slack of the lateral-speed / angle-of-attack / no-climb limits
+    # largest slack of the lateral-speed / angle-of-attack limits
     lateral_violation: float = 0.0
     aoa_violation: float = 0.0
-    climb_violation: float = 0.0
     keep_out_violation: float = 0.0
     relax: int = 0
     created_at: float = 0.0
@@ -229,13 +231,11 @@ class Plan3D:
     @property
     def reaches_pad(self) -> bool:
         # Reaching the pad by breaking the flyability limits (much faster
-        # sideways than allowed, nose-first, climbing) does not count: the
-        # tracker cannot follow such a plan, so the time must move instead.
-        # A relaxed plan (``relax``) is judged without the limits it relaxed
-        # (level 1 keeps a looser climb limit of its own).
+        # sideways than allowed, nose-first) does not count: the tracker
+        # cannot follow such a plan, so the time must move instead.  A relaxed
+        # plan (``relax``) is judged without the limits it relaxed.
         return (self.terminal_position_error < 1.0 and self.terminal_velocity_error < 0.8
                 and self.fuel_violation < 1e-3 and self.keep_out_violation < 0.5
-                and self.climb_violation < 2.0
                 and (self.relax >= 2 or (self.glide_violation < 1.0 and self.lateral_violation < 3.0)))
 
     @property
@@ -245,7 +245,11 @@ class Plan3D:
     def sample(self, tau: float):
         g = np.array([0.0, 0.0, -G0])
         if tau >= self.t_f:
-            return self.r[-1].copy(), self.v[-1].copy(), self.u[-1].copy()
+            # Past the end: carry on at the final velocity (on the pad,
+            # sinking at touchdown speed), with the thrust that just holds
+            # it.  Holding the end point and the last knot's (braking)
+            # thrust instead balances the feedback above the pad -- a hover.
+            return self.r[-1] + self.v[-1] * (tau - self.t_f), self.v[-1].copy(), -(g + self.drag[-1])
         tau = max(0.0, tau)
         k = min(int(tau / self.dt), self.knots - 1)
         t = tau - k * self.dt
@@ -275,11 +279,12 @@ class Planner3D:
     sink_envelope_weight = 80.0
     # Final approach: lateral offset / speed weights (per s) vs time-to-go (s).
     approach_t = (0.0, 6.0, 10.0, 15.0)
-    approach_pos_w = (0.3, 0.2, 0.02, 0.008)
+    approach_pos_w = np.array([0.3, 0.2, 0.02, 0.008])
     approach_vel_w = (0.4, 0.3, 0.03, 0.03)
     vertical_final_t = 10.0
     vertical_final_w = 0.1
     lateral_position_weight = 0.008
+    lateral_position_ref = 150.0   # m: the pull towards the pad axis saturates beyond this offset
     lateral_velocity_weight = 0.03
     lateral_jerk_factor = 8.0
     lateral_rate = 4.0             # m/s^3, limit on the change of planned lateral thrust
@@ -294,10 +299,6 @@ class Planner3D:
     lateral_speed_floor = 2.0      # m/s at the pad
     lateral_speed_gain = 0.15      # + m/s per m of height
     aoa_weight = 100.0
-    no_climb_weight = 300.0
-    min_sink = 1.0                 # m/s, the slowest planned descent
-    climb_decay = 1.5              # m/s^2: a climb now must end at least this fast
-    relaxed_climb = 5.0            # m/s: the climb a relaxed plan (relax >= 1) may use
     approach_cone_floor = 1.0      # m off the pad centre at the pad ...
     approach_cone_gain = 0.35      # ... + m per m of height
     approach_cone_weight = 60.0
@@ -338,8 +339,7 @@ class Planner3D:
         isk = ifs + 1                  # sink-envelope slacks, knots 1..N
         ivs = isk + N                  # lateral-speed slacks, knots 1..N
         iao = ivs + N                  # angle-of-attack slacks, knots 1..N
-        icl = iao + N                  # no-climb slacks, knots 1..N
-        iap = icl + N                  # final-approach-cone slacks, knots 1..N
+        iap = iao + N                  # final-approach-cone slacks, knots 1..N
         ikp = iap + N                  # keep-out slacks, one per half-space
         t_k = np.arange(N + 1) * dt
         keep = [kp for kp in cfg.keep_out(t_k) if kp[0] >= 1] if cfg.keep_out is not None else []
@@ -414,21 +414,11 @@ class Planner3D:
         for k in range(N):
             row([(iao + k, -1.0)], 0.0)
         for k in range(N):
-            row([(icl + k, -1.0)], 0.0)
-        for k in range(N):
             row([(iap + k, -1.0)], 0.0)
         # Obstacles: n . r_k + s >= b  ->  -n . r_k - s <= -b
         for j, (k, nrm, b_) in enumerate(keep):
             row([(ikp + j, -1.0)], 0.0)
             row([(S(k, c), -float(nrm[c])) for c in range(3) if nrm[c] != 0.0] + [(ikp + j, -1.0)], -b_)
-        # The landing burn only descends (soft): a divert is flown sinking,
-        # never by climbing back up or hovering to wait.
-        # Relaxed (nothing reachable otherwise): no longer monotonic, but a
-        # climb stays moderate (fast climbing is what a time-optimal search
-        # would pick to earn a wider lateral-speed envelope).
-        floor_vz = self.relaxed_climb if cfg.relax >= 1 else -self.min_sink
-        for k in range(1, N + 1):
-            row([(S(k, 5), 1.0), (icl + k - 1, -1.0)], max(floor_vz, float(v0[2]) - self.climb_decay * t_k[k]))
         if cfg.sink_gain > 0.0:
             # vz_k >= -(v_td + c (h_k - h_target)) - s_k   (linear in the state)
             c_s = cfg.sink_gain
@@ -514,6 +504,15 @@ class Planner3D:
             row([(S(k, 3), -1.0)], 0.0)
             row([(S(k, 4), -1.0)], 0.0)
             soc_dims.append(3)
+            if cfg.lateral_ref_height is not None:
+                # ... and no wider than at the reference height: climbing is
+                # allowed (over an obstacle, back up after a deep fall), but
+                # it does not buy a faster traverse.
+                row([(ivs + k - 1, -1.0)],
+                    self.lateral_speed_floor + self.lateral_speed_gain * max(0.0, cfg.lateral_ref_height - cfg.target_alt))
+                row([(S(k, 3), -1.0)], 0.0)
+                row([(S(k, 4), -1.0)], 0.0)
+                soc_dims.append(3)
             # Final approach cone (soft), much steeper than the glide slope:
             # be over the pad before the last ~50 m, then come down upright.
             row([(iap + k - 1, -1.0), (S(k, 2), -self.approach_cone_gain)],
@@ -554,7 +553,14 @@ class Planner3D:
         # a late lateral error.  Quadratic costs, not constraints.
         if cfg.mode != "fuel":
             tgo_k = t_f - t_k
-            wr = np.maximum(self.lateral_position_weight, np.interp(tgo_k, self.approach_t, self.approach_pos_w))
+            # A quadratic pull grows with the square of the offset: from far
+            # off (a long divert) it would swamp the soft flyability limits
+            # (lateral-speed envelope) and the plan would rush sideways.  Its
+            # strength is that of a ``lateral_position_ref`` offset at most;
+            # the final approach (last ~6 s) keeps its full weight.
+            d0 = math.hypot(float(r0[0]) - float(cfg.target_xy[0]), float(r0[1]) - float(cfg.target_xy[1]))
+            far = min(1.0, (self.lateral_position_ref / max(d0, 1e-6)) ** 2)
+            wr = np.maximum(self.lateral_position_weight * far, np.interp(tgo_k, self.approach_t, self.approach_pos_w * np.array([1.0, 1.0, far, far])))
             wvv = np.maximum(self.lateral_velocity_weight, np.interp(tgo_k, self.approach_t, self.approach_vel_w))
             tx, ty = float(cfg.target_xy[0]), float(cfg.target_xy[1])
             for k in range(1, N + 1):
@@ -602,7 +608,6 @@ class Planner3D:
         q[isk:isk + N] = self.sink_envelope_weight * lax1
         q[ivs:ivs + N] = self.lateral_speed_weight * dt * lax2
         q[iao:iao + N] = self.aoa_weight * dt
-        q[icl:icl + N] = self.no_climb_weight * dt
         # only the last seconds: earlier a low, far booster must not be
         # pushed up to get inside it
         q[iap:iap + N] = self.approach_cone_weight * dt * lax2 * np.interp(t_f - t_k[1:], self.approach_cone_t, [1.0, 0.0])
@@ -610,7 +615,7 @@ class Planner3D:
         for i in range(n):
             add_p(i, i, 1e-7)
         P = hessian.matrix()
-        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, isg=isg, ifs=ifs, ivs=ivs, iao=iao, icl=icl, ikp=ikp, n=n,
+        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, isg=isg, ifs=ifs, ivs=ivs, iao=iao, ikp=ikp, n=n,
                       NX=NX, G=Gm)
         return P, q, A, b_vec, n_zero, n_nonneg, soc_dims, layout, drag, const
 
@@ -637,7 +642,6 @@ class Planner3D:
             glide_violation=float(np.max(x[L["isg"]: L["isg"] + N], initial=0.0)), fuel_violation=float(max(0.0, x[L["ifs"]])),
             lateral_violation=float(np.max(x[L["ivs"]: L["ivs"] + N], initial=0.0)),
             aoa_violation=float(np.max(x[L["iao"]: L["iao"] + N], initial=0.0)),
-            climb_violation=float(np.max(x[L["icl"]: L["icl"] + N], initial=0.0)),
             keep_out_violation=float(np.max(x[L["ikp"]: L["n"]], initial=0.0)), relax=int(cfg.relax),
         )
 
