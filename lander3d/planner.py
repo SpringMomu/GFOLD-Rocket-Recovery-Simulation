@@ -79,6 +79,10 @@ class Plan3D:
     terminal_velocity_error: float
     glide_violation: float
     fuel_violation: float
+    # largest slack of the lateral-speed / angle-of-attack / no-climb limits
+    lateral_violation: float = 0.0
+    aoa_violation: float = 0.0
+    climb_violation: float = 0.0
     created_at: float = 0.0
 
     @property
@@ -87,8 +91,12 @@ class Plan3D:
 
     @property
     def reaches_pad(self) -> bool:
+        # Reaching the pad by breaking the flyability limits (much faster
+        # sideways than allowed, nose-first, climbing) does not count: the
+        # tracker cannot follow such a plan, so the time must move instead.
         return (self.terminal_position_error < 1.0 and self.terminal_velocity_error < 0.8
-                and self.glide_violation < 1.0 and self.fuel_violation < 1e-3)
+                and self.glide_violation < 1.0 and self.fuel_violation < 1e-3
+                and self.lateral_violation < 3.0 and self.climb_violation < 2.0)
 
     @property
     def final_mass(self) -> float:
@@ -122,7 +130,7 @@ class Planner3D:
     terminal_position_weight = 400.0
     terminal_velocity_weight = 250.0
     glide_slope_weight = 30.0
-    glide_slope_tan = math.tan(math.radians(65.0))
+    glide_slope_tan = math.tan(math.radians(80.0))
     fuel_slack_weight = 2.0e4
     sink_envelope_weight = 80.0
     # Final approach: lateral offset / speed weights (per s) vs time-to-go (s).
@@ -146,8 +154,9 @@ class Planner3D:
     lateral_speed_floor = 2.0      # m/s at the pad
     lateral_speed_gain = 0.15      # + m/s per m of height
     aoa_weight = 100.0
-    no_climb_weight = 100.0
+    no_climb_weight = 300.0
     min_sink = 1.0                 # m/s, the slowest planned descent
+    climb_decay = 1.5              # m/s^2: a climb now must end at least this fast
     approach_cone_floor = 1.0      # m off the pad centre at the pad ...
     approach_cone_gain = 0.35      # ... + m per m of height
     approach_cone_weight = 60.0
@@ -267,7 +276,7 @@ class Planner3D:
         # The landing burn only descends (soft): a divert is flown sinking,
         # never by climbing back up or hovering to wait.
         for k in range(1, N + 1):
-            row([(S(k, 5), 1.0), (icl + k - 1, -1.0)], max(-self.min_sink, float(v0[2]) - g * t_k[k]))
+            row([(S(k, 5), 1.0), (icl + k - 1, -1.0)], max(-self.min_sink, float(v0[2]) - self.climb_decay * t_k[k]))
         if cfg.sink_gain > 0.0:
             # vz_k >= -(v_td + c (h_k - h_target)) - s_k   (linear in the state)
             c_s = cfg.sink_gain
@@ -295,7 +304,7 @@ class Planner3D:
                     continue
                 aoa = math.radians(float(np.interp(q_mid[k - 1], *cfg.q_aoa)))
                 aoa = max(aoa, math.acos(float(np.clip(w[2], -1.0, 1.0))) - tilt[k] + math.radians(3.0))
-                if aoa < math.pi / 2:
+                if aoa < math.radians(170.0):
                     # soft (slack in m/s^2 of thrust off the allowed cone):
                     # thrust-rate limits may not allow an instant turn
                     row([(U(k, 3), math.cos(aoa)), (iao + k - 1, -1.0)] + [(U(k, c), -float(w[c])) for c in range(3)], 0.0)
@@ -445,7 +454,7 @@ class Planner3D:
         for i in range(n):
             add_p(i, i, 1e-7)
         P = hessian.matrix()
-        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, isg=isg, ifs=ifs, NX=NX, G=Gm)
+        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, isg=isg, ifs=ifs, ivs=ivs, iao=iao, icl=icl, NX=NX, G=Gm)
         return P, q, A, b_vec, n_zero, n_nonneg, soc_dims, layout, drag, const
 
     def solve(self, r0, v0, m0, t_f, cfg: PlanConfig3D) -> Plan3D | None:
@@ -469,6 +478,9 @@ class Planner3D:
             u=Uc[:, 0:3].copy(), sigma=Uc[:, 3].copy(), drag=drag, status=status, objective=obj,
             terminal_position_error=float(np.linalg.norm(e[0:3])), terminal_velocity_error=float(np.linalg.norm(e[3:6])),
             glide_violation=float(np.max(x[L["isg"]: L["isg"] + N], initial=0.0)), fuel_violation=float(max(0.0, x[L["ifs"]])),
+            lateral_violation=float(np.max(x[L["ivs"]: L["ivs"] + N], initial=0.0)),
+            aoa_violation=float(np.max(x[L["iao"]: L["iao"] + N], initial=0.0)),
+            climb_violation=float(np.max(x[L["icl"]: L["icl"] + N], initial=0.0)),
         )
 
     def search(self, r0, v0, m0, lo, hi, cfg, evaluations=10):
