@@ -127,6 +127,10 @@ html, body { margin: 0; height: 100%; background: #04070c; color: var(--txt); fo
 
 /* toasts / help */
 #banner { position: fixed; left: 50%; top: 38%; transform: translate(-50%, -50%); font-size: 34px; font-weight: 700; letter-spacing: 0.2em; padding: 12px 30px; border-radius: 6px; display: none; text-shadow: 0 0 20px currentColor; background: rgba(0,0,0,0.45); border: 1px solid currentColor; }
+#solverWarn { position: fixed; left: 50%; top: 64px; transform: translateX(-50%); z-index: 30; display: none; padding: 6px 16px; border-radius: 5px; font-size: 14px; font-weight: 700; letter-spacing: 0.04em; background: rgba(0,0,0,0.6); border: 1px solid currentColor; text-shadow: 0 0 10px currentColor; pointer-events: none; white-space: nowrap; }
+#solverWarn.fail { color: #ff5a4e; animation: warnBlink 0.8s steps(2, start) infinite; }
+#solverWarn.miss { color: #ffb347; }
+@keyframes warnBlink { to { opacity: 0.45; } }
 #banner small { display: block; font-size: 13px; letter-spacing: 0.08em; margin-top: 6px; font-weight: 400; text-align: center; }
 #help { left: 50%; top: 50%; transform: translate(-50%, -50%); width: 640px; display: none; font-size: 12px; z-index: 10; }
 #help table { width: 100%; border-collapse: collapse; }
@@ -415,6 +419,7 @@ body.pad #hint { display: none; }
 </div>
 
 <div id="banner"></div>
+<div id="solverWarn"></div>
 <div id="hint"><b>−</b> 折叠面板 · <b>H</b> 帮助 · <b>M</b> 自动驾驶 · <b>F</b> 主视图气流 · <b>K</b> 轨迹 · <b>V</b> 相机 · <b>1-9 0</b> 场景</div>
 
 <div id="help" class="panel">

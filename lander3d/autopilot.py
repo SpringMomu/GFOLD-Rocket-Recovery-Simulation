@@ -14,6 +14,7 @@ import numpy as np
 
 from common.conic import golden_section_search
 
+from .aero import grid_fin_forces
 from .attitude import attitude_control
 from .planner import (
     KeepOutBox,
@@ -35,14 +36,28 @@ from .vehicle import G0, atmosphere
 # partly fly, and lands further off in wind.)
 TILT_BUDGET = ([0.3, 1.5, 3.0, 8.0, 15.0, 40.0], [0.6, 2.0, 5.0, 12.0, 20.0, 75.0])
 TRIM_FADE = (0.5, 5.5)          # m: upright below the first height, full trim above the second
-# Angle of attack (thrust vs the oncoming flow) vs dynamic pressure (Pa -> deg):
-# free at low speed; tight where the aerodynamic moment and the body lift of the
-# engines-first booster (opposing its tilt) outweigh TVC and the thrust's side
-# part -- e.g. a fast low divert cannot be flown nose-first towards the pad.
-# Below ~0.5 kPa slightly nose-first is still holdable (a slow sideways cruise
-# needs it against the broadside drag).
 SLEW_DEG = ([2.0, 30.0, 300.0], [8.0, 15.0, 25.0])   # thrust-direction slew-rate limit (deg/s) by height
+# Angle of attack (thrust vs the oncoming flow) vs dynamic pressure (Pa ->
+# deg): only a fallback without an aerodynamic model.  With one, the limit is
+# physical -- the attitude the TVC can hold against the aerodynamic moment
+# (Autopilot3D._aoa_table).
 Q_AOA_BUDGET = ([300.0, 800.0, 1500.0, 2500.0, 8000.0], [115.0, 90.0, 60.0, 30.0, 12.0])
+AOA_Q_GRID = (150.0, 300.0, 500.0, 800.0, 1200.0, 2000.0, 3500.0, 6000.0, 10000.0, 20000.0)
+
+
+class _AttitudeProbe:
+    """The booster at another attitude, for the aerodynamic model only."""
+
+    def __init__(self, veh, R):
+        self.R = R
+        self._mp = veh.mass_properties()
+        self.legs = veh.legs
+        self.omega = np.zeros(3)
+        self.fin_defl = np.zeros(4)
+        self.fins_deploy = 1.0
+
+    def mass_properties(self):
+        return self._mp
 
 
 class Autopilot3D:
@@ -161,6 +176,9 @@ class Autopilot3D:
     trim_max_deg = 12.0
     trim_filter = 0.5             # s
     hold_bias_filter = 1.0        # s (_update_hold_bias)
+    aoa_moment_margin = 0.8       # share of the gimbal's moment the aerodynamic moment may take (_aoa_table)
+    aoa_refresh = 2.0             # s between recomputations of the angle-of-attack table
+    q_filter = 1.0                # s, smoothing of the dynamic pressure for that limit
     # attitude loop
     k_angle = 2.0
     k_rate = 4.0
@@ -208,6 +226,9 @@ class Autopilot3D:
         self._next_shear_fit = 0.0
         self.wind_shear_est = 1.0
         self._trim_xy = np.zeros(2)
+        self._aoa_cache = (-1e9, Q_AOA_BUDGET)
+        self._q_filt = 0.0
+        self.solver_fail = None       # (time, status) of the last re-plan that found no solution at all
         self._hold_bias = np.zeros(2)
         self._boostback = False
         self._boostback_done = False
@@ -280,8 +301,9 @@ class Autopilot3D:
             G = np.zeros((n, 3, 3))
             qd = np.zeros(n)
             wd = np.zeros((n, 3))
+            dq = np.zeros(n)                # d(dynamic pressure)/d(height) along the reference
             if self.aero is None:
-                return out, G, qd, wd
+                return out, G, qd, wd, dq
             for i, t in enumerate(times):
                 u_ref = None
                 if prev is None or t < 0.3:
@@ -305,6 +327,13 @@ class Autopilot3D:
                 vr = v - self._wind(h)          # the wind where the plan will be, not the wind here
                 sp = float(np.linalg.norm(vr))
                 qd[i] = 0.5 * rho * sp * sp
+                # lower down the wind is weaker (and the air a little denser):
+                # how the dynamic pressure would change with the height
+                qs = []
+                for dh in (5.0, -5.0):
+                    rho_d = atmosphere(max(0.0, h + dh + self.h_off))[0]
+                    qs.append(0.5 * rho_d * float(np.linalg.norm(v - self._wind(h + dh))) ** 2)
+                dq[i] = (qs[0] - qs[1]) / 10.0
                 if sp < 3.0:
                     continue
                 u = vr / sp
@@ -347,7 +376,7 @@ class Autopilot3D:
                     Gi += np.outer(grad, e) / sig             # tilt along e ~ (e . u) / sigma
                 out[i] = f0 / m - (Gi @ u_ref if u_ref is not None and np.any(tilt) else 0.0)
                 G[i] = Gi
-            return out, G, qd, wd
+            return out, G, qd, wd, dq
 
         return model
 
@@ -408,10 +437,11 @@ class Autopilot3D:
             u_cmd=tuple(self.plan.sample(self.elapsed - self.plan.created_at)[2]) if self.plan is not None else None,
             max_tilt_deg=self.divert_tilt_deg,
             touchdown_speed=self.gate_speed, target_alt=self.gate_height, target_xy=tuple(self._gate_xy),
-            sink_gain=self.sink_gain, keep_out=keep_out, q_aoa=Q_AOA_BUDGET, ground_alt=self._z_ground,
+            sink_gain=self.sink_gain, keep_out=keep_out, q_aoa=self._aoa_table(veh), ground_alt=self._z_ground,
             body_length=s.length,
             tilt_trim=tuple(self._gate_trim(veh)), trim_fade=self._trim_fade(), tilt_budget=TILT_BUDGET,
             height_ref=self._height_ref(veh), slew_deg=SLEW_DEG, time_weight=self.time_weight,
+            min_sink=1.0 if self.catch_link is None else 0.0,
         )
 
     def _solver(self, veh, wind_now, frac, keep_out):
@@ -622,6 +652,22 @@ class Autopilot3D:
         self.last_status = self.planner.last_status
         if plan is not None:
             self._commit(plan)
+        else:
+            # no solution at all this time (the solver gave up or found the
+            # problem infeasible): the booster flies on along the last plan
+            self.solver_fail = (self.elapsed, self.planner.last_status)
+
+    def solver_alert(self):
+        """For the display: None, or (kind, status) -- 'fail' when the last
+        re-plans found no solution (shown for 2 s), 'miss' when the plan in
+        hand does not reach the gate."""
+        if not self.burn_locked:
+            return None
+        if self.solver_fail is not None and self.elapsed - self.solver_fail[0] < 2.0:
+            return ("fail", self.solver_fail[1])
+        if self.plan is not None and not self.plan.reaches_pad:
+            return ("miss", self.last_status)
+        return None
 
     def _commit(self, plan):
         plan.created_at = self.elapsed
@@ -725,6 +771,10 @@ class Autopilot3D:
             c.fins_deploy = True
             self._update_trim(veh, wind_now, dt)
             self._update_hold_bias(veh, dt)
+            # dynamic pressure for the angle-of-attack limit, smoothed: the
+            # booster's own sway and the gusts swing it by +-50 % in a strong
+            # cross wind, and the limit (steep in q there) would flick on and off
+            self._q_filt += (float(veh.last.get("q", 0.0)) - self._q_filt) * min(1.0, dt / self.q_filter)
 
         if not self.burn_locked:
             self._pre_ignition(veh, r, v, m, wind_now)
@@ -786,7 +836,7 @@ class Autopilot3D:
             max_tilt = math.radians(float(np.interp(h, *TILT_BUDGET)))
             center = self._trim_xy * float(np.interp(h, self._trim_fade(), (0.0, 1.0)))
             trim_tilt = math.atan2(float(np.linalg.norm(center)), G0)
-            accel = self._aoa_limit(veh, accel, wind_now, max_tilt + trim_tilt)
+            accel = self._aoa_limit(veh, accel, wind_now, max_tilt + trim_tilt, self._aoa_table(veh), self._q_filt)
         else:
             self.phase = "FALLBACK"
             a_max_now = s.thrust_sl / m
@@ -850,18 +900,89 @@ class Autopilot3D:
         self._fly_accel(veh, np.array([a_xy[0], a_xy[1], a_z]), tilt, floor=0.9 * self.minimum_throttle,
                         center=None if secured else self._hold_bias)
 
+    def _aoa_table(self, veh):
+        """Angle-of-attack limit vs dynamic pressure, from physics: the
+        largest angle between the thrust (body axis) and the oncoming flow,
+        counted from engines-first, at which the aerodynamic moment stays
+        within ``aoa_moment_margin`` of what the controls can hold: the
+        gimbal (thrust ~ weight, at the current mass and centre of mass) and
+        the four grid fins at full deflection (each fin in its own local
+        flow, so their moment grows with the dynamic pressure like the
+        aerodynamic one).  Both moments are taken from the models (per Pa at
+        each angle, refreshed every ``aoa_refresh``).  A hovering booster in a cross wind leans into
+        it at ~90-110 deg from the flow: what limits it there is the dynamic
+        pressure, hardly the lean (leaning 20 deg adds ~20 % moment), and
+        near the ground, where the wind is weaker, it can lean much more."""
+        t_last, table = self._aoa_cache
+        if self.aero is None or self.elapsed - t_last < self.aoa_refresh:
+            return table
+        s = veh.spec
+        m, zc, _, _ = veh.mass_properties()
+        m_gim = m * G0 * math.sin(s.gimbal_limit) * max(0.5, zc - s.gimbal_z)
+        rho, _, _, a_s = atmosphere(max(0.0, float(veh.pos[2])))
+        q_ref = 1000.0
+        sp = math.sqrt(2.0 * q_ref / rho)
+        last = getattr(self.aero, "last", None)
+        angles = np.arange(0.0, 181.0, 10.0)
+        k, k_fin = [], []
+        w = np.array([1.0, 0.0, 0.0])                     # where the air goes, relative to the booster
+        patterns = [np.array(p, float) * s.fin_max_defl for p in ((1, 0, -1, 0), (0, 1, 0, -1), (1, 1, -1, -1), (1, -1, -1, 1))]
+        for ang in angles:
+            a = math.radians(float(ang))
+            axis = np.array([math.cos(a), 0.0, math.sin(a)])
+            # rotation taking the body z axis to ``axis`` (about body y)
+            R = np.array([[math.sin(a), 0.0, math.cos(a)], [0.0, 1.0, 0.0], [-math.cos(a), 0.0, math.sin(a)]])
+            assert np.allclose(R[:, 2], axis)
+            _, mom, _ = self.aero(_AttitudeProbe(veh, R), -w * sp, rho, a_s, veh.com_world())
+            k.append(float(np.linalg.norm(mom)) / q_ref)
+            # what the four fins can add (pitch/yaw, best deflection pattern)
+            _, m0, _ = grid_fin_forces(s, R, zc, np.zeros(3), -w * sp, rho, a_s, np.zeros(4), 1.0)
+            best = 0.0
+            for d in patterns:
+                _, m1, _ = grid_fin_forces(s, R, zc, np.zeros(3), -w * sp, rho, a_s, d, 1.0)
+                dm = m1 - m0
+                best = max(best, float(np.linalg.norm(dm - axis * float(np.dot(dm, axis)))))
+            k_fin.append(best / q_ref)
+        if last is not None:
+            self.aero.last = last
+        # highest dynamic pressure each angle can be held at:
+        #   K q <= margin (M_gimbal + K_fin q)
+        mg = self.aoa_moment_margin
+        excess = np.asarray(k) - mg * np.asarray(k_fin)
+        q_max = np.where(excess > 0.0, mg * m_gim / np.maximum(excess, 1e-12), np.inf)
+        q_max = np.minimum.accumulate(q_max)                # the cone from engines-first must hold throughout
+        out = []
+        for q in AOA_Q_GRID:
+            ok = q_max >= q
+            if ok.all():
+                out.append(180.0)
+            elif not ok[0]:
+                out.append(0.0)
+            else:
+                j = int(np.argmin(ok))                      # first angle that cannot be held
+                # interpolate in 1/q_max between the last good and first bad angle
+                a0, a1 = angles[j - 1], angles[j]
+                r0, r1 = 1.0 / q_max[j - 1], 1.0 / q_max[j]
+                out.append(float(a0 + (a1 - a0) * (1.0 / q - r0) / max(r1 - r0, 1e-12)))
+        table = (AOA_Q_GRID, tuple(out))
+        self._aoa_cache = (self.elapsed, table)
+        return table
+
     @staticmethod
-    def _aoa_limit(veh, accel, wind_now, max_tilt):
-        """Keep the commanded thrust within the angle-of-attack budget of the
-        oncoming flow (``Q_AOA_BUDGET``), but never beyond the tilt cone."""
+    def _aoa_limit(veh, accel, wind_now, max_tilt, table=Q_AOA_BUDGET, q_dyn=None):
+        """Keep the commanded thrust within the angle-of-attack limit of the
+        oncoming flow (``table``: dynamic pressure -> deg, normally
+        ``_aoa_table``), but never beyond the tilt cone."""
         vr = veh.vel - wind_now
         sp = float(np.linalg.norm(vr))
-        q_dyn = float(veh.last.get("q", 0.0))
+        q_dyn = float(veh.last.get("q", 0.0)) if q_dyn is None else float(q_dyn)
         an = float(np.linalg.norm(accel))
-        if sp < 3.0 or an < 1e-6 or q_dyn <= Q_AOA_BUDGET[0][0]:
+        if sp < 3.0 or an < 1e-6 or q_dyn <= table[0][0]:
             return accel
         w = -vr / sp
-        aoa = math.radians(float(np.interp(q_dyn, *Q_AOA_BUDGET)))
+        aoa = math.radians(float(np.interp(q_dyn, *table)))
+        if aoa >= math.radians(179.0):
+            return accel
         aoa = max(aoa, math.acos(float(np.clip(w[2], -1.0, 1.0))) - max_tilt + math.radians(3.0))
         d = accel / an
         ang = math.acos(float(np.clip(np.dot(d, w), -1.0, 1.0)))
@@ -882,7 +1003,11 @@ class Autopilot3D:
                     lo = mid
                 else:
                     hi = mid
-            return np.array([accel[0] * lo, accel[1] * lo, accel[2]])
+            # ... and what it gives up does not go into a climb: rising
+            # already, at most the hover vertical acceleration (a climb in a
+            # strong wind only meets a stronger one)
+            az = min(float(accel[2]), G0) if float(veh.vel[2]) >= 0.0 else float(accel[2])
+            return np.array([accel[0] * lo, accel[1] * lo, az])
         side = d - w * float(np.dot(d, w))
         sn = float(np.linalg.norm(side))
         if sn < 1e-9:

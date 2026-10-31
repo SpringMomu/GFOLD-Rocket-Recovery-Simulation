@@ -65,6 +65,10 @@ class PlanConfig3D:
     # loose high up, it only keeps the last metres slow (no braking hard into
     # contact), like the tracker's envelope.
     sink_gain: float = 0.0
+    # No hover near the pad (soft): sink at least min_sink between these
+    # heights above the gate (at the reference heights, height_ref).
+    min_sink: float = 0.0
+    min_sink_band: tuple = (1.5, 10.0)
     # Angle-of-attack cap vs dynamic pressure ((Pa...), (deg...)): the angle
     # between the thrust and the oncoming flow (engines-first attitude).  The
     # drag model then also returns the predicted dynamic pressure and flow
@@ -349,12 +353,16 @@ class Planner3D:
     fuel_slack_weight = 2.0e4
     sink_envelope_weight = 80.0
     jerk_weight = 0.1
-    # Control effort of sideways thrust (per (m/s^2)^2 s).  In propellant a
-    # sideways acceleration a costs only ~a^2 / 2g per second, so a purely
-    # propellant-optimal plan swings hard and brakes late sideways -- with
-    # the attitude lag the tracker then overshoots (round and round the
-    # catch point).  This keeps sideways manoeuvres as gentle as the cost
-    # allows; it says nothing about the route.
+    # Effort of sideways manoeuvring (per (m/s^2)^2 s): the net sideways
+    # acceleration, thrust plus the predicted aerodynamic force -- holding
+    # still against a cross wind costs nothing here (that thrust is needed),
+    # swinging about does.  In propellant a sideways acceleration a costs
+    # only ~a^2 / 2g per second, so a purely propellant-optimal plan swings
+    # hard and brakes late sideways -- with the attitude lag the tracker
+    # then overshoots (round and round the catch point).  It says nothing
+    # about the route.  (On the thrust alone it made fighting the wind
+    # expensive: the plan let the wind carry the booster off and came back
+    # low and late.)
     lateral_accel_weight = 1.0
     # Touchdown phase (not the route): over the last ~10 s be over the pad
     # and nearly still sideways -- the burn runs to contact, so a lateral
@@ -403,7 +411,8 @@ class Planner3D:
         isk = ifs + 1                  # touchdown-approach slacks, knots 1..N
         iao = isk + N                  # angle-of-attack slacks, knots 1..N
         igr = iao + N                  # ground slacks, knots 1..N-1
-        ikp = igr + N                  # keep-out slacks, one per half-space
+        imn = igr + N                  # no-hover (minimum sink near the ground) slacks, knots 1..N
+        ikp = imn + N                  # keep-out slacks, one per half-space
         t_k = np.arange(N + 1) * dt
         keep = [kp for kp in cfg.keep_out(t_k) if kp[0] >= 1] if cfg.keep_out is not None else []
         n = ikp + len(keep)
@@ -416,13 +425,15 @@ class Planner3D:
 
         mid = (np.arange(N) + 0.5) * dt
         Gm = None
-        q_mid = w_mid = None
+        q_mid = w_mid = dq_mid = None
         if cfg.drag_model is not None:
             res = cfg.drag_model(mid)
             if isinstance(res, tuple):
                 drag, Gm = np.asarray(res[0], float).reshape(N, 3), np.asarray(res[1], float).reshape(N, 3, 3)
                 if len(res) > 3:
                     q_mid, w_mid = np.asarray(res[2], float).reshape(N), np.asarray(res[3], float).reshape(N, 3)
+                if len(res) > 4:
+                    dq_mid = np.asarray(res[4], float).reshape(N)
             else:
                 drag = np.asarray(res, float).reshape(N, 3)
         else:
@@ -474,6 +485,8 @@ class Planner3D:
             row([(iao + k, -1.0)], 0.0)
         for k in range(N):
             row([(igr + k, -1.0)], 0.0)
+        for k in range(N):
+            row([(imn + k, -1.0)], 0.0)
         if math.isfinite(cfg.ground_alt):
             # the ground: h_k + s_k >= h_ground  (the last knot is the gate)
             for k in range(1, N):
@@ -489,6 +502,17 @@ class Planner3D:
             if lever > 0.0 and abs(float(nrm[2])) < 0.5:
                 row([(S(k, c), -float(nrm[c])) for c in range(2) if nrm[c] != 0.0]
                     + [(U(k, c), -lever * float(nrm[c])) for c in range(2) if nrm[c] != 0.0] + [(ikp + j, -1.0)], -b_)
+        if cfg.min_sink > 0.0:
+            # No hover just above the pad (the acceptance rule): over the last
+            # metres the booster keeps sinking, vz_k <= -v_min + s_k -- a
+            # sideways error must be fixed higher up, not by stopping low
+            # down where the tilt budget makes it slow.
+            h_k = np.asarray(cfg.height_ref(t_k), float) if cfg.height_ref is not None else None
+            if h_k is not None:
+                for k in range(1, N):
+                    hk = float(h_k[k]) - cfg.target_alt
+                    if cfg.min_sink_band[0] < hk < cfg.min_sink_band[1]:
+                        row([(S(k, 5), 1.0), (imn + k - 1, -1.0)], -cfg.min_sink)
         if cfg.sink_gain > 0.0:
             # vz_k >= -(v_td + c (h_k - h_target)) - s_k   (linear in the state)
             c_s = cfg.sink_gain
@@ -516,16 +540,37 @@ class Planner3D:
             # booster cannot hold against the aerodynamic moment -- e.g.
             # flying nose-first towards the pad in a fast low divert.  Kept
             # compatible with the tilt cone, so the problem stays feasible.
+            # The limit depends on the dynamic pressure, which depends on the
+            # height (a cross wind is weaker lower down): linearised in the
+            # knot's height about the reference, with the thrust at its
+            # reference ~g in that term, so that flying lower to lean into
+            # the wind is visible to the optimiser.
+            h_mid = np.asarray(cfg.height_ref(mid), float) if cfg.height_ref is not None else None
             for k in range(1, N + 1):
                 w = w_mid[k - 1]
-                if q_mid[k - 1] <= cfg.q_aoa[0][0] or not np.any(w):
+                if not np.any(w):
                     continue
-                aoa = math.radians(float(np.interp(q_mid[k - 1], *cfg.q_aoa)))
-                aoa = max(aoa, math.acos(float(np.clip(w[2], -1.0, 1.0))) - tilt[k] + math.radians(3.0))
-                if aoa < math.radians(170.0):
-                    # soft (slack in m/s^2 of thrust off the allowed cone):
-                    # thrust-rate limits may not allow an instant turn
-                    row([(U(k, 3), math.cos(aoa)), (iao + k - 1, -1.0)] + [(U(k, c), -float(w[c])) for c in range(3)], 0.0)
+                floor = math.acos(float(np.clip(w[2], -1.0, 1.0))) - tilt[k] + math.radians(3.0)
+
+                def cos_lim(qq, floor=floor):
+                    return math.cos(max(math.radians(float(np.interp(qq, *cfg.q_aoa))), floor))
+
+                qk = float(q_mid[k - 1])
+                c0 = cos_lim(qk)
+                dc = 0.0
+                if dq_mid is not None and h_mid is not None:
+                    dlt = max(20.0, 0.05 * qk)
+                    dc = (cos_lim(qk + dlt) - cos_lim(max(0.0, qk - dlt))) / (qk + dlt - max(0.0, qk - dlt)) * float(dq_mid[k - 1])
+                if c0 <= math.cos(math.radians(170.0)) and dc == 0.0:
+                    continue
+                # soft (slack in m/s^2 of thrust off the allowed cone):
+                # thrust-rate limits may not allow an instant turn
+                terms = [(U(k, 3), c0), (iao + k - 1, -1.0)] + [(U(k, c), -float(w[c])) for c in range(3)]
+                rhs = 0.0
+                if dc != 0.0:
+                    terms.append((S(k, 2), G0 * dc))
+                    rhs = G0 * dc * float(h_mid[k - 1])
+                row(terms, rhs)
         # The first knot may keep the current thrust direction (attitude lag),
         # but no more: a looser first knot is flown for the whole replan
         # period and the tracker clips it anyway.
@@ -585,10 +630,15 @@ class Planner3D:
         const = 0.0
 
         # propellant (sum of thrust acceleration x dt), sideways effort, time
+        lam = self.lateral_accel_weight
         for k in range(N + 1):
             q[U(k, 3)] += w[k]
+            d_k = drag[min(k, N - 1)]
             for c_ in (0, 1):
-                add_p(U(k, c_), U(k, c_), 2 * self.lateral_accel_weight * w[k])
+                # lam |u_c + d_c|^2: the net sideways acceleration
+                add_p(U(k, c_), U(k, c_), 2 * lam * w[k])
+                q[U(k, c_)] += 2 * lam * w[k] * float(d_k[c_])
+                const += lam * w[k] * float(d_k[c_]) ** 2
         const += cfg.time_weight * t_f
         tgo_k = t_f - t_k
         wr = np.interp(tgo_k, self.approach_t, self.approach_pos_w)
@@ -628,6 +678,7 @@ class Planner3D:
             q[iem + c] = wgt
         q[ifs] = self.fuel_slack_weight
         q[isk:isk + N] = self.sink_envelope_weight
+        q[imn:imn + N] = self.sink_envelope_weight
         q[iao:iao + N] = self.aoa_weight * dt
         q[igr:igr + N] = self.ground_weight * dt
         q[ikp:n] = self.keep_out_weight * dt

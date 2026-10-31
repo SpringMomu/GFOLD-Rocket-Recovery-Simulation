@@ -158,7 +158,19 @@ def test_aoa_limit_does_not_push_downwind_while_rising():
     accel = np.array([0.0, -2.0, G0 + 2.0])              # lean into the wind
     out = Autopilot3D._aoa_limit(veh, accel, wind, math.radians(75.0))
     assert out[1] <= 1e-9                                 # never turned downwind (+y)
-    assert abs(out[2] - accel[2]) < 1e-9                  # vertical part kept
+    assert abs(out[2] - min(accel[2], G0)) < 1e-9         # and what it gives up does not go into a climb
+
+
+def test_angle_of_attack_limit_comes_from_the_moment_the_controls_can_hold():
+    sim = Sim3D(cfd=False)
+    sim.load_scenario(9)
+    ap = sim.autopilot
+    ap.elapsed = 10.0
+    qs, lim = ap._aoa_table(sim.vehicle)
+    lim = dict(zip(qs, lim))
+    assert lim[150.0] == 180.0 and lim[500.0] == 180.0  # a 30 m/s cross wind: any lean is holdable
+    assert lim[20000.0] < 15.0                          # fast flight: close to engines-first only
+    assert all(a >= b for a, b in zip(list(lim.values()), list(lim.values())[1:]))
 
 
 def test_low_far_catch_burn_time_is_searched_not_predicted():

@@ -41,7 +41,7 @@ const SAS = { OFF: "关", STABILITY: "姿态保持", RETROGRADE: "对准逆速�
 
 export const SOLVER_STATUS = {
   idle: "空闲", Solved: "已收敛", AlmostSolved: "近似收敛", MaxIterations: "达到迭代上限",
-  PrimalInfeasible: "原问题不可行", DualInfeasible: "对偶不可行", nonfinite: "解含非有限值", "no-solver": "无求解器",
+  PrimalInfeasible: "原问题不可行", DualInfeasible: "对偶不可行", NumericalError: "数值错误", InsufficientProgress: "进展不足", nonfinite: "解含非有限值", "no-solver": "无求解器",
 };
 export const BACKEND = { "clarabel-python": "Clarabel（Python）", "feedback-fallback": "反馈备份" };
 

@@ -247,7 +247,7 @@ class VehicleSpec:
     isp_sl: float = 282.0
     isp_vac: float = 311.0
     throttle_rate: float = 1.2       # full range per second
-    gimbal_limit: float = math.radians(8.0)
+    gimbal_limit: float = math.radians(12.0)
     gimbal_rate: float = math.radians(30.0)
     gimbal_z: float = 0.3            # pivot height above the base
     nozzle_exit_z: float = -1.6
@@ -261,7 +261,12 @@ class VehicleSpec:
     # aero.grid_fin_forces.
     fin_azimuth_deg: tuple = (0.0, 90.0, 180.0, 270.0)
     fin_area: float = 1.62           # panel area (1.35 m span x 1.2 m)
-    fin_cn_alpha: float = 0.80       # normal-force slope per cell-wall set (1/rad, on fin_area)
+    # Normal-force slope per cell-wall set (1/rad, on the panel's frontal
+    # area).  A lattice fin has many lifting cell walls behind its frontal
+    # area: wind-tunnel data give ~0.05/deg (~3/rad) subsonic on that area
+    # (Washington & Miller), i.e. about a planar fin of the same span.  With
+    # fin_normal_coeff = cn_alpha sin a cos a it peaks at 1.5 at 45 deg.
+    fin_cn_alpha: float = 3.0
     fin_cd0: float = 0.30            # panel drag (on fin_area)
     fin_r_cp: float = 2.17           # radial position of the panel centre
     fin_max_defl: float = math.radians(20.0)
