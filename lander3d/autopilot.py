@@ -60,47 +60,38 @@ class _AttitudeProbe:
         return self._mp
 
 
-class Autopilot3D:
-    """Falcon-9 style recovery: coast -> (boost-back) -> one landing burn to touchdown.
+class _Scored:
+    """A plan whose objective, for the time search, is ``value(plan)``
+    (unreachable plans rank behind every reaching one)."""
 
-    * COAST: engine off, engines-first, flying a small angle of attack whose
-      body/grid-fin lift steers the booster (zero-effort-miss guidance).
-      The aim point is not the drag-only impact but ``_burn_miss``: where
-      an upright landing burn lit at the predicted ignition would end.  The
-      glide thus removes the horizontal error and the burn only needs a
-      small, steady tilt.  An ignition predictor on the drag-aware coast
-      decides the latest safe moment to light the engine.
-    * BOOSTBACK: only when the ballistic impact point is far from the pad.
-      The velocity change is found by shooting on the coast so that the
-      same aim point lands on the pad, i.e. the booster really comes back
-      over the pad; when the pad is out of reach, or the fall would arrive
-      too shallow, the burn also lofts the trajectory (more time, steeper).
-    * LANDING BURN: at ignition the touchdown time is locked and the 3-D
-      G-FOLD SOCP (Planner3D) is re-solved every 0.2 s with a smooth
-      objective; if the pad becomes unreachable the time moves to the
-      earliest reachable one (never simply later).  The plan ends on the pad
-      itself (base height 0, vertical, 1.2 m/s sink); the burn continues
-      until a foot touches and the engine is cut -- no separate terminal
-      phase.  The last ~0.6 s are flown on the final plan with a tilt limit
-      that tightens with height, so the vehicle is upright at contact.
-    * Grid fins: stowed for the boost-back, deployed for the coast/entry
-      and the landing burn; they steer the attitude by their real
-      aerodynamic forces (see attitude_control).
+    def __init__(self, plan, value):
+        self.plan = plan
+        self.objective = value(plan)
+
+
+class Autopilot3D:
+    """Recovery by one convex optimiser from the moment the autopilot is on.
+
+    From the current state to the gate (the pad, or the catch point above the
+    arms) a single G-FOLD SOCP (Planner3D) plans the whole flight: thrust may
+    drop to zero (the engine is off, coasting), so whether and when to boost
+    back, coast and brake is the optimiser's decision -- there is no coast
+    guidance, boost-back or ignition logic of its own any more.  The final
+    time is the shortest one whose plan reaches the gate clear of the
+    obstacles and the ground (hard limits); propellant only breaks ties.  It
+    is re-planned every 0.2-0.6 s from the measured state, and every second a
+    shorter time is tried; when the plan in hand no longer reaches, longer
+    times are searched until one does.  The tracker flies the plan's thrust
+    plus PD feedback; where the plan coasts, the engine is off and the body
+    points engines-first into the flow, turning to the next burn's thrust
+    direction shortly before it.  A tower catch ends in a hold above the
+    arms (_catch_hold).
     """
 
     burn_replan_period = 0.2
-    coast_predict_period = 0.25
-    # Ignition threshold (thrust fraction a constant-deceleration burn started
-    # now would need).  The later the ignition, the less gravity loss; the
-    # threshold adapts to how much of the 0.85 plan budget the burn will
-    # really have to spare (see _ignition_threshold).
-    ignition_fraction = 0.76      # straight-down burn: ~10 % below the plan cap
-    ignition_lateral_cut = 0.14   # less when the burn must also divert sideways
-    ignition_short = 0.48         # short hover-slam burns (t_burn <= 2 s) ...
-    ignition_mid = 0.62           # ... 5 s; full threshold from 8 s on
     burn_fraction_nominal = 0.85
     minimum_throttle = 0.20
-    divert_tilt_deg = 65.0
+    divert_tilt_deg = 75.0        # thrust tilt the plan may use far from the end (the tracker's budget up high)
     touchdown_speed = 1.2
     gate_height = 0.0             # G-FOLD plan ends on the pad (base height 0) ...
     gate_speed = 1.2              # ... vertical, at the touchdown sink rate
@@ -108,50 +99,27 @@ class Autopilot3D:
     sink_gain = 0.5               # final approach: sink <= 1.2 + 0.5 h (m/s): 6.2 at 10 m, 2.2 at 2 m
     sink_track_height = 15.0      # the tracker enforces the envelope below this height
     legs_deploy_height = 450.0
-    # Boost-back from this predicted miss on.  A fast fall is steered by the
-    # glide (body lift ~ q), but a slow one is not: e.g. 180 m off from 2 km
-    # at -30 m/s, the glide removes less than half and ignition comes fast
-    # (~120 m/s, ~9 kPa), where the angle-of-attack budget allows no sideways
-    # thrust -- the burn would divert only once slow, near the ground, i.e.
-    # hover sideways at ~80 m.  There a boost-back of ~15 m/s up high is far
-    # cheaper and the burn stays nearly vertical.
-    boostback_miss = 350.0
-    boostback_miss_slow = 120.0   # below boostback_slow_speed[0] airspeed ...
-    boostback_slow_speed = (80.0, 140.0)   # ... blending to boostback_miss at [1]
-    boostback_min_alt = 900.0     # start a boost-back only above this height ...
-    boostback_end_alt = 500.0     # ... and stop it below this one (the landing burn diverts the rest)
-    aero_steer_max_deg = 15.0
-    lift_gradient_cap = 3.0       # body lift per radian of tilt, in units of thrust accel
-    boostback_done_dv = 2.0       # boost-back ends when the remaining velocity change is this small
-    boostback_gamma_ok = 10.0     # deg: flight path at ignition steeper than this needs no loft
-    boostback_loft_max = 80.0     # m/s of extra climb the boost-back may add for a longer, steeper fall
-    boostback_solve_period = 0.3
-    # Hop: low (below boostback_min_alt), slow and far off.  The landing burn
-    # would fly the divert as a long traverse at its lateral-speed limit
-    # (~30 m/s: faster needs thrust along the motion, nose-first, which the
-    # angle-of-attack budget does not allow), paying gravity loss all the
-    # way -- e.g. 2 km from 600 m at rest: ~75 s and ~3.4 t, about all the
-    # propellant.  A lofted boost-back instead (engine off on the arc, then
-    # the normal landing burn) is far cheaper.
-    hop_miss = 500.0              # m of predicted miss ...
-    hop_min_alt = 150.0           # ... from this height up (lower: no room to turn and climb)
-    hop_end_frac = 0.7            # a hop ends if it sinks below this fraction of its start height
-    # Any boost-back thrusting nose-first (along the motion) above this
-    # airspeed keeps its thrust within nose_first_aoa_deg of the flow: low
-    # down, a thrust that turns away from the flow puts the booster broadside
-    # and the air flips it (fins stowed, RCS too weak to bring it back).
-    nose_first_speed = 50.0       # m/s (~1.5 kPa low down)
-    nose_first_aoa_deg = 20.0
+    lift_gradient_cap = 3.0       # body lift per radian of tilt, in units of thrust accel (drag model)
     search_backoff = 1.0          # s between final-time searches (doubled after failures, up to x4)
-    # Free final time: the touchdown time minimises J = propellant +
-    # time_weight * t_f (PlanConfig3D.time_weight) -- a golden-section search
-    # at ignition and whenever the plan in hand misses, a step either side
-    # (retime_step of the time to go) every search_backoff otherwise.
-    time_weight = 1.0             # propellant units (m/s) per second of flight
+    # Free final time: J = propellant + time_weight t_f among plans that reach
+    # the gate (_search_time: golden section, longer until one reaches); every
+    # search_backoff a step either side (retime_step of the time to go).
+    time_weight = 2.0             # propellant units (m/s) per second of flight: time counts double
     retime_step = 0.08
-    retime_freeze = 5.0           # s to go: no more retiming (unless lost)
-    time_search_evals = 9
-    ignition_refine = 2               # re-solves about the first plan at ignition (successive convexification)
+    time_search_evals = 9         # golden-section evaluations
+    time_grow = 1.5               # longer times tried by this factor ...
+    time_grow_steps = 6           # ... at most this often
+    engage_refine = 2             # re-solves about the first plan (successive convexification)
+    trust_weight = 0.01           # per (m/s)^2 s: trust region round the reference plan's velocities
+    ignite_soon = 1.0             # s: a landing burn due this soon is checked against ...
+    ignite_delay = 1.5            # ... the same plan lit this much later (still reaching: wait)
+    burn_gap_merge = 3.0          # s: free-plan burns closer than this are one burn
+    burn_sigma_frac = 0.5         # free-plan thrust above this share of the minimum throttle counts as a burn
+    nose_first_speed = 50.0       # m/s: above this a nose-first burn keeps its thrust ...
+    nose_first_aoa_deg = 20.0     # ... within this of the motion (planner: PlanConfig3D.nose_first_aoa_deg)
+    glide_aoa_deg = 15.0          # largest angle of attack of the glide (body + grid-fin lift)
+    coast_accel = 1.0             # m/s^2: planned thrust below this is a coast (engine off)
+    burn_lookahead = 3.0          # s: turn to the next burn's direction this early
     # Tower catch: the burn ends with the collar this high above the arm tops,
     # sinking this slowly; there the booster holds, centred, until the arms
     # have closed round the barrel, and then settles onto them.
@@ -161,7 +129,6 @@ class Autopilot3D:
     catch_hold_max = 25.0         # s; then settle anyway
     catch_hold_tilt_deg = 4.0     # tilt budget about the wind trim while holding
     catch_integral_radius = 1.0   # m: the hold's integral only builds up this close to the axis
-    glide_gain = 1.5
     # Wind profile for the predictions: the wind measured now, extrapolated
     # to other heights with a log-law profile whose shear strength k (as in
     # vehicle.Wind: 0 = the same at every height, 1 = the standard log law)
@@ -231,10 +198,6 @@ class Autopilot3D:
         self._q_filt = 0.0
         self.solver_fail = None       # (time, status) of the last re-plan that found no solution at all
         self._hold_bias = np.zeros(2)
-        self._boostback = False
-        self._boostback_done = False
-        self._hop = False
-        self._bb_floor = self.boostback_end_alt
         self._route = None            # reference path round the obstacles while no plan gets through
         self._touched = False
         self.relax = 0                # (no relaxation levels any more; kept for the front end)
@@ -249,12 +212,7 @@ class Autopilot3D:
         self._gate_xy = np.zeros(2)
         self._dir_rate = np.zeros(3)
         self._dt = 1.0 / 240.0
-        self._bb_dv = None
-        self._bb_v = None
-        self._bb_next = 0.0
-        self._bb_reserve = 0.0
         self._ign_state = None
-        self._burn_miss_now = np.zeros(2)
         self._brake_time = 0.0
         self.impact = None
         self.ignition_in = math.inf
@@ -292,6 +250,7 @@ class Autopilot3D:
         legs = max(veh.legs, 1.0 if veh.controls.legs_down else 0.0)
         s = veh.spec
         sig_now = max(3.0, veh.throttle * s.thrust_sl / m0)
+        v_now2 = float(np.dot(v0, v0))
 
         def model(times):
             n = len(times)
@@ -303,10 +262,22 @@ class Autopilot3D:
             qd = np.zeros(n)
             wd = np.zeros((n, 3))
             dq = np.zeros(n)                # d(dynamic pressure)/d(height) along the reference
+            Jv = np.zeros((n, 3, 3))        # d(drag accel)/d(velocity) about the reference
+            vref = np.zeros((n, 3))         # the reference velocity it is linearised about
+            lmax = np.zeros(n)              # glide lift available (engine off, glide_aoa_deg off engines-first)
+
+            def damping(i, f, sp, u):
+                # drag ~ -D u (u: unit airflow velocity), D ~ |v|^2: its
+                # derivative in the velocity, so a plan flying faster or slower
+                # than its reference sees the drag change (without it the drag
+                # is that of the reference speed, and successive plans swing)
+                D = max(0.0, -float(np.dot(f, u))) / m
+                Jv[i] = -(D / sp) * (np.eye(3) + np.outer(u, u))
             if self.aero is None:
-                return out, G, qd, wd, dq
+                return out, G, qd, wd, dq, Jv, vref, lmax
             for i, t in enumerate(times):
                 u_ref = None
+                coast = False
                 if prev is None or t < 0.3:
                     T = max(t_guess, 0.5)
                     f = max(0.0, 1.0 - t / T)
@@ -328,8 +299,19 @@ class Autopilot3D:
                     h, v = pos[2], vel
                     k = min(int(max(tau, 0.0) / prev.dt), prev.knots)
                     m = float(math.exp(prev.z[k]))
-                    sig = max(3.0, prev.sigma_at(tau))
+                    sig_ref = prev.sigma_at(tau)
+                    sig = max(3.0, sig_ref)
                     u_ref = acc
+                    if sig_ref < self.coast_accel:
+                        coast = True
+                # No faster than falling there from here without drag: a
+                # reference from a plan that missed can carry absurd speeds,
+                # and the drag about them blows the next plan up.
+                v = np.asarray(v, float)
+                v_cap = math.sqrt(v_now2 + 2.0 * G0 * max(0.0, float(r0[2]) - float(h))) + 5.0
+                vn = float(np.linalg.norm(v))
+                if vn > v_cap:
+                    v = v * (v_cap / vn)
                 rho, _, _, a = atmosphere(max(0.0, h + self.h_off))
                 vr = v - self._wind(h)          # the wind where the plan will be, not the wind here
                 sp = float(np.linalg.norm(vr))
@@ -341,11 +323,27 @@ class Autopilot3D:
                     rho_d = atmosphere(max(0.0, h + dh + self.h_off))[0]
                     qs.append(0.5 * rho_d * float(np.linalg.norm(v - self._wind(h + dh))) ** 2)
                 dq[i] = (qs[0] - qs[1]) / 10.0
+                vref[i] = v
                 if sp < 3.0:
                     continue
                 u = vr / sp
                 wd[i] = -u
                 base = -u
+                # glide lift: the body tilted glide_aoa_deg off engines-first
+                f_b = self.aero.quick_force(vr, base, rho, a, legs)
+                e_g = np.cross(u, [0.0, 0.0, 1.0] if abs(u[2]) < 0.9 else [1.0, 0.0, 0.0])
+                e_g /= np.linalg.norm(e_g)
+                al = math.radians(self.glide_aoa_deg)
+                df = self.aero.quick_force(vr, math.cos(al) * base + math.sin(al) * e_g, rho, a, legs) - f_b
+                lmax[i] = float(np.linalg.norm(df - u * float(np.dot(df, u)))) / m
+                if coast:
+                    # the reference coasts: engine off, engines-first into the
+                    # flow (as the tracker flies it) -- aligned drag, and no
+                    # body lift from tilting a thrust that is not there
+                    f0 = f_b
+                    out[i] = f0 / m
+                    damping(i, f0, sp, u)
+                    continue
                 # Linearise around the reference attitude (successive
                 # linearisation: each replan uses the previous plan's tilt).
                 tilt = np.zeros(3)
@@ -363,7 +361,9 @@ class Autopilot3D:
                 axis0 = base + tilt
                 axis0 /= np.linalg.norm(axis0)
                 if broadside is not None:
-                    out[i] = self.aero.quick_force(vr, broadside, rho, a, legs) / m
+                    f0 = self.aero.quick_force(vr, broadside, rho, a, legs)
+                    out[i] = f0 / m
+                    damping(i, f0, sp, u)
                     continue
                 f0 = self.aero.quick_force(vr, axis0, rho, a, legs)
                 e1 = np.cross(u, [0.0, 0.0, 1.0] if abs(u[2]) < 0.9 else [1.0, 0.0, 0.0])
@@ -382,8 +382,9 @@ class Autopilot3D:
                         grad *= self.lift_gradient_cap * sig / gn
                     Gi += np.outer(grad, e) / sig             # tilt along e ~ (e . u) / sigma
                 out[i] = f0 / m - (Gi @ u_ref if u_ref is not None and np.any(tilt) else 0.0)
+                damping(i, f0, sp, u)
                 G[i] = Gi
-            return out, G, qd, wd, dq
+            return out, G, qd, wd, dq, Jv, vref, lmax
 
         return model
 
@@ -457,10 +458,27 @@ class Autopilot3D:
 
         return dirs
 
+    def _vel_ref(self, veh):
+        """Reference velocities at the knot times (trust region of the
+        successive convexification): the plan in hand, stretched over the new
+        horizon like the drag reference.  None before there is a plan."""
+        prev = self.plan if self.burn_locked else None
+        if prev is None:
+            return None
+        now = self.elapsed
+
+        def vels(t_knots):
+            t_end = max(float(t_knots[-1]), 1e-6)
+            t0 = now - prev.created_at
+            span = max(0.0, prev.t_f - t0)
+            return np.asarray([prev.sample(t0 + span * float(t) / t_end)[1] for t in t_knots])
+
+        return vels
+
     def _config(self, veh, frac, keep_out=None):
         s = veh.spec
         return PlanConfig3D(
-            thrust_min=self.minimum_throttle * s.thrust_sl * self.thrust_scale,
+            thrust_min=0.0,                  # the engine may be off: coasting is the optimiser's choice
             thrust_max=frac * s.thrust_sl * self.thrust_scale, isp=s.isp_sl,
             dry_mass=s.dry_mass + 150.0, sigma_now=veh.throttle * s.thrust_sl / veh.mass,
             u_now=tuple(veh.last["thrust"] / veh.mass), engine_on=True,
@@ -471,7 +489,7 @@ class Autopilot3D:
             body_length=s.length,
             tilt_trim=tuple(self._gate_trim(veh)), trim_fade=self._trim_fade(), tilt_budget=TILT_BUDGET,
             height_ref=self._height_ref(veh), slew_deg=SLEW_DEG, dir_ref=self._dir_ref(veh), time_weight=self.time_weight,
-            min_sink=1.0 if self.catch_link is None else 0.0,
+            vel_ref=self._vel_ref(veh), trust_weight=self.trust_weight,
         )
 
     def _solver(self, veh, wind_now, frac, keep_out):
@@ -482,9 +500,92 @@ class Autopilot3D:
         def solve(t_f):
             if not t_f > 0.6:
                 return None
-            return self.planner.solve(r, v, m, t_f, dataclasses.replace(base, drag_model=self._drag_model(veh, wind_now, t_f)))
+            cfg = dataclasses.replace(base, drag_model=self._drag_model(veh, wind_now, t_f))
+            # Two passes.  Free thrust first (0 .. max): where the optimiser
+            # wants the engine on.  Then the burns it can really have with
+            # the engine starts left (_windows) -- coasts at zero thrust,
+            # burns at least at the minimum throttle -- and that plan is flown.
+            free = self.planner.solve(r, v, m, t_f, cfg)
+            if free is None:
+                return None
+            windows = self._windows(veh, free)
+            t_min = self.minimum_throttle * veh.spec.thrust_sl * self.thrust_scale
+
+            def constrained(win):
+                q = self.planner.solve(r, v, m, t_f, dataclasses.replace(cfg, burn_windows=win, thrust_min=t_min))
+                if q is not None:
+                    q.windows = win
+                return q
+
+            p = constrained(windows)
+            left = veh.spec.max_ignitions - veh.ignitions
+            if (p is not None and not veh.engine_lit and left == 1 and len(windows) == 1
+                    and windows[0][0] < self.ignite_soon and t_f - windows[0][0] > 2.0 * self.ignite_delay):
+                # The last start (the landing burn) is about to be used: only
+                # if waiting would lose the gate (latest safe ignition) -- a
+                # burn lit early must run to the end at no less than the
+                # minimum throttle, and that is long and costly.
+                later = constrained(((windows[0][0] + self.ignite_delay, t_f),))
+                if later is not None and (later.reaches_pad or (not p.reaches_pad and self._miss(later) <= self._miss(p) + 1.0)):
+                    p = later
+            return p
 
         return solve
+
+    def _windows(self, veh, free):
+        """Engine burn windows for a plan, from the free-thrust plan and the
+        engine starts left (VehicleSpec.max_ignitions): the landing burn is
+        the free plan's last burn and runs to the end; a burn before it (the
+        boost-back) only with a start to spare for it.  A burning engine with
+        no start left burns to the end."""
+        t = np.arange(free.knots + 1) * free.dt
+        on = free.sigma > self.burn_sigma_frac * self.minimum_throttle * veh.spec.thrust_sl / veh.mass
+        runs = []
+        k = 0
+        while k < len(on):
+            if on[k]:
+                j = k
+                while j + 1 < len(on) and on[j + 1]:
+                    j += 1
+                runs.append((k, j))
+                k = j + 1
+            else:
+                k += 1
+        # a short dip of the thrust is no end of a burn (the engine would be
+        # out, and a relight takes a start): runs this close are one burn
+        merged = []
+        for a, b in runs:
+            if merged and (a - merged[-1][1]) * free.dt <= self.burn_gap_merge:
+                merged[-1] = (merged[-1][0], b)
+            else:
+                merged.append((a, b))
+        runs = merged
+        t_f = float(free.t_f)
+        left = veh.spec.max_ignitions - veh.ignitions
+        lit = bool(veh.engine_lit)
+        if lit and left <= 0:
+            return ((0.0, t_f),)                       # the last start is burning: to the end
+        if not runs:
+            return ((0.0, t_f),) if lit else ((max(0.0, t_f - 2.0), t_f),)
+        land = (float(t[runs[-1][0]]), t_f)
+        # the boost-back is the free plan's first burn, the landing burn its
+        # last; a burn in between has no start to light it (dropped -- the
+        # constrained plan does without it)
+        if lit:
+            # burning now with a start left: this burn may end (boost-back) --
+            # but not on the word of a plan that misses the gate (cut short,
+            # it leaves the booster short of the pad with only the landing
+            # burn to come): then it burns on
+            if not free.reaches_pad:
+                return ((0.0, t_f),)
+            if runs[0][0] == 0 and len(runs) > 1:
+                return ((0.0, float(t[runs[0][1]])), land)
+            return ((0.0, t_f),) if runs[0][0] == 0 else (land,)
+        if left >= 2 and len(runs) > 1:
+            return ((float(t[runs[0][0]]), float(t[runs[0][1]])), land)
+        if left >= 1:
+            return (land,)
+        return ()
 
     @staticmethod
     def _thrust_available(veh, h):
@@ -584,108 +685,52 @@ class Autopilot3D:
                 best = (cost, float(k))
         self.wind_shear_est = best[1]
 
-    def _burn_need(self, veh, r, v, m, drag_up):
-        """(thrust fraction needed for a landing burn started now, burn time, thrust direction)."""
-        g = G0
-        vz = float(v[2])
-        h_eff = r[2] - self.gate_height - 0.45 * max(0.0, -vz)   # engine spool-up margin
-        if vz > -(self.touchdown_speed + 2.0) and h_eff > 5.0:
-            return 0.0, math.inf, np.array([0.0, 0.0, 1.0])
-        if h_eff <= 0.5:
-            return 9.0, 1.0, np.array([0.0, 0.0, 1.0])
-        a_v = max(0.1, (vz * vz - self.gate_speed ** 2) / (2.0 * h_eff))
-        t_b = max(0.5, (-vz - self.gate_speed) / a_v)
-        a_lat = -(6.0 * r[:2] / t_b ** 2 + 4.0 * v[:2] / t_b) * 1.0
-        need = np.array([a_lat[0], a_lat[1], a_v + g - drag_up / 3.0])
-        frac = m * float(np.linalg.norm(need)) / self._thrust_available(veh, r[2])
-        return frac, t_b, need / float(np.linalg.norm(need))
-
-    def _ignition_threshold(self, t_burn, burn_dir):
-        """Latest safe ignition: the required thrust fraction at which to light.
-
-        A vertical burn lights at ``ignition_fraction``; the lateral share of
-        the burn (sin of its tilt) lowers it, since the plan then also needs
-        tilt and slew authority; short low burns light earlier so the burn
-        lasts long enough to trim drift without a late sideways swing.
-        """
-        lateral = float(np.linalg.norm(burn_dir[:2]))
-        ign = self.ignition_fraction - self.ignition_lateral_cut * min(1.0, lateral / 0.5)
-        if t_burn < 8.0:
-            ign = float(np.interp(t_burn, [2.0, 5.0, 8.0], [self.ignition_short, self.ignition_mid, ign]))
-        return ign
-
-    def _ballistic(self, veh, r, v, m, wind_now, dt=0.25, t_max=240.0, stop_on_ignition=True):
-        """Drag-aware coast prediction. Returns (points, impact_xy, t_impact, t_ignition, burn_time)."""
-        pts = [r.copy()]
-        p, u = r.copy(), v.copy()
-        t = 0.0
-        t_ign, t_burn = math.inf, math.inf
-        while t < t_max:
-            rho, _, _, a = atmosphere(max(0.0, p[2]))
-            f = self.aero.quick_force(u - self._wind(p[2]), None, rho, a, 0.0) if self.aero is not None else np.zeros(3)
-            if stop_on_ignition and not math.isfinite(t_ign):
-                frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m))
-                if frac >= self._ignition_threshold(tb, bd):
-                    t_ign, t_burn = t, tb
-                    ign_p, ign_v = p.copy(), u.copy()
-            acc = f / m + np.array([0.0, 0.0, -G0])
-            u = u + acc * dt
-            p = p + u * dt
-            t += dt
-            if len(pts) < 400:
-                pts.append(p.copy())
-            if p[2] <= 0.0:
-                break
-        impact = p[:2].copy()
-        # State at the predicted ignition (or at the impact): the glide target.
-        self._ign_state = (t_ign, ign_p, ign_v, t_burn) if math.isfinite(t_ign) else (t, p.copy(), u.copy(), 0.0)
-        self._burn_miss_now, self._brake_time = (self._burn_miss(veh, ign_p, ign_v, m, wind_now) if math.isfinite(t_ign)
-                                                 else (p[:2].copy(), 0.0))
-        if math.isfinite(t_ign):
-            # Visual prediction: coast until ignition, then a smooth arc to the pad.
-            k = int(t_ign / dt)
-            pts = pts[:k + 1]
-            p0, v0 = ign_p, ign_v
-            T = max(t_burn, 0.5)
-            v_end = np.array([0.0, 0.0, -self.touchdown_speed])
-            for s in np.linspace(0.0, 1.0, 30)[1:]:
-                # Cubic Hermite from (p0, v0) to (pad, touchdown velocity); the pad is the origin.
-                h00, h10, h11 = 2 * s ** 3 - 3 * s ** 2 + 1, s ** 3 - 2 * s ** 2 + s, s ** 3 - s ** 2
-                pts.append(h00 * p0 + h10 * T * v0 + h11 * T * v_end)
-        return pts, impact, t, t_ign, t_burn
-
     # ------------------------------------------------------------- replan
     def _replan(self, veh, wind_now):
-        """Re-plan from the current state.  The touchdown time stays where it
-        is (smooth tracking) unless the cost J = propellant + time_weight t_f
-        is lower a step earlier or later; a plan that misses the gate gets a
-        full search of the final time (and the route).  The optimiser alone
-        decides how the booster gets there."""
-        t_go = self.touchdown_time - self.elapsed
-        solve = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))
-        plan = solve(t_go)
-        lost = plan is None or plan.terminal_position_error > 10.0
-        if self.elapsed >= self._next_search and (t_go > self.retime_freeze or lost):
+        """Re-plan from the current state at the time to go; every
+        search_backoff a shorter time is tried (minimum time), and when the
+        plan does not reach the gate longer times are searched until one does."""
+        t_go = max(0.7, self.touchdown_time - self.elapsed)
+        plan = self._solve_now(veh, wind_now, t_go)
+        if self.elapsed >= self._next_search:
             if plan is None or not plan.reaches_pad:
                 best = self._search_time(veh, wind_now, t_go)
                 self._search_fails = 0 if best is not None and best.reaches_pad else min(self._search_fails + 1, 2)
-                if best is not None and (plan is None or best.objective < plan.objective):
+                if best is not None:
                     plan = best
             else:
-                d = max(0.4, self.retime_step * t_go)
+                d = max(0.3, self.retime_step * t_go)
                 for t in (t_go - d, t_go + d):
-                    p = solve(t)
+                    p = self._solve_now(veh, wind_now, max(0.7, t))
                     if p is not None and p.reaches_pad and p.objective < plan.objective:
                         plan = p
                 self._search_fails = 0
             self._next_search = self.elapsed + self.search_backoff * 2 ** self._search_fails
         self.last_status = self.planner.last_status
+        if plan is not None and not plan.reaches_pad and self.plan is not None and self.elapsed - self.plan.created_at < 1.0 and (
+                self.plan.reaches_pad or self._miss(plan) >= self._miss(self.plan)):
+            # a re-plan that misses where the plan in hand still gets there
+            # (or misses less) is not taken: it would also become the
+            # reference the next plans are linearised about
+            plan = None
+            if self.touchdown_time - self.elapsed > 0.6:
+                return
         if plan is not None:
             self._commit(plan)
-        else:
-            # no solution at all this time (the solver gave up or found the
-            # problem infeasible): the booster flies on along the last plan
+        elif self.planner.last_status not in ("Solved", "AlmostSolved"):
+            # no solution at all (numerical): fly on along the last plan
             self.solver_fail = (self.elapsed, self.planner.last_status)
+
+    @staticmethod
+    def _miss(p):
+        return p.terminal_position_error + p.terminal_velocity_error + p.keep_out_violation + p.ground_violation
+
+    def _solve_now(self, veh, wind_now, t_f, path=None):
+        """One plan from the current state for final time t_f (references --
+        drag, heights, thrust directions, obstacle faces -- from the plan in
+        hand, or ``path`` round the obstacles)."""
+        keep_out = self._keep_out(veh, path)
+        return self._solver(veh, wind_now, self.burn_fraction, keep_out)(t_f)
 
     def solver_alert(self):
         """For the display: None, or (kind, status) -- 'fail' when the last
@@ -718,23 +763,46 @@ class Autopilot3D:
             self._route = None          # from now on along this plan
 
     def _search_time(self, veh, wind_now, t_guess):
-        """Final time minimising J (golden section), on the best route round
-        the obstacles; at full thrust if nothing reaches at the nominal one."""
+        """Final time minimising J = propellant + time_weight t_f among plans
+        that reach the gate (golden section); if none in the bracket reaches,
+        longer times (x time_grow) until one does -- the search never settles
+        on a plan that cannot get there.  At full thrust if the nominal budget
+        reaches nowhere.  Returns the best reaching plan, or the nearest miss."""
+        best = None
+        nearest = None
+
+        def value(p):
+            nonlocal best, nearest
+            if p is None:
+                return math.inf
+            if p.reaches_pad:
+                if best is None or p.objective < best.objective:
+                    best = p
+                return p.objective
+            miss = self._miss(p)
+            if nearest is None or miss < nearest[0]:
+                nearest = (miss, p)
+            return p.objective + 1e4 + 100.0 * miss
+
         r, v, _ = self._state(veh)
         t_far = self._far_time(r, v)
-        lo = max(1.0, 0.35 * min(t_guess, t_far))
-        hi = 1.5 * max(t_guess, t_far) + 2.0
-        best = None
+        ceiling = 3.0 * t_far + 30.0
         for frac in dict.fromkeys((self.burn_fraction, 0.97)):
-            keep_out = self._keep_out(veh, self._routes(veh, wind_now, frac, 0.5 * (lo + hi)))
-            p = golden_section_search(self._solver(veh, wind_now, frac, keep_out), lo, hi, self.time_search_evals)
-            if p is not None and (best is None or p.objective < best.objective):
-                best = p
-                if p.reaches_pad:
-                    self.burn_fraction = max(self.burn_fraction, frac)
-            if best is not None and best.reaches_pad:
+            self.burn_fraction = frac
+            path = self._routes(veh, wind_now, frac, max(t_guess, 5.0)) if self.obstacles else None
+            lo = max(1.0, 0.35 * min(t_guess, t_far))
+            hi = 1.5 * max(t_guess, t_far) + 2.0
+            golden_section_search(lambda t, path=path: _Scored(self._solve_now(veh, wind_now, t, path), value), lo, hi,
+                                  self.time_search_evals)
+            t = hi
+            while best is None and t < ceiling:
+                t = min(ceiling, t * self.time_grow + 2.0)
+                value(self._solve_now(veh, wind_now, t, path))
+            if best is not None:
                 break
-        return best
+        if best is None:
+            self.burn_fraction = self.burn_fraction_nominal
+        return best if best is not None else (nearest[1] if nearest is not None else None)
 
     def _routes(self, veh, wind_now, frac, t_f):
         """Which way round the obstacles (over, round either side): one convex
@@ -807,18 +875,17 @@ class Autopilot3D:
 
         if h < self.legs_deploy_height and self.use_legs:
             c.legs_down = True
-        if self.burn_locked:
-            c.fins_deploy = True
-            self._update_trim(veh, wind_now, dt)
-            self._update_hold_bias(veh, dt)
-            # dynamic pressure for the angle-of-attack limit, smoothed: the
-            # booster's own sway and the gusts swing it by +-50 % in a strong
-            # cross wind, and the limit (steep in q there) would flick on and off
-            self._q_filt += (float(veh.last.get("q", 0.0)) - self._q_filt) * min(1.0, dt / self.q_filter)
+        c.fins_deploy = True
+        self._update_trim(veh, wind_now, dt)
+        self._update_hold_bias(veh, dt)
+        # dynamic pressure for the angle-of-attack limit, smoothed: the
+        # booster's own sway and the gusts swing it by +-50 % in a strong
+        # cross wind, and the limit (steep in q there) would flick on and off
+        self._q_filt += (float(veh.last.get("q", 0.0)) - self._q_filt) * min(1.0, dt / self.q_filter)
 
         if not self.burn_locked:
-            self._pre_ignition(veh, r, v, m, wind_now)
-            return
+            # autopilot just switched on: plan the whole recovery from here
+            self._engage(veh, wind_now)
 
         # Engine performance from the measured thrust (accelerometer): a
         # weaker-than-modelled engine shrinks the planner's thrust limits, so
@@ -852,10 +919,18 @@ class Autopilot3D:
         if t_go < 8.0 and self.use_legs:
             c.legs_down = True
 
+        if self.plan is not None and self._coasting(veh, v, wind_now):
+            return
+        floor = None
         if self.plan is not None:
-            self.phase = "LANDING BURN"
             tau = self.elapsed - self.plan.created_at
             p_ref, v_ref, u_ff = self.plan.sample(tau)
+            w = self._window_at(self.plan, tau)
+            boost = w is not None and w >= 0 and w < len(self.plan.windows) - 1
+            self.phase = "BOOSTBACK" if boost else "LANDING BURN"
+            c.fins_deploy = not boost               # grid fins stowed for the boost-back
+            if w is not None and w >= 0:
+                floor = self.minimum_throttle       # inside a burn: never let the engine go out
             fb = 0.5 * (p_ref - r) + 1.6 * (v_ref - v)
             nfb = float(np.linalg.norm(fb))
             if nfb > 5.0:
@@ -876,7 +951,24 @@ class Autopilot3D:
             max_tilt = math.radians(float(np.interp(h, *TILT_BUDGET)))
             center = self._trim_xy * float(np.interp(h, self._trim_fade(), (0.0, 1.0)))
             trim_tilt = math.atan2(float(np.linalg.norm(center)), G0)
-            accel = self._aoa_limit(veh, accel, wind_now, max_tilt + trim_tilt, self._aoa_table(veh), self._q_filt)
+            vr = v - wind_now
+            sp = float(np.linalg.norm(vr))
+            an = float(np.linalg.norm(accel))
+            if boost and sp > self.nose_first_speed and an > 1e-6 and float(np.dot(accel, vr)) > 0.0:
+                # nose-first boost-back (fins stowed): thrust within
+                # nose_first_aoa_deg of the motion, as the plan has it
+                u_air = vr / sp
+                d = accel / an
+                cos_f = float(np.dot(d, u_air))
+                cap = math.radians(self.nose_first_aoa_deg)
+                if cos_f < math.cos(cap):
+                    side = d - u_air * cos_f
+                    d = u_air * math.cos(cap) + side / max(1e-9, float(np.linalg.norm(side))) * math.sin(cap)
+                accel = d * an
+                max_tilt = math.radians(89.0)
+                center = None
+            else:
+                accel = self._aoa_limit(veh, accel, wind_now, max_tilt + trim_tilt, self._aoa_table(veh), self._q_filt)
         else:
             self.phase = "FALLBACK"
             a_max_now = s.thrust_sl / m
@@ -885,7 +977,106 @@ class Autopilot3D:
             max_tilt = math.radians(35.0)
             center = None
         self._mark()
-        self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 else None, center=center)
+        self._fly_accel(veh, accel, max_tilt, floor=floor, center=center)
+
+    @staticmethod
+    def _window_at(p, tau):
+        """Index of the plan's burn window at tau (past the end: the landing
+        burn); None when coasting; -1 for a plan without windows."""
+        if p.windows is None:
+            return -1
+        if p.windows and tau >= p.windows[-1][0] - 1e-6:
+            return len(p.windows) - 1
+        for i, (a, b) in enumerate(p.windows):
+            if a - 1e-6 <= tau <= b + 1e-6:
+                return i
+        return None
+
+    def _coasting(self, veh, v, wind_now) -> bool:
+        """Where the plan coasts (thrust below coast_accel), fly it with the
+        engine off: engines-first into the flow (what the plan's aerodynamics
+        assume), turning to the next burn's thrust direction up to
+        burn_lookahead before it.  Returns False when the plan is thrusting."""
+        p = self.plan
+        tau = self.elapsed - p.created_at
+        w = self._window_at(p, tau)
+        if w is None:
+            pass                                    # between burns
+        elif w >= 0 or tau >= p.t_f or p.sigma_at(tau) >= self.coast_accel:
+            return False
+        c = veh.controls
+        c.throttle = 0.0
+        c.fins_deploy = True
+        self.cmd_throttle = 0.0
+        self.cmd_accel = np.zeros(3)
+        self.phase = "COAST"
+        self._mark()
+        vr = np.asarray(v, float) - np.asarray(wind_now, float)
+        sp = float(np.linalg.norm(vr))
+        # next burn soon: turn to its thrust direction
+        nxt = None
+        if p.windows:
+            starts = [a for a, _ in p.windows if a > tau]
+            if starts and starts[0] - tau <= self.burn_lookahead:
+                nxt = min(p.t_f, starts[0] + 0.5 * p.dt)
+        if nxt is not None:
+            u = np.asarray(p.sample(nxt)[2], float)
+            n = float(np.linalg.norm(u))
+            target = None if n < 1e-6 else self._aoa_limit(veh, u / n * G0, wind_now, math.radians(self.divert_tilt_deg),
+                                                            self._aoa_table(veh), self._q_filt)
+            if target is not None:
+                target = target / max(1e-9, float(np.linalg.norm(target)))
+        elif sp > 20.0:
+            # the glide: the planned lift, by a small angle of attack
+            k = min(int(max(tau, 0.0) / p.dt), p.knots - 1)
+            a_des = np.zeros(3) if p.lift is None else np.asarray(p.lift[k], float)
+            target = self._glide_attitude(veh, vr, a_des)
+        else:
+            target = None
+        if target is None:
+            target = -vr / sp if sp > 20.0 else np.array([0.0, 0.0, 1.0])
+        if target[2] < 0.0 and sp <= 20.0:
+            target = np.array([0.0, 0.0, 1.0])
+        self.cmd_axis = target
+        self._dir_prev = target.copy()
+        self._attitude(veh, target, use_rcs=True)
+        return True
+
+    def _glide_attitude(self, veh, vr, a_des):
+        """Attitude that gives the lift acceleration ``a_des`` (across the
+        flow): engines-first, tilted by the angle of attack (secant on the
+        aerodynamic model's lift curve, up to glide_aoa_deg)."""
+        sp = float(np.linalg.norm(vr))
+        u = vr / sp
+        base = -u
+        a_des = a_des - u * float(np.dot(a_des, u))
+        an = float(np.linalg.norm(a_des))
+        if an < 0.02 or self.aero is None:
+            return base
+        e_a = a_des / an
+        rho, _, _, a_snd = atmosphere(max(0.0, float(veh.pos[2])))
+        l0 = float(np.dot(self.aero.quick_force(vr, base, rho, a_snd, veh.legs), e_a))
+        a_max = math.radians(self.glide_aoa_deg)
+        m = veh.mass
+
+        def lift(alpha, e):
+            axis = math.cos(alpha) * base + math.sin(alpha) * e
+            return float(np.dot(self.aero.quick_force(vr, axis, rho, a_snd, veh.legs), e_a)) - l0
+
+        # Engines-first, the lift points against the tilt: find the side that
+        # pushes along e_a, then the angle.
+        alpha = math.radians(5.0)
+        e, l_a = max(((e, lift(alpha, e)) for e in (-e_a, e_a)), key=lambda x: x[1])
+        if l_a <= 0.0:
+            return base
+        for _ in range(2):
+            alpha = float(np.clip(alpha * an * m / l_a, 0.0, a_max))
+            if alpha >= a_max:
+                break
+            l_a = lift(alpha, e)
+            if l_a <= 0.0:
+                break
+        return math.cos(alpha) * base + math.sin(alpha) * e
 
     def _catch_hold(self, veh, r, v, dt):
         """Tower catch: hold the collar just above the arm tops, centred on the
@@ -1118,342 +1309,30 @@ class Autopilot3D:
         attitude_control(veh, d, self.k_angle, self.k_rate, self.max_rate,
                          veh.throttle < 0.25 or self._height(veh) < self.low_rcs_height, hold_roll=True)
 
-    # ----------------------------------------------------- before ignition
-    def _pre_ignition(self, veh, r, v, m, wind_now):
-        c = veh.controls
-        s = veh.spec
-        if self.elapsed >= self.next_predict or self.impact is None:
-            pts, impact, t_imp, t_ign, t_burn = self._ballistic(veh, r, v, m, wind_now)
-            self.impact = impact
-            self.ignition_in = t_ign
-            self.predicted_points = [(float(p[0]), float(p[1]), float(max(0.0, p[2])) + self.h_off) for p in pts[:: max(1, len(pts) // 120)]]
-            self.time_to_go = t_ign + t_burn if math.isfinite(t_ign) else t_imp
-            self.next_predict = self.elapsed + self.coast_predict_period
-        miss = float(np.linalg.norm(self.impact))
-
-        # ---- boost-back: put the booster over the pad at ignition.
-        airspeed = float(np.linalg.norm(v - wind_now))
-        drag_up = max(0.0, float(veh.last["aero"][2]) / m)
-        frac, t_burn, burn_dir = self._burn_need(veh, r, v, m, drag_up)
-        ignite_now = frac >= self._ignition_threshold(t_burn, burn_dir)
-        # Boost-back only with time to come back and coast: not when the
-        # landing burn is already due (then the burn itself flies the divert,
-        # G-FOLD), and a running one stops once a vertical burn would be due.
-        up_only = np.array([0.0, 0.0, 1.0])
-        f_v, t_v, _ = self._burn_need(veh, r * up_only, v * up_only, m, drag_up)
-        burn_due = f_v >= self._ignition_threshold(t_v, up_only)
-        bb_miss = float(np.interp(airspeed, self.boostback_slow_speed, (self.boostback_miss_slow, self.boostback_miss)))
-        start = miss > bb_miss and r[2] > self.boostback_min_alt and airspeed < 180.0 and not ignite_now
-        hop = (not start and self.hop_min_alt < r[2] <= self.boostback_min_alt and airspeed < 100.0
-               and miss > self.hop_miss and not ignite_now)
-        if not self._boostback_done and (self._boostback or start or hop):
-            if not self._boostback:
-                self._hop = hop
-                self._bb_floor = self.hop_end_frac * float(r[2]) if hop else self.boostback_end_alt
-            self._boostback = True
-            self.phase = "BOOSTBACK"
-            self._mark()
-            if self.elapsed >= self._bb_next or self._bb_dv is None:
-                self._boostback_target(veh, r, v, m, wind_now)
-                self._bb_next = self.elapsed + self.boostback_solve_period
-            elif self._bb_v is not None:
-                self._bb_dv = self._bb_dv - (v - self._bb_v)   # velocity gained since the last solve
-                self._bb_v = v.copy()
-            dv = self._bb_dv
-            dvn = float(np.linalg.norm(dv)) if dv is not None else 0.0
-            # Nose-first at speed (see nose_first_speed): keep within the flow
-            # cone (a gravity turn); once the horizontal change still wanted
-            # points back (more nose-first thrust only overshoots), or the air
-            # has already turned the booster round (engines-first: the stable
-            # attitude, from which the thrust cannot be pointed along the
-            # motion again -- it would wait at zero throttle), the
-            # engines-first coast and the landing burn take over.  A hop also
-            # ends once the change wanted points against the flow (braking):
-            # it starts slow, so there is no retrograde phase to fly.
-            d = None if dv is None or dvn <= 0.0 else dv / dvn
-            braking = False
-            if d is not None and airspeed > self.nose_first_speed:
-                u_air = (v - wind_now) / airspeed
-                cos_f = float(np.dot(d, u_air))
-                cap = math.radians(self.nose_first_aoa_deg)
-                if cos_f > 0.0:
-                    if float(np.dot(dv[:2], v[:2])) < 0.0 or float(np.dot(veh.axis, u_air)) < 0.0:
-                        braking = True
-                    elif cos_f < math.cos(cap):
-                        side = d - u_air * cos_f
-                        d = u_air * math.cos(cap) + side / float(np.linalg.norm(side)) * math.sin(cap)
-                elif self._hop:
-                    braking = True
-            if (dv is None or dvn < self.boostback_done_dv or r[2] < self._bb_floor or burn_due
-                    or veh.propellant < self._bb_reserve or braking):
-                self._boostback = False
-                self._boostback_done = True
-            else:
-                c.fins_deploy = False           # grid fins stay stowed for the boost-back
-                err = math.acos(max(-1.0, min(1.0, float(np.dot(veh.axis, d)))))
-                thr = float(np.clip(dvn / 8.0, 0.4, 1.0)) if err < math.radians(25.0) else 0.0
-                if self._hop and thr == 0.0 and veh.axis[2] > 0.3:
-                    # still turning: hold the height meanwhile (a hop starts
-                    # low and slow -- falling now only steepens the flow it
-                    # must then fly against)
-                    thr = float(np.clip(1.1 * m * G0 / (self._thrust_available(veh, r[2]) * float(veh.axis[2])), 0.0, 1.0))
-                c.throttle = thr
-                self.cmd_throttle = thr
-                self.cmd_axis = d
-                self.cmd_accel = d * thr * s.thrust_sl / m
-                self.next_predict = min(self.next_predict, self.elapsed + 0.1)
-                self._attitude(veh, d, use_rcs=True)
-                return
-
-        # ---- coast, and the ignition decision.
-        self.phase = "COAST"
-        c.fins_deploy = True                    # grid fins out after the boost-back
-        self._mark()
-        # Low, slow and far off (no boost-back, too little speed to glide):
-        # falling first only loses the height the divert needs -- light now
-        # and let the landing burn fly it.
-        divert_now = (not self._boostback_done and r[2] < self.boostback_min_alt and airspeed < 100.0
-                      and miss > max(150.0, 0.5 * r[2]))
-        if ignite_now or divert_now:
-            if not math.isfinite(t_burn):
-                # not falling yet: fall time plus the sideways transfer
-                h, vz = max(0.0, float(r[2])), float(v[2])
-                t_burn = (vz + math.sqrt(vz * vz + 2.0 * G0 * h)) / G0 + 2.0 * math.sqrt(miss / 3.0)
-            self._ignite(veh, r, v, m, wind_now, t_burn)
-            return
-        c.throttle = 0.0
-        self.cmd_throttle = 0.0
-        self.cmd_accel = np.zeros(3)
-        vr = v - wind_now
-        sp = float(np.linalg.norm(vr))
-        if self.ignition_in < 3.0:
-            # Line up for the landing burn: upright, plus the steady lateral
-            # deceleration of _burn_miss and what removes the rest of the
-            # aim-point miss (the glide has done the bulk of it).
-            t_b = max(2.0, self._brake_time)
-            a_lat = -v[:2] / t_b - 2.0 * self._burn_miss_now / t_b ** 2
-            a_z = max(G0, frac * self._thrust_available(veh, r[2]) / m * float(burn_dir[2]))
-            target = np.array([a_lat[0], a_lat[1], a_z])
-            target /= float(np.linalg.norm(target))
-            cap = math.radians(float(np.clip(r[2] / 40.0, 1.0, 20.0)))
-            if math.acos(max(-1.0, min(1.0, float(target[2])))) > cap:
-                hz = np.array([target[0], target[1], 0.0])
-                hz /= max(1e-9, float(np.linalg.norm(hz)))
-                target = hz * math.sin(cap) + np.array([0.0, 0.0, math.cos(cap)])
-        elif sp > 25.0:
-            target = self._aero_steer(veh, r, v, m, wind_now)   # engines-first, steered by body lift
-        else:
-            target = np.array([0.0, 0.0, 1.0])
-        self.cmd_axis = target
-        self._attitude(veh, target, use_rcs=True)
-
-    def _coast(self, veh, r, v, m, wind_now, dt=0.25, t_max=200.0):
-        """Drag-aware coast to the predicted ignition: ``(t_ign, p_ign, v_ign, t_burn)``, or None."""
-        if self.aero is None:
-            return None
-        p, u = r.copy(), v.copy()
-        t = 0.0
-        while t < t_max and p[2] > 0.0:
-            rho, _, _, a = atmosphere(max(0.0, p[2]))
-            f = self.aero.quick_force(u - self._wind(p[2]), None, rho, a, 0.0)
-            frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m))
-            if frac >= self._ignition_threshold(tb, bd):
-                return t, p, u, tb
-            u = u + (f / m + np.array([0.0, 0.0, -G0])) * dt
-            p = p + u * dt
-            t += dt
-        return None
-
-    def _burn_miss(self, veh, p_ign, v_ign, m, wind_now, dt=0.2):
-        """Where a (nearly) upright landing burn lit at ``(p_ign, v_ign)`` ends.
-
-        Returns ``(miss_xy, t_brake)``.  The burn brakes at constant
-        deceleration until it meets the final-approach envelope (sink
-        <= gate_speed + sink_gain h), and must be over the pad, without
-        sideways speed, by then: over the braking time the horizontal speed
-        is bled off at the smallest steady rate (the rest is done by the
-        drag of the upright body), so the booster drifts about
-        ``v_ign t_brake / 2``.  The glide and the boost-back aim this point
-        at the pad: the burn then needs only a small, steady tilt -- at high
-        dynamic pressure a tilted engines-first booster gets a body lift
-        *against* its tilt, so a large sideways correction with the engine
-        is costly and fights itself."""
-        h0, vz0 = float(p_ign[2]) - self.gate_height, float(v_ign[2])
-        a_v = max(0.5, (vz0 ** 2 - self.gate_speed ** 2) / (2.0 * max(1.0, h0)))
-        # Braking time: the constant-deceleration profile sqrt(2 a_v h)
-        # meets the final-approach envelope near h = 2 a_v / sink_gain^2 (~100 m).
-        t_br, h, vz = 0.0, h0, vz0
-        while h > 0.0 and -vz <= self.gate_speed + self.sink_gain * h and t_br < 60.0:
-            vz += a_v * dt
-            h += vz * dt
-            t_br += dt
-        if t_br < dt:                       # already below the envelope: low, short burn
-            t_br = 0.6 * max(0.0, -vz0) / a_v
-        t_br = max(t_br, 1.0)
-        p, u = p_ign.copy(), v_ign.copy()
-        up = np.array([0.0, 0.0, 1.0])
-        e0 = v_ign[:2] / max(1e-6, float(np.linalg.norm(v_ign[:2])))
-        t = 0.0
-        while t < t_br - 1e-9:
-            a_h = np.zeros(2)
-            if self.aero is not None:
-                rho, _, _, a = atmosphere(max(0.0, p[2]))
-                a_h = self.aero.quick_force(u - self._wind(p[2]), up, rho, a, 0.0)[:2] / m
-            # steady thrust decel that stops the along-track drift by t_br
-            # (drag does part of it); a cross wind is not fought with tilt
-            a_h -= e0 * max(0.0, float(np.dot(u[:2], e0))) / max(dt, t_br - t)
-            u[:2] += a_h * dt
-            u[2] += a_v * dt
-            p = p + u * dt
-            t += dt
-        return p[:2], t_br
-
-    def _boostback_target(self, veh, r, v, m, wind_now):
-        """Velocity change that brings the booster back over the pad.
-
-        Shooting on the drag-aware coast: Newton on the horizontal velocity
-        change so that the landing burn ends on the pad (``_burn_miss`` = 0),
-        and loft (extra climb) while that is out of reach or the flight path
-        at ignition is shallower than ``boostback_gamma_ok``: a longer,
-        steeper fall lets drag bleed the horizontal speed off.  Warm-started
-        between solves (every ``boostback_solve_period``)."""
-        if self._bb_dv is None:
-            dv = np.zeros(3)
-            if self._hop:
-                # start lofted: from low down a flat shot just falls short
-                # (and the booster must not sink while it turns)
-                dv[2] = float(np.clip(0.5 * math.sqrt(G0 * float(np.linalg.norm(self.impact))), 20.0, self.boostback_loft_max))
-        else:
-            dv = self._bb_dv.copy()
-        if self._bb_v is not None and self._bb_dv is not None:
-            dv -= v - self._bb_v
-        dv[2] = max(0.0, dv[2])
-
-        def shoot(x):
-            res = self._coast(veh, r, v + x, m, wind_now)
-            return None if res is None else (self._burn_miss(veh, res[1], res[2], m, wind_now)[0], res)
-
-        out = shoot(dv)
-        for _ in range(2):
-            if out is None or float(np.linalg.norm(out[0])) < 3.0:
-                break
-            J = np.zeros((2, 2))
-            for j in range(2):
-                e = np.zeros(3)
-                e[j] = 4.0
-                oj = shoot(dv + e)
-                if oj is None:
-                    J = None
-                    break
-                J[:, j] = (oj[0] - out[0]) / 4.0
-            if J is None or abs(np.linalg.det(J)) < 1e-6:
-                break
-            step = -np.linalg.solve(J, out[0])
-            sn = float(np.linalg.norm(step))
-            if sn > 80.0:
-                step *= 80.0 / sn
-            dv[:2] += step
-            out = shoot(dv)
-        if out is None:
-            # No ignition predicted: fall back to the drag-only impact point.
-            dv = np.zeros(3)
-            dv[:2] = -self.impact / max(5.0, self.time_to_go)
-            dv[2] = 0.3 * float(np.linalg.norm(dv[:2]))
-            self._bb_reserve = 0.0
-        else:
-            v_i = out[1][2]
-            # Loft (extra climb = more time) while the pad is out of reach,
-            # or while the fall would still be too shallow at ignition.
-            excess = float(np.linalg.norm(v_i[:2])) - math.tan(math.radians(self.boostback_gamma_ok)) * max(20.0, -float(v_i[2]))
-            if float(np.linalg.norm(out[0])) > 30.0:
-                excess = max(excess, 5.0)
-            dv[2] = float(np.clip(dv[2] + np.clip(excess, -5.0, 5.0), 0.0, self.boostback_loft_max))
-            # Keep the landing-burn propellant (with margin).
-            isp_g = veh.spec.isp_sl * G0
-            self._bb_reserve = 1.3 * m * (1.0 - math.exp(-(float(np.linalg.norm(v_i)) + 15.0) / isp_g)) + 250.0
-        self._bb_dv = dv
-        self._bb_v = v.copy()
-
-    def _aero_steer(self, veh, r, v, m, wind_now):
-        """Engines-first attitude with a small angle of attack whose body/grid-fin
-        lift steers the booster over the pad (Falcon-9 style glide).
-
-        Zero-effort-miss guidance on the drag-aware coast: the lateral
-        acceleration moves ``_burn_miss`` (where an upright landing burn from
-        the predicted ignition would end) onto the pad, so the glide -- not
-        the burn -- removes the horizontal error."""
-        vr = v - wind_now
-        sp = float(np.linalg.norm(vr))
-        u = vr / sp
-        base = -u
-        if self._ign_state is None or self.aero is None:
-            return base
-        t_i = self._ign_state[0]
-        miss = self._burn_miss_now
-        t_go = max(3.0, float(t_i))
-        # A constant lateral acceleration a held until ignition moves the
-        # aim point by about a (t^2/2 + t_brake t / 2).
-        a_des = np.zeros(3)
-        a_des[:2] = -self.glide_gain * miss / (0.5 * t_go ** 2 + 0.5 * self._brake_time * t_go)
-        a_des -= u * float(np.dot(a_des, u))
-        an = float(np.linalg.norm(a_des))
-        if an < 0.02:
-            return base
-        e_a = a_des / an
-        rho, _, _, a_snd = atmosphere(max(0.0, r[2]))
-        l0 = float(np.dot(self.aero.quick_force(vr, base, rho, a_snd, veh.legs), e_a))
-        a_max = math.radians(self.aero_steer_max_deg)
-
-        def lift(alpha, e):
-            axis = math.cos(alpha) * base + math.sin(alpha) * e
-            return float(np.dot(self.aero.quick_force(vr, axis, rho, a_snd, veh.legs), e_a)) - l0
-
-        # Engines-first, the lift points against the tilt: find the side that
-        # pushes along e_a, then the angle (secant on the real lift curve).
-        alpha = math.radians(5.0)
-        best = max(((e, lift(alpha, e)) for e in (-e_a, e_a)), key=lambda x: x[1])
-        e, l_a = best
-        if l_a <= 0.0:
-            return base
-        for _ in range(2):
-            alpha = float(np.clip(alpha * an * m / l_a, 0.0, a_max))
-            if alpha >= a_max:
-                break
-            l_a = lift(alpha, e)
-            if l_a <= 0.0:
-                break
-        return math.cos(alpha) * base + math.sin(alpha) * e
-
-    def _ignite(self, veh, r, v, m, wind_now, t_burn):
+    # ------------------------------------------------------------ engage
+    def _engage(self, veh, wind_now):
+        """Autopilot on: the shortest-time plan of the whole recovery from
+        the current state, then a few re-solves about it (the first search
+        is linearised about a guessed path)."""
         self._dir_prev = veh.axis.copy()
-        self._gate_xy = np.zeros(2)          # the burn itself lands on the pad centre
+        self._gate_xy = np.zeros(2)
         self.burn_locked = True
-        self._boostback = False
         self._route = None
         self.plan = None
-        # the predictor's burn time only seeds the search of the final time
-        t_est = max(1.5, 1.05 * t_burn) + 2.0
+        r, v, _ = self._state(veh)
+        t_est = self._far_time(r, v)
         self.touchdown_time = self.elapsed + t_est
         plan = self._search_time(veh, wind_now, t_est) if self.planner.available else None
         if plan is not None:
             self._commit(plan)
-            # The search linearised drag and angle of attack about a straight
-            # descent (there was no plan yet) -- in a strong wind aloft that
-            # reference hovers in a 30-40 m/s flow, and the plan breaks the
-            # angle-of-attack cone along a path it will not fly.  Two passes
-            # about the plan itself (successive convexification) before it is
-            # flown.
-            for _ in range(self.ignition_refine):
-                p = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))(self.plan.t_f)
-                if p is None:
+            for _ in range(self.engage_refine):
+                p = self._solve_now(veh, wind_now, self.plan.t_f)
+                if p is None or not p.reaches_pad:
                     break
                 self._commit(p)
         self._next_search = self.elapsed + self.search_backoff
         self._publish()
         self.next_replan = self.elapsed + self.burn_replan_period
-        self.phase = "LANDING BURN"
-        self._mark()
-        veh.controls.throttle = self.minimum_throttle
 
     def _mark(self):
         if self.phase in ("COAST", "BOOSTBACK", "LANDING BURN", "LANDED") and self.phase not in self.visited:

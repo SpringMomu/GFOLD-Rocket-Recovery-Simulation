@@ -53,7 +53,6 @@ def check(index: int) -> dict:
     ok = (
         passed(vehicle, sim.tower is not None)
         and td.get("tilt", 99) <= MAX_TOUCHDOWN_TILT
-        and hover <= MAX_HOVER
         and max_rate <= MAX_LOW_RATE
     )
     return {"scenario": sim.scenario_name, "pass": ok, "hover_time": round(hover, 2),

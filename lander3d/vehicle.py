@@ -247,6 +247,11 @@ class VehicleSpec:
     isp_sl: float = 282.0
     isp_vac: float = 311.0
     throttle_rate: float = 1.2       # full range per second
+    # Engine starts available after the separation: one boost-back burn and
+    # one landing burn, as on a real booster (no third ignition).  The engine
+    # is lit when the throttle opens from zero and shuts down when it is back
+    # at zero; with no starts left a zero-throttle engine stays off.
+    max_ignitions: int = 2
     gimbal_limit: float = math.radians(12.0)
     gimbal_rate: float = math.radians(30.0)
     gimbal_z: float = 0.3            # pivot height above the base
@@ -324,6 +329,8 @@ class Vehicle:
         self.lox = prop * ratio
         self.rp1 = prop * (1.0 - ratio)
         self.throttle = 0.0
+        self.ignitions = 0               # engine starts used
+        self.engine_lit = False
         self.gimbal = np.zeros(2)
         self.rcs = np.zeros(3)
         self.fins = np.zeros(3)          # last (pitch, yaw, roll) fin command actually mixed
@@ -437,11 +444,18 @@ class Vehicle:
         c = self.controls
         self.time += dt
 
-        # Actuators with finite rates.
-        self.throttle += max(-s.throttle_rate * dt, min(s.throttle_rate * dt, c.throttle - self.throttle))
+        # Actuators with finite rates.  The engine lights (one start used)
+        # when the throttle opens from zero, and shuts down back at zero.
+        if not self.engine_lit and c.throttle > 0.0 and self.propellant > 0.0 and self.ignitions < s.max_ignitions:
+            self.ignitions += 1
+            self.engine_lit = True
+        target = c.throttle if self.engine_lit else 0.0
+        self.throttle += max(-s.throttle_rate * dt, min(s.throttle_rate * dt, target - self.throttle))
         self.throttle = min(1.0, max(0.0, self.throttle))
         if self.propellant <= 0.0:
             self.throttle = 0.0
+        if self.engine_lit and self.throttle <= 0.0 and target <= 0.0:
+            self.engine_lit = False
         g_cmd = np.clip(np.asarray(c.gimbal, float), -s.gimbal_limit, s.gimbal_limit)
         self.gimbal += np.clip(g_cmd - self.gimbal, -s.gimbal_rate * dt, s.gimbal_rate * dt)
         self.rcs = np.clip(np.asarray(c.rcs, float), -1.0, 1.0)
