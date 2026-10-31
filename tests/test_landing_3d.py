@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from lander3d.planner import KeepOutBox, Plan3D, along_path, detour_path, separating_planes
+from lander3d.planner import KeepOutBox, Plan3D, along_path, detour_paths, separating_planes
 from lander3d.regression import passed, run_scenario
 from lander3d.server import finite, snapshot
 from lander3d.sim import PHYSICS_DT, SCENARIOS, Sim3D
@@ -28,29 +28,32 @@ def test_closed_arms_clear_a_centred_booster():
     assert all(abs(g - FACE_CLEARANCE) < 1e-9 for g in tower.face_gaps(veh))
 
 
-def test_keep_out_goes_over_the_tower_and_keeps_east_of_it_at_the_end():
+def test_keep_out_offers_routes_over_and_round_the_tower():
     boxes = [KeepOutBox(c - np.array([0.0, 0.0, CatchTower().catch_base_z]), ax, hf)
              for c, ax, hf in CatchTower.keep_out_boxes(Vehicle().spec)]
-    start, gate = np.array([-150.0, 0.0, 85.0]), np.zeros(3)
-    path = detour_path(boxes, start, gate)
-    pts = along_path(path, np.linspace(0.0, 1.0, 400))
-    inside = [p for p in pts for b in boxes if np.all(np.abs(b.axes.T @ (p - b.center)) < b.half)]
-    assert not inside and max(p[2] for p in path[1:-1]) > 30.0    # over the top, not through
+    start, gate = np.array([-150.0, 0.0, 30.0]), np.zeros(3)
+    paths = detour_paths(boxes, start, gate, z_min=-14.0)
+    assert len(paths) >= 2
+    for path in paths:                                  # none goes through an obstacle
+        pts = along_path(path, np.linspace(0.0, 1.0, 400))
+        assert not [p for p in pts for b in boxes if np.all(np.abs(b.axes.T @ (p - b.center)) < b.half)]
+    # over the top and round a side are both on offer: the planner picks
+    over = [max(p[2] for p in path[1:-1]) > 30.0 for path in paths]
+    assert any(over) and not all(over)
     # at the gate the tower plane is its east face, which the gate satisfies
     (_, n, b), = [kp for kp in separating_planes(boxes[:1], [gate], target=gate)]
     assert np.allclose(n, [1.0, 0.0, 0.0]) and n @ gate >= b
 
 
-def test_relaxed_plans_are_judged_without_the_limits_they_relax():
+def test_a_plan_through_a_physical_limit_does_not_reach():
     z = np.zeros(3)
     plan = Plan3D(t_f=10.0, dt=1.0, r=z, v=z, z=z, u=z, sigma=z, drag=z, status="Solved", objective=0.0,
-                  terminal_position_error=0.2, terminal_velocity_error=0.1, glide_violation=0.0, fuel_violation=0.0,
-                  lateral_violation=8.0)
-    assert not plan.reaches_pad                      # far too fast sideways for the normal limits
-    plan.relax = 1
-    assert not plan.reaches_pad                      # level 1 only frees the sink envelope
-    plan.relax = 2
+                  terminal_position_error=0.2, terminal_velocity_error=0.1, fuel_violation=0.0)
     assert plan.reaches_pad
+    for limit in ("keep_out_violation", "ground_violation", "aoa_violation"):
+        setattr(plan, limit, 5.0)
+        assert not plan.reaches_pad
+        setattr(plan, limit, 0.0)
 
 
 def test_past_its_end_a_plan_keeps_descending_instead_of_holding():
@@ -64,7 +67,7 @@ def test_past_its_end_a_plan_keeps_descending_instead_of_holding():
     u = np.tile([0.0, 0.0, 13.0], (n + 1, 1))
     plan = Plan3D(t_f=4.0, dt=1.0, r=r, v=v, z=np.zeros(n + 1), u=u, sigma=np.full(n + 1, 13.0),
                   drag=np.zeros((n, 3)), status="Solved", objective=0.0, terminal_position_error=0.0,
-                  terminal_velocity_error=0.0, glide_violation=0.0, fuel_violation=0.0)
+                  terminal_velocity_error=0.0, fuel_violation=0.0)
     pos, vel, acc = plan.sample(6.0)
     assert pos[2] < r[-1, 2] - 2.0 and vel[2] < 0.0
     assert abs(acc[2] - 9.80665) < 0.01

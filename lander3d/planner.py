@@ -12,18 +12,25 @@ Second-order-cone program over N+1 knots with first-order-hold thrust:
     sigma_k >= T_min e^{-z0_k} (1 - (z_k - z0_k))          first-order in z around
                                                            the max-burn mass z0_k)
     z_N >= ln(m_dry) - s_fuel                             (propellant limit)
-    ||(x_k, y_k)|| <= tan(gamma) (h_k + s_k)              (glide-slope cone, soft)
+    h_k >= h_ground - s_k                                 (the ground, soft)
     n_j . r_k >= b_j - s_j                                (keep-out half-spaces, soft:
                                                            obstacles, see separating_planes)
-    u_z,k >= cos(theta(t_go)) sigma_k                     (pointing: vertical at the end)
+    w_k . u_k >= cos(alpha(q_k)) sigma_k - s_k            (angle of attack the booster can
+                                                           hold at dynamic pressure q_k, soft)
+    vz_k >= -(v_td + c h_k) - s_k                         (touchdown approach, soft)
+    u . a_k >= cos(theta(t_go)) sigma_k                   (upright at touchdown)
     |sigma_{k+1} - sigma_k|, |u_{x/y,k+1} - u_{x/y,k}| <= rate * dt
     r_N = 0, v_N = (0, 0, -v_td)                           (exact L1 penalty)
 
-Objective: fuel (sum sigma dt ~ -z_N) while searching the ignition time; a
-smooth thrust profile (acceleration, jerk, lateral offset) for the locked
-landing burn.  Drag d(t) is predicted along the previous plan, together with
-the lift gradient ``G`` of tilting the vehicle against the flow, which enters
-the dynamics linearly in ``u``.
+Only physical limits (vehicle, actuators, aerodynamics, ground, obstacles)
+and the touchdown condition are constraints: the route -- when to brake,
+how fast and how high to fly, whether to go over an obstacle or round it --
+is the optimiser's.  Objective: propellant (sum sigma dt) plus
+``time_weight`` per second of flight (the final time is searched on this
+total by the caller), with a small jerk term for the actuators.  Drag d(t)
+is predicted along the previous plan, together with the lift gradient ``G``
+of tilting the vehicle against the flow, which enters the dynamics linearly
+in ``u``.
 """
 
 from __future__ import annotations
@@ -41,7 +48,6 @@ from .vehicle import G0
 
 @dataclass
 class PlanConfig3D:
-    mode: str
     thrust_min: float          # N
     thrust_max: float          # N
     isp: float                 # s
@@ -55,8 +61,9 @@ class PlanConfig3D:
     target_alt: float = 0.0          # plan end height above the pad (0 = touchdown)
     u_cmd: tuple | None = None       # previous plan's command now (continuity anchor)
     target_xy: tuple = (0.0, 0.0)    # gate position (normally the pad centre)
-    # Final-approach sink envelope (soft): sink <= touchdown_speed + sink_gain * h.
-    # Arrive slowly with thrust ~ weight instead of braking hard into contact.
+    # Touchdown approach (soft): sink <= touchdown_speed + sink_gain * h --
+    # loose high up, it only keeps the last metres slow (no braking hard into
+    # contact), like the tracker's envelope.
     sink_gain: float = 0.0
     # Angle-of-attack cap vs dynamic pressure ((Pa...), (deg...)): the angle
     # between the thrust and the oncoming flow (engines-first attitude).  The
@@ -66,30 +73,37 @@ class PlanConfig3D:
     # Obstacles (soft): callable(knot times) -> [(k, n, b), ...], each asking
     # n . r_k >= b; see separating_planes.
     keep_out: Callable | None = None
-    # Relaxation level when nothing is reachable otherwise: 1 = sink envelope
-    # nearly free, 2 = also the lateral-speed envelope, approach cone and
-    # glide slope.
-    relax: int = 0
-    # Height (planner coordinates) whose lateral-speed envelope also caps the
-    # plan: the envelope widens with height, and without this a plan would
-    # climb just to fly sideways faster.  Normally the height at ignition.
-    lateral_ref_height: float | None = None
+    # The ground (planner coordinates of the base point; soft, like the
+    # obstacles).
+    ground_alt: float = -math.inf
+    # Length from the base to the top of the body: beside an obstacle the
+    # tilted body's top must stay on the same side as the base (the boxes
+    # are grown upwards by the length, which only covers an upright body).
+    body_length: float = 0.0
     # Wind trim (m/s^2, x and y): the sideways thrust acceleration that holds
     # the upright booster against the wind near the end.  The tilt cone is
     # centred on the trim axis (lean into the wind) instead of the vertical,
     # like the tracker's tilt budget.
     tilt_trim: tuple = (0.0, 0.0)
     trim_fade: tuple = (0.5, 5.5)    # m above the gate: upright below, full trim above
-    # Cost per metre (per second) of planned height above ``climb_ref_height``
-    # (soft; planner coordinates, default the current height -- normally
-    # the height at ignition).  With the burn time fixed, gravity losses do
-    # not depend on the path, so without it nothing resists a loft that only
-    # eases the soft envelopes -- and up there the wind is stronger and
-    # comes from above the climbing booster.  Only height above the reference
-    # counts: a descending burn that brakes a little too hard may climb back
-    # freely, and a climb over an obstacle (keep-out, far costlier) still wins.
-    climb_weight: float = 0.0
-    climb_ref_height: float | None = None
+    # The tracker's tilt budget by height ((m...), (deg...)): the plan must
+    # not count on a late sideways swing the tracker will not fly near the
+    # ground.  Applied at the reference heights ``height_ref(knot times)``
+    # (the previous plan: successive linearisation), else at the height of
+    # the touchdown approach t_go before the end.
+    tilt_budget: tuple | None = None
+    height_ref: Callable | None = None
+    # The tracker's slew-rate limit on the thrust direction by height ((m...),
+    # (deg/s...)): caps the change of the planned lateral thrust (at the
+    # reference heights, with a margin for the attitude lag) -- a reversal
+    # faster than the booster can turn is flown late and overshoots.
+    slew_deg: tuple | None = None
+    # Cost of a second of flight, in propellant units (m/s of thrust
+    # acceleration integrated): the final time is chosen on propellant +
+    # time_weight * t_f -- the cheapest route, and of nearly equal ones the
+    # fastest.  (Gravity losses alone already make every extra second cost
+    # ~g: hovering is never optimal.)
+    time_weight: float = 0.0
 
 
 @dataclass
@@ -125,45 +139,91 @@ def _segment_hit(boxes, a, b, step=1.0):
     return box, (pts[i - 1] if i > 0 else a), (pts[i + int(out[0])] if len(out) else b)
 
 
-def detour_path(boxes, start, end, z_min=-math.inf, climb_cost=5.0, rounds=4):
+def _detour_options(boxes, a, b, z_min):
+    """Ways past the first box the segment a -> b runs into: for each face of
+    that box, its last point before and first point after the box moved just
+    outside that face (over the top, round a side, underneath).  Returns
+    (index of the segment's hit, [(length, w1, w2), ...] shortest first), or
+    None if the segment is clear."""
+    hit = _segment_hit(boxes, a, b)
+    if hit is None:
+        return None
+    box, p_in, p_out = hit
+    l_in = box.axes.T @ (p_in - box.center)
+    l_out = box.axes.T @ (p_out - box.center)
+    opts = []
+    for i in range(3):
+        for sgn in (1.0, -1.0):
+            # just outside this face -- or further out, past whatever else
+            # stands there (round the tower's side means round the arms too)
+            for extra in np.arange(1.0, 31.0, 1.0):
+                w1, w2 = l_in.copy(), l_out.copy()
+                w1[i] = w2[i] = sgn * (box.half[i] + extra)
+                w1, w2 = box.center + box.axes @ w1, box.center + box.axes @ w2
+                if not any(_inside(o, w) for o in boxes for w in (w1, w2)):
+                    break
+            else:
+                continue
+            if min(w1[2], w2[2]) < z_min:
+                continue
+            legs = ((a, w1), (w1, w2), (w2, b))
+            if any(_segment_hit([box], p, q) is not None for p, q in legs):
+                continue
+            opts.append((sum(float(np.linalg.norm(q - p)) for p, q in legs), w1, w2))
+    opts.sort(key=lambda o: o[0])
+    return opts
+
+
+def detour_path(boxes, start, end, z_min=-math.inf, rounds=4, first=0):
     """Reference path from ``start`` to ``end`` around the keep-out boxes.
 
-    Where the straight line crosses a box, its last point before and first
-    point after the box are both moved just outside one side (over the top,
-    round a side, or underneath; whichever is shortest, climbing counting
-    ``climb_cost`` times).  The path only serves to pick the face each knot
-    must stay outside of -- the trajectory itself is optimised by the SOCP.
+    Where the straight line crosses a box it is bent just outside one of
+    the box's faces; ``first`` picks which way past the first obstacle (0 =
+    the shortest), later ones take the shortest.  The path only serves to
+    pick the face each knot must stay outside of -- the trajectory itself,
+    and which way it goes, is the optimiser's (see ``detour_paths``).
     """
     pts = [np.asarray(start, float), np.asarray(end, float)]
-    for _ in range(rounds):
+    for r in range(rounds):
         for j in range(len(pts) - 1):
-            a, b = pts[j], pts[j + 1]
-            hit = _segment_hit(boxes, a, b)
-            if hit is not None:
+            opts = _detour_options(boxes, pts[j], pts[j + 1], z_min)
+            if opts is not None:
                 break
         else:
             return pts
-        box, p_in, p_out = hit
-        l_in = box.axes.T @ (p_in - box.center)
-        l_out = box.axes.T @ (p_out - box.center)
-        best = None
-        for i in range(3):
-            for sgn in (1.0, -1.0):
-                w1, w2 = l_in.copy(), l_out.copy()
-                w1[i] = w2[i] = sgn * (box.half[i] + 1.0)
-                w1, w2 = box.center + box.axes @ w1, box.center + box.axes @ w2
-                if min(w1[2], w2[2]) < z_min or any(_inside(o, w) for o in boxes for w in (w1, w2)):
-                    continue
-                legs = ((a, w1), (w1, w2), (w2, b))
-                if any(_segment_hit([box], p, q) is not None for p, q in legs):
-                    continue
-                cost = sum(float(np.linalg.norm(q - p)) + climb_cost * max(0.0, float(q[2] - p[2])) for p, q in legs)
-                if best is None or cost < best[0]:
-                    best = (cost, w1, w2)
-        if best is None:
+        if not opts:
             return pts
-        pts[j + 1:j + 1] = [best[1], best[2]]
+        _, w1, w2 = opts[min(first if r == 0 else 0, len(opts) - 1)]
+        pts[j + 1:j + 1] = [w1, w2]
     return pts
+
+
+def detour_paths(boxes, start, end, z_min=-math.inf, limit=3, near=15.0):
+    """Distinct ways round the obstacles (over, round either side ...):
+    candidate references, one convex problem each -- the cheapest plan picks
+    the route.  With obstacles close round the end (the catch arms) one more:
+    to a point straight above it, clear of them, then straight down -- the
+    way in between two obstacles open at the top, which no single bend
+    round one of them finds."""
+    start, end = np.asarray(start, float), np.asarray(end, float)
+    opts = _detour_options(boxes, start, end, z_min)
+    paths = ([detour_path(boxes, start, end, z_min, first=i) for i in range(min(limit, len(opts)))]
+             if opts else [detour_path(boxes, start, end, z_min)])
+    tops = [float(b.center[2] + np.sum(np.abs(b.axes[2]) * b.half)) for b in boxes
+            if float(np.linalg.norm(_closest_xy(b, end) - end[:2])) < near]
+    if tops:
+        above = np.array([end[0], end[1], max(max(tops) + 2.0, end[2])])
+        if not any(_inside(b, above) for b in boxes) and _segment_hit(boxes, above, end) is None:
+            paths.append(detour_path(boxes, start, above, z_min)[:-1] + [above, end])
+    return paths
+
+
+def _closest_xy(box, p):
+    """Horizontal point of the box nearest to ``p`` (ignoring height)."""
+    rel = box.axes.T @ (np.asarray(p, float) - box.center)
+    rel = np.clip(rel, -box.half, box.half)
+    q = box.center + box.axes @ rel
+    return q[:2]
 
 
 def along_path(pts, fractions):
@@ -231,13 +291,11 @@ class Plan3D:
     objective: float
     terminal_position_error: float
     terminal_velocity_error: float
-    glide_violation: float
     fuel_violation: float
-    # largest slack of the lateral-speed / angle-of-attack limits
-    lateral_violation: float = 0.0
-    aoa_violation: float = 0.0
-    keep_out_violation: float = 0.0
-    relax: int = 0
+    # largest slacks of the soft physical limits
+    aoa_violation: float = 0.0        # m/s^2 of thrust outside the angle-of-attack cone
+    keep_out_violation: float = 0.0   # m inside an obstacle
+    ground_violation: float = 0.0     # m below the ground
     created_at: float = 0.0
 
     @property
@@ -246,13 +304,12 @@ class Plan3D:
 
     @property
     def reaches_pad(self) -> bool:
-        # Reaching the pad by breaking the flyability limits (much faster
-        # sideways than allowed, nose-first) does not count: the tracker
-        # cannot follow such a plan, so the time must move instead.  A relaxed
-        # plan (``relax``) is judged without the limits it relaxed.
+        # Reaching the pad by breaking a physical limit (through an obstacle
+        # or the ground, nose-first beyond what the air allows) does not
+        # count: the tracker cannot fly such a plan.
         return (self.terminal_position_error < 1.0 and self.terminal_velocity_error < 0.8
                 and self.fuel_violation < 1e-3 and self.keep_out_violation < 0.5
-                and (self.relax >= 2 or (self.glide_violation < 1.0 and self.lateral_violation < 3.0)))
+                and self.ground_violation < 0.5 and self.aoa_violation < 2.0)
 
     @property
     def final_mass(self) -> float:
@@ -289,37 +346,29 @@ class Planner3D:
     knots = 40
     terminal_position_weight = 400.0
     terminal_velocity_weight = 250.0
-    glide_slope_weight = 30.0
-    glide_slope_tan = math.tan(math.radians(80.0))
     fuel_slack_weight = 2.0e4
     sink_envelope_weight = 80.0
-    # Final approach: lateral offset / speed weights (per s) vs time-to-go (s).
-    approach_t = (0.0, 6.0, 10.0, 15.0)
-    approach_pos_w = np.array([0.3, 0.2, 0.02, 0.008])
-    approach_vel_w = (0.4, 0.3, 0.03, 0.03)
-    vertical_final_t = 10.0
-    vertical_final_w = 0.1
-    lateral_position_weight = 0.008
-    lateral_position_ref = 150.0   # m: the pull towards the pad axis saturates beyond this offset
-    lateral_velocity_weight = 0.03
-    lateral_jerk_factor = 8.0
+    jerk_weight = 0.1
+    # Control effort of sideways thrust (per (m/s^2)^2 s).  In propellant a
+    # sideways acceleration a costs only ~a^2 / 2g per second, so a purely
+    # propellant-optimal plan swings hard and brakes late sideways -- with
+    # the attitude lag the tracker then overshoots (round and round the
+    # catch point).  This keeps sideways manoeuvres as gentle as the cost
+    # allows; it says nothing about the route.
+    lateral_accel_weight = 1.0
+    # Touchdown phase (not the route): over the last ~10 s be over the pad
+    # and nearly still sideways -- the burn runs to contact, so a lateral
+    # error left for the last metres can only be fixed by a swing the
+    # tracker will not fly near the ground.  Weights (per s) vs time to go.
+    approach_t = (0.0, 6.0, 10.0)
+    approach_pos_w = (0.3, 0.2, 0.0)
+    approach_vel_w = (0.4, 0.3, 0.0)
+    lateral_jerk_factor = 8.0      # lateral thrust changes mean tilting the whole vehicle
     lateral_rate = 4.0             # m/s^3, limit on the change of planned lateral thrust
-    # Soft cap on the horizontal speed (a low divert): flying sideways faster
-    # than this needs thrust along the motion against the broadside drag,
-    # i.e. nose-first flight the booster cannot hold aerodynamically.
-    lateral_speed_max = 30.0       # m/s (or the current speed, bled at lateral_speed_decay)
-    lateral_speed_decay = 4.0      # m/s^2
-    lateral_speed_weight = 200.0
-    # ... and, like the sink envelope, the lower the slower: arrive over the
-    # pad nearly vertical instead of braking a sideways speed at the bottom.
-    lateral_speed_floor = 2.0      # m/s at the pad
-    lateral_speed_gain = 0.15      # + m/s per m of height
-    aoa_weight = 100.0
-    approach_cone_floor = 1.0      # m off the pad centre at the pad ...
-    approach_cone_gain = 0.35      # ... + m per m of height
-    approach_cone_weight = 60.0
-    approach_cone_t = (6.0, 10.0)  # s to go: full weight -> none
+    slew_margin = 0.7              # share of the tracker's slew rate the plan may use
+    aoa_weight = 100.0             # per m/s^2 of thrust outside the angle-of-attack cone (per s)
     keep_out_weight = 2000.0       # per m inside an obstacle's half-space (per s)
+    ground_weight = 2000.0         # per m below the ground (per s)
 
     def __init__(self) -> None:
         self.solve_count = 0
@@ -350,18 +399,14 @@ class Planner3D:
         nU = 4 * (N + 1)
         iep = iu + nU
         iem = iep + 6
-        isg = iem + 6
-        ifs = isg + N
-        isk = ifs + 1                  # sink-envelope slacks, knots 1..N
-        ivs = isk + N                  # lateral-speed slacks, knots 1..N
-        iao = ivs + N                  # angle-of-attack slacks, knots 1..N
-        iap = iao + N                  # final-approach-cone slacks, knots 1..N
-        ikp = iap + N                  # keep-out slacks, one per half-space
+        ifs = iem + 6
+        isk = ifs + 1                  # touchdown-approach slacks, knots 1..N
+        iao = isk + N                  # angle-of-attack slacks, knots 1..N
+        igr = iao + N                  # ground slacks, knots 1..N-1
+        ikp = igr + N                  # keep-out slacks, one per half-space
         t_k = np.arange(N + 1) * dt
         keep = [kp for kp in cfg.keep_out(t_k) if kp[0] >= 1] if cfg.keep_out is not None else []
-        icl = ikp + len(keep)          # loft slacks (height above climb_ref_height), knots 1..N
-        n_cl = N if cfg.climb_weight > 0.0 else 0
-        n = icl + n_cl
+        n = ikp + len(keep)
 
         def S(k, c):
             return NX * k + c
@@ -422,26 +467,28 @@ class Planner3D:
         for c in range(6):
             row([(iep + c, -1.0)], 0.0)
             row([(iem + c, -1.0)], 0.0)
-        for k in range(N):
-            row([(isg + k, -1.0)], 0.0)
         row([(ifs, -1.0)], 0.0)
         for k in range(N):
             row([(isk + k, -1.0)], 0.0)
         for k in range(N):
-            row([(ivs + k, -1.0)], 0.0)
-        for k in range(N):
             row([(iao + k, -1.0)], 0.0)
         for k in range(N):
-            row([(iap + k, -1.0)], 0.0)
-        # Obstacles: n . r_k + s >= b  ->  -n . r_k - s <= -b
+            row([(igr + k, -1.0)], 0.0)
+        if math.isfinite(cfg.ground_alt):
+            # the ground: h_k + s_k >= h_ground  (the last knot is the gate)
+            for k in range(1, N):
+                row([(S(k, 2), -1.0), (igr + k - 1, -1.0)], -float(cfg.ground_alt))
+        # Obstacles: n . r_k + s >= b  ->  -n . r_k - s <= -b; beside a box
+        # (a side face) the top of the tilted body too: top = r + L u / sigma,
+        # with sigma ~ g (braking harder only tilts less for the same u, so
+        # this is on the safe side)
+        lever = cfg.body_length / G0
         for j, (k, nrm, b_) in enumerate(keep):
             row([(ikp + j, -1.0)], 0.0)
             row([(S(k, c), -float(nrm[c])) for c in range(3) if nrm[c] != 0.0] + [(ikp + j, -1.0)], -b_)
-        h_ref = float(r0[2]) if cfg.climb_ref_height is None else float(cfg.climb_ref_height)
-        for k in range(n_cl):
-            # c_k >= max(0, h_(k+1) - h_ref)
-            row([(icl + k, -1.0)], 0.0)
-            row([(S(k + 1, 2), 1.0), (icl + k, -1.0)], h_ref)
+            if lever > 0.0 and abs(float(nrm[2])) < 0.5:
+                row([(S(k, c), -float(nrm[c])) for c in range(2) if nrm[c] != 0.0]
+                    + [(U(k, c), -lever * float(nrm[c])) for c in range(2) if nrm[c] != 0.0] + [(ikp + j, -1.0)], -b_)
         if cfg.sink_gain > 0.0:
             # vz_k >= -(v_td + c (h_k - h_target)) - s_k   (linear in the state)
             c_s = cfg.sink_gain
@@ -460,6 +507,9 @@ class Planner3D:
         # Height the final approach (sink envelope) is at t_go before the end.
         c_s = cfg.sink_gain if cfg.sink_gain > 0.0 else 0.5
         h_go = abs(cfg.touchdown_speed) / c_s * np.expm1(c_s * np.minimum(t_go, 20.0))
+        if cfg.tilt_budget is not None:
+            h_ref = np.asarray(cfg.height_ref(t_k), float) if cfg.height_ref is not None else h_go
+            tilt = np.minimum(tilt, np.radians(np.interp(h_ref - cfg.target_alt, *cfg.tilt_budget)))
         if q_mid is not None and cfg.q_aoa is not None:
             # Same angle-of-attack cap as the tracker (knots 1..N, flow of the
             # interval before): the plan must not count on an attitude the
@@ -491,13 +541,17 @@ class Planner3D:
             axis /= np.linalg.norm(axis)
             row([(U(k, 3), float(cos_tilt[k]))] + [(U(k, c), -float(axis[c])) for c in range(3) if axis[c] != 0.0], 0.0)
         rate_s = 0.8 * 1.2 * cfg.thrust_max / m0 * dt
-        lat = self.lateral_rate * dt
+        lat = np.full(N, self.lateral_rate)
+        if cfg.slew_deg is not None:
+            h_s = np.asarray(cfg.height_ref(mid), float) if cfg.height_ref is not None else np.interp(mid, t_k, h_go)
+            lat = np.minimum(lat, self.slew_margin * G0 * np.radians(np.interp(h_s - cfg.target_alt, *cfg.slew_deg)))
+        lat = lat * dt
         for k in range(N):
             row([(U(k + 1, 3), 1.0), (U(k, 3), -1.0)], rate_s)
             row([(U(k, 3), 1.0), (U(k + 1, 3), -1.0)], rate_s)
             for c in (0, 1):
-                row([(U(k + 1, c), 1.0), (U(k, c), -1.0)], lat)
-                row([(U(k, c), 1.0), (U(k + 1, c), -1.0)], lat)
+                row([(U(k + 1, c), 1.0), (U(k, c), -1.0)], float(lat[k]))
+                row([(U(k, c), 1.0), (U(k + 1, c), -1.0)], float(lat[k]))
         spool = 0.8 * 1.2 * cfg.thrust_max / m0 * 0.15
         row([(U(0, 3), 1.0)], cfg.sigma_now + spool)
         row([(U(0, 3), -1.0)], -(cfg.sigma_now - spool))
@@ -517,40 +571,6 @@ class Planner3D:
             row([(U(k, 1), -1.0)], 0.0)
             row([(U(k, 2), -1.0)], 0.0)
             soc_dims.append(4)
-        tg = self.glide_slope_tan
-        for k in range(1, N + 1):
-            row([(S(k, 2), -tg), (isg + k - 1, -tg)], 0.0)
-            row([(S(k, 0), -1.0)], 0.0)
-            row([(S(k, 1), -1.0)], 0.0)
-            soc_dims.append(3)
-
-        v_cap = np.maximum(self.lateral_speed_max, math.hypot(v0[0], v0[1]) - self.lateral_speed_decay * t_k)
-        for k in range(1, N + 1):
-            row([(ivs + k - 1, -1.0)], float(v_cap[k]))
-            row([(S(k, 3), -1.0)], 0.0)
-            row([(S(k, 4), -1.0)], 0.0)
-            soc_dims.append(3)
-            row([(ivs + k - 1, -1.0), (S(k, 2), -self.lateral_speed_gain)],
-                self.lateral_speed_floor - self.lateral_speed_gain * cfg.target_alt)
-            row([(S(k, 3), -1.0)], 0.0)
-            row([(S(k, 4), -1.0)], 0.0)
-            soc_dims.append(3)
-            if cfg.lateral_ref_height is not None:
-                # ... and no wider than at the reference height: climbing is
-                # allowed (over an obstacle, back up after a deep fall), but
-                # it does not buy a faster traverse.
-                row([(ivs + k - 1, -1.0)],
-                    self.lateral_speed_floor + self.lateral_speed_gain * max(0.0, cfg.lateral_ref_height - cfg.target_alt))
-                row([(S(k, 3), -1.0)], 0.0)
-                row([(S(k, 4), -1.0)], 0.0)
-                soc_dims.append(3)
-            # Final approach cone (soft), much steeper than the glide slope:
-            # be over the pad before the last ~50 m, then come down upright.
-            row([(iap + k - 1, -1.0), (S(k, 2), -self.approach_cone_gain)],
-                self.approach_cone_floor - self.approach_cone_gain * cfg.target_alt)
-            row([(S(k, 0), -1.0)], -float(cfg.target_xy[0]))
-            row([(S(k, 1), -1.0)], -float(cfg.target_xy[1]))
-            soc_dims.append(3)
 
         A = row.matrix(n)
         b_vec = row.rhs
@@ -564,55 +584,30 @@ class Planner3D:
         q = np.zeros(n)
         const = 0.0
 
-        if cfg.mode == "fuel":
-            fuel_w, accel_w, jerk_w = 1.0, 0.0, 0.004
-        else:
-            fuel_w, accel_w, jerk_w = 0.02, 0.05, 0.25
+        # propellant (sum of thrust acceleration x dt), sideways effort, time
         for k in range(N + 1):
-            q[U(k, 3)] += fuel_w * w[k]
-            if accel_w > 0:
-                for c in range(3):
-                    add_p(U(k, c), U(k, c), 2 * accel_w * w[k])
-                q[U(k, 2)] += -2 * accel_w * w[k] * g
-                const += accel_w * w[k] * g * g
-        # Horizontal distance from the pad axis: pulls lateral corrections
-        # early, while the vehicle is high and tilting is cheap.
-        # Horizontal distance from the pad axis, and lateral speed: weighted
-        # up as touchdown approaches, so the divert is done early (high) and
-        # the last seconds are flown (almost) vertically -- with the burn
-        # running all the way to contact there is no final phase to clean up
-        # a late lateral error.  Quadratic costs, not constraints.
-        if cfg.mode != "fuel":
-            tgo_k = t_f - t_k
-            # A quadratic pull grows with the square of the offset: from far
-            # off (a long divert) it would swamp the soft flyability limits
-            # (lateral-speed envelope) and the plan would rush sideways.  Its
-            # strength is that of a ``lateral_position_ref`` offset at most;
-            # the final approach (last ~6 s) keeps its full weight.
-            d0 = math.hypot(float(r0[0]) - float(cfg.target_xy[0]), float(r0[1]) - float(cfg.target_xy[1]))
-            far = min(1.0, (self.lateral_position_ref / max(d0, 1e-6)) ** 2)
-            wr = np.maximum(self.lateral_position_weight * far, np.interp(tgo_k, self.approach_t, self.approach_pos_w * np.array([1.0, 1.0, far, far])))
-            wvv = np.maximum(self.lateral_velocity_weight, np.interp(tgo_k, self.approach_t, self.approach_vel_w))
-            tx, ty = float(cfg.target_xy[0]), float(cfg.target_xy[1])
-            for k in range(1, N + 1):
-                for c_, t_ in ((0, tx), (1, ty)):
-                    add_p(S(k, c_), S(k, c_), 2 * wr[k] * w[k])
-                    q[S(k, c_)] += -2 * wr[k] * w[k] * t_
-                    const += wr[k] * w[k] * t_ * t_
-                add_p(S(k, 3), S(k, 3), 2 * wvv[k] * w[k])
-                add_p(S(k, 4), S(k, 4), 2 * wvv[k] * w[k])
-            # in the last seconds sideways thrust (= tilt) itself is costly
-            for k in range(N + 1):
-                if tgo_k[k] < self.vertical_final_t:
-                    f = 1.0 - tgo_k[k] / self.vertical_final_t
-                    for c_ in (0, 1):
-                        add_p(U(k, c_), U(k, c_), 2 * self.vertical_final_w * f * w[k])
-        jw = jerk_w / dt
+            q[U(k, 3)] += w[k]
+            for c_ in (0, 1):
+                add_p(U(k, c_), U(k, c_), 2 * self.lateral_accel_weight * w[k])
+        const += cfg.time_weight * t_f
+        tgo_k = t_f - t_k
+        wr = np.interp(tgo_k, self.approach_t, self.approach_pos_w)
+        wvv = np.interp(tgo_k, self.approach_t, self.approach_vel_w)
+        tx, ty = float(cfg.target_xy[0]), float(cfg.target_xy[1])
+        for k in range(1, N + 1):
+            if wr[k] <= 0.0 and wvv[k] <= 0.0:
+                continue
+            for c_, t_ in ((0, tx), (1, ty)):
+                add_p(S(k, c_), S(k, c_), 2 * wr[k] * w[k])
+                q[S(k, c_)] += -2 * wr[k] * w[k] * t_
+                const += wr[k] * w[k] * t_ * t_
+                add_p(S(k, 3 + c_), S(k, 3 + c_), 2 * wvv[k] * w[k])
+        jw = self.jerk_weight / dt
         for k in range(N):
             for c in range(3):
                 # Lateral jerk costs more: lateral thrust means tilting the
                 # whole vehicle, and fast tilt reversals are what look like rocking.
-                jc = jw * (self.lateral_jerk_factor if c < 2 and cfg.mode != "fuel" else 1.0)
+                jc = jw * (self.lateral_jerk_factor if c < 2 else 1.0)
                 add_p(U(k, c), U(k, c), 2 * jc)
                 add_p(U(k + 1, c), U(k + 1, c), 2 * jc)
                 add_p(U(k, c), U(k + 1, c), -2 * jc)
@@ -631,23 +626,15 @@ class Planner3D:
             wgt = self.terminal_position_weight if c < 3 else self.terminal_velocity_weight
             q[iep + c] = wgt
             q[iem + c] = wgt
-        # Relaxed levels keep the limits as (cheap) preferences only.
-        lax1 = 0.02 if cfg.relax >= 1 else 1.0
-        lax2 = 0.05 if cfg.relax >= 2 else 1.0
-        q[isg:isg + N] = self.glide_slope_weight * lax2
         q[ifs] = self.fuel_slack_weight
-        q[isk:isk + N] = self.sink_envelope_weight * lax1
-        q[ivs:ivs + N] = self.lateral_speed_weight * dt * lax2
+        q[isk:isk + N] = self.sink_envelope_weight
         q[iao:iao + N] = self.aoa_weight * dt
-        # only the last seconds: earlier a low, far booster must not be
-        # pushed up to get inside it
-        q[iap:iap + N] = self.approach_cone_weight * dt * lax2 * np.interp(t_f - t_k[1:], self.approach_cone_t, [1.0, 0.0])
-        q[ikp:icl] = self.keep_out_weight * dt
-        q[icl:n] = cfg.climb_weight * dt
+        q[igr:igr + N] = self.ground_weight * dt
+        q[ikp:n] = self.keep_out_weight * dt
         for i in range(n):
             add_p(i, i, 1e-7)
         P = hessian.matrix()
-        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, isg=isg, ifs=ifs, ivs=ivs, iao=iao, ikp=ikp, icl=icl, n=n,
+        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, ifs=ifs, iao=iao, igr=igr, ikp=ikp, n=n,
                       NX=NX, G=Gm)
         return P, q, A, b_vec, n_zero, n_nonneg, soc_dims, layout, drag, const
 
@@ -671,10 +658,10 @@ class Planner3D:
             t_f=float(t_f), dt=L["dt"], r=X[:, 0:3].copy(), v=X[:, 3:6].copy(), z=X[:, 6].copy(),
             u=Uc[:, 0:3].copy(), sigma=Uc[:, 3].copy(), drag=drag, status=status, objective=obj,
             terminal_position_error=float(np.linalg.norm(e[0:3])), terminal_velocity_error=float(np.linalg.norm(e[3:6])),
-            glide_violation=float(np.max(x[L["isg"]: L["isg"] + N], initial=0.0)), fuel_violation=float(max(0.0, x[L["ifs"]])),
-            lateral_violation=float(np.max(x[L["ivs"]: L["ivs"] + N], initial=0.0)),
+            fuel_violation=float(max(0.0, x[L["ifs"]])),
             aoa_violation=float(np.max(x[L["iao"]: L["iao"] + N], initial=0.0)),
-            keep_out_violation=float(np.max(x[L["ikp"]: L["icl"]], initial=0.0)), relax=int(cfg.relax),
+            ground_violation=float(np.max(x[L["igr"]: L["igr"] + N], initial=0.0)),
+            keep_out_violation=float(np.max(x[L["ikp"]: L["n"]], initial=0.0)),
         )
 
     def search(self, r0, v0, m0, lo, hi, cfg, evaluations=10):

@@ -116,7 +116,7 @@ def test_planner_tilt_cone_leans_into_the_wind():
     if not P.available:
         return
     # hold position above the pad against a steady 1 m/s^2 eastward wind drag
-    cfg = PlanConfig3D(mode="smooth", thrust_min=0.2 * 360e3, thrust_max=0.85 * 360e3, isp=282.0, dry_mass=8150.0,
+    cfg = PlanConfig3D(thrust_min=0.2 * 360e3, thrust_max=0.85 * 360e3, isp=282.0, dry_mass=8150.0,
                        sigma_now=9.8, u_now=(-1.0, 0.0, 9.8), engine_on=True, max_tilt_deg=2.0, touchdown_speed=1.2,
                        sink_gain=0.5, drag_model=lambda t: np.tile([1.0, 0.0, 0.0], (len(t), 1)),
                        tilt_trim=(-1.0, 0.0), trim_fade=(0.0, 0.1))
@@ -127,25 +127,24 @@ def test_planner_tilt_cone_leans_into_the_wind():
     assert plan.terminal_position_error < 0.5
 
 
-def test_planner_climb_cost_stops_a_needless_loft():
+def test_the_final_time_is_the_optimisers_and_it_does_not_loft():
     from lander3d.planner import PlanConfig3D, Planner3D
 
     P = Planner3D()
     if not P.available:
         return
-    # low and 150 m off, more time than the divert needs: without a cost on
-    # climbing the plan spends the spare time lofting (gravity losses are the
-    # same whatever the path); with it, it stays at its height
+    # low and 150 m off: the cost J = propellant + time picks the final time
+    # (a longer burn costs ~g per second of gravity loss), and the cheapest
+    # route does not climb -- no envelope makes it do anything else
     r0, v0 = np.array([-150.0, 0.0, 87.0]), np.array([0.0, 0.0, -5.0])
-    tops = []
-    for cw in (0.0, 30.0):
-        cfg = PlanConfig3D(mode="smooth", thrust_min=0.2 * 360e3, thrust_max=0.85 * 360e3, isp=282.0, dry_mass=8150.0,
-                           sigma_now=3.6, u_now=(0.0, 0.0, 3.6), engine_on=True, max_tilt_deg=40.0, touchdown_speed=1.2,
-                           sink_gain=0.5, lateral_ref_height=87.0, climb_weight=cw)
-        plan = P.solve(r0, v0, 12150.0, 30.0, cfg)
-        assert plan is not None and plan.reaches_pad
-        tops.append(float(plan.r[:, 2].max()))
-    assert tops[0] > 110.0 and tops[1] < 87.5
+    cfg = PlanConfig3D(thrust_min=0.2 * 360e3, thrust_max=0.85 * 360e3, isp=282.0, dry_mass=8150.0,
+                       sigma_now=3.6, u_now=(0.0, 0.0, 3.6), engine_on=True, max_tilt_deg=65.0, touchdown_speed=1.2,
+                       sink_gain=0.5, ground_alt=0.0, time_weight=1.0)
+    best = P.search(r0, v0, 12150.0, 8.0, 40.0, cfg)
+    assert best.reaches_pad and 18.0 < best.t_f < 32.0
+    rushed, slow = (P.solve(r0, v0, 12150.0, t, cfg) for t in (12.0, 40.0))
+    assert rushed.objective > best.objective + 100.0 and slow.objective > best.objective
+    assert float(best.r[:, 2].max()) < 88.0          # no loft: nothing in the cost asks for one
 
 
 def test_aoa_limit_does_not_push_downwind_while_rising():
@@ -162,7 +161,7 @@ def test_aoa_limit_does_not_push_downwind_while_rising():
     assert abs(out[2] - accel[2]) < 1e-9                  # vertical part kept
 
 
-def test_low_far_catch_burn_is_not_locked_too_long():
+def test_low_far_catch_burn_time_is_searched_not_predicted():
     from lander3d.sim import PHYSICS_DT
 
     sim = Sim3D(cfd=False)
@@ -173,9 +172,9 @@ def test_low_far_catch_burn_is_not_locked_too_long():
     while not ap.burn_locked and sim.time < 3.0:         # lights almost at once (low, slow, far off)
         sim.step(PHYSICS_DT)
     assert ap.burn_locked and ap.plan is not None and ap.plan.reaches_pad
-    # the vertical-burn estimate alone locks ~34 s (and the plan then lofts
-    # to ~250 m); the earliest reachable time is ~20 s
-    assert ap.touchdown_time - ap.elapsed < 26.0
+    # the vertical-burn estimate alone says ~34 s (locked to it, the plan
+    # used to loft to ~250 m); the final time is the one minimising J
+    assert ap.touchdown_time - ap.elapsed < 32.0
     assert float(ap.plan.r[:, 2].max()) < 100.0
 
 
