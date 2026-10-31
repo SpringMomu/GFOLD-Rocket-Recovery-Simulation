@@ -416,13 +416,15 @@ class Planner3D:
 
         mid = (np.arange(N) + 0.5) * dt
         Gm = None
-        q_mid = w_mid = None
+        q_mid = w_mid = dq_mid = None
         if cfg.drag_model is not None:
             res = cfg.drag_model(mid)
             if isinstance(res, tuple):
                 drag, Gm = np.asarray(res[0], float).reshape(N, 3), np.asarray(res[1], float).reshape(N, 3, 3)
                 if len(res) > 3:
                     q_mid, w_mid = np.asarray(res[2], float).reshape(N), np.asarray(res[3], float).reshape(N, 3)
+                if len(res) > 4:
+                    dq_mid = np.asarray(res[4], float).reshape(N)
             else:
                 drag = np.asarray(res, float).reshape(N, 3)
         else:
@@ -516,16 +518,37 @@ class Planner3D:
             # booster cannot hold against the aerodynamic moment -- e.g.
             # flying nose-first towards the pad in a fast low divert.  Kept
             # compatible with the tilt cone, so the problem stays feasible.
+            # The limit depends on the dynamic pressure, which depends on the
+            # height (a cross wind is weaker lower down): linearised in the
+            # knot's height about the reference, with the thrust at its
+            # reference ~g in that term, so that flying lower to lean into
+            # the wind is visible to the optimiser.
+            h_mid = np.asarray(cfg.height_ref(mid), float) if cfg.height_ref is not None else None
             for k in range(1, N + 1):
                 w = w_mid[k - 1]
-                if q_mid[k - 1] <= cfg.q_aoa[0][0] or not np.any(w):
+                if not np.any(w):
                     continue
-                aoa = math.radians(float(np.interp(q_mid[k - 1], *cfg.q_aoa)))
-                aoa = max(aoa, math.acos(float(np.clip(w[2], -1.0, 1.0))) - tilt[k] + math.radians(3.0))
-                if aoa < math.radians(170.0):
-                    # soft (slack in m/s^2 of thrust off the allowed cone):
-                    # thrust-rate limits may not allow an instant turn
-                    row([(U(k, 3), math.cos(aoa)), (iao + k - 1, -1.0)] + [(U(k, c), -float(w[c])) for c in range(3)], 0.0)
+                floor = math.acos(float(np.clip(w[2], -1.0, 1.0))) - tilt[k] + math.radians(3.0)
+
+                def cos_lim(qq, floor=floor):
+                    return math.cos(max(math.radians(float(np.interp(qq, *cfg.q_aoa))), floor))
+
+                qk = float(q_mid[k - 1])
+                c0 = cos_lim(qk)
+                dc = 0.0
+                if dq_mid is not None and h_mid is not None:
+                    dlt = max(20.0, 0.05 * qk)
+                    dc = (cos_lim(qk + dlt) - cos_lim(max(0.0, qk - dlt))) / (qk + dlt - max(0.0, qk - dlt)) * float(dq_mid[k - 1])
+                if c0 <= math.cos(math.radians(170.0)) and dc == 0.0:
+                    continue
+                # soft (slack in m/s^2 of thrust off the allowed cone):
+                # thrust-rate limits may not allow an instant turn
+                terms = [(U(k, 3), c0), (iao + k - 1, -1.0)] + [(U(k, c), -float(w[c])) for c in range(3)]
+                rhs = 0.0
+                if dc != 0.0:
+                    terms.append((S(k, 2), G0 * dc))
+                    rhs = G0 * dc * float(h_mid[k - 1])
+                row(terms, rhs)
         # The first knot may keep the current thrust direction (attitude lag),
         # but no more: a looser first knot is flown for the whole replan
         # period and the tracker clips it anyway.
