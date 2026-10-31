@@ -125,3 +125,73 @@ def test_planner_tilt_cone_leans_into_the_wind():
     lean = np.degrees(np.arctan2(-plan.u[:-1, 0], plan.u[:-1, 2]))
     assert lean.min() > 3.0                        # leans west to hold against the drag (2 deg cone about ~5.8)
     assert plan.terminal_position_error < 0.5
+
+
+def test_planner_climb_cost_stops_a_needless_loft():
+    from lander3d.planner import PlanConfig3D, Planner3D
+
+    P = Planner3D()
+    if not P.available:
+        return
+    # low and 150 m off, more time than the divert needs: without a cost on
+    # climbing the plan spends the spare time lofting (gravity losses are the
+    # same whatever the path); with it, it stays at its height
+    r0, v0 = np.array([-150.0, 0.0, 87.0]), np.array([0.0, 0.0, -5.0])
+    tops = []
+    for cw in (0.0, 30.0):
+        cfg = PlanConfig3D(mode="smooth", thrust_min=0.2 * 360e3, thrust_max=0.85 * 360e3, isp=282.0, dry_mass=8150.0,
+                           sigma_now=3.6, u_now=(0.0, 0.0, 3.6), engine_on=True, max_tilt_deg=40.0, touchdown_speed=1.2,
+                           sink_gain=0.5, lateral_ref_height=87.0, climb_weight=cw)
+        plan = P.solve(r0, v0, 12150.0, 30.0, cfg)
+        assert plan is not None and plan.reaches_pad
+        tops.append(float(plan.r[:, 2].max()))
+    assert tops[0] > 110.0 and tops[1] < 87.5
+
+
+def test_aoa_limit_does_not_push_downwind_while_rising():
+    from lander3d.autopilot import Autopilot3D
+    from lander3d.vehicle import G0, Vehicle
+
+    veh = Vehicle()
+    veh.reset(position=(0.0, 0.0, 120.0), velocity=(0.0, 0.0, 12.0), on_pad=False)
+    veh.last["q"] = 450.0
+    wind = np.array([0.0, 22.0, 0.0])                    # from the south, the booster climbing
+    accel = np.array([0.0, -2.0, G0 + 2.0])              # lean into the wind
+    out = Autopilot3D._aoa_limit(veh, accel, wind, math.radians(75.0))
+    assert out[1] <= 1e-9                                 # never turned downwind (+y)
+    assert abs(out[2] - accel[2]) < 1e-9                  # vertical part kept
+
+
+def test_low_far_catch_burn_is_not_locked_too_long():
+    from lander3d.sim import PHYSICS_DT
+
+    sim = Sim3D(cfd=False)
+    if not sim.autopilot.planner.available:
+        return
+    sim.load_scenario(9)                                 # behind the tower, 150 m off, 87 m above the catch point
+    ap = sim.autopilot
+    while not ap.burn_locked and sim.time < 3.0:         # lights almost at once (low, slow, far off)
+        sim.step(PHYSICS_DT)
+    assert ap.burn_locked and ap.plan is not None and ap.plan.reaches_pad
+    # the vertical-burn estimate alone locks ~34 s (and the plan then lofts
+    # to ~250 m); the earliest reachable time is ~20 s
+    assert ap.touchdown_time - ap.elapsed < 26.0
+    assert float(ap.plan.r[:, 2].max()) < 100.0
+
+
+def test_catch_hold_bias_includes_what_the_model_misses():
+    from lander3d.autopilot import Autopilot3D
+    from lander3d.vehicle import Vehicle
+
+    ap = Autopilot3D()
+    veh = Vehicle()
+    veh.reset(position=(0.0, 0.0, 50.0), on_pad=False)
+    m = veh.mass
+    ap.cmd_accel = np.array([-0.7, 0.0, 9.8])
+    # the thrust delivers only part of the commanded lean (gimbal holding the
+    # attitude), the wind pushes east at 0.75 m/s^2
+    veh.last["thrust"] = np.array([-0.45, 0.0, 9.8]) * m
+    veh.last["aero"] = np.array([0.75, 0.0, 0.0]) * m
+    for _ in range(2000):
+        ap._update_hold_bias(veh, 1.0 / 240.0)
+    assert np.allclose(ap._hold_bias, [-1.0, 0.0], atol=1e-3)

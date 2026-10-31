@@ -80,6 +80,16 @@ class PlanConfig3D:
     # like the tracker's tilt budget.
     tilt_trim: tuple = (0.0, 0.0)
     trim_fade: tuple = (0.5, 5.5)    # m above the gate: upright below, full trim above
+    # Cost per metre (per second) of planned height above ``climb_ref_height``
+    # (soft; planner coordinates, default the current height -- normally
+    # the height at ignition).  With the burn time fixed, gravity losses do
+    # not depend on the path, so without it nothing resists a loft that only
+    # eases the soft envelopes -- and up there the wind is stronger and
+    # comes from above the climbing booster.  Only height above the reference
+    # counts: a descending burn that brakes a little too hard may climb back
+    # freely, and a climb over an obstacle (keep-out, far costlier) still wins.
+    climb_weight: float = 0.0
+    climb_ref_height: float | None = None
 
 
 @dataclass
@@ -349,7 +359,9 @@ class Planner3D:
         ikp = iap + N                  # keep-out slacks, one per half-space
         t_k = np.arange(N + 1) * dt
         keep = [kp for kp in cfg.keep_out(t_k) if kp[0] >= 1] if cfg.keep_out is not None else []
-        n = ikp + len(keep)
+        icl = ikp + len(keep)          # loft slacks (height above climb_ref_height), knots 1..N
+        n_cl = N if cfg.climb_weight > 0.0 else 0
+        n = icl + n_cl
 
         def S(k, c):
             return NX * k + c
@@ -425,6 +437,11 @@ class Planner3D:
         for j, (k, nrm, b_) in enumerate(keep):
             row([(ikp + j, -1.0)], 0.0)
             row([(S(k, c), -float(nrm[c])) for c in range(3) if nrm[c] != 0.0] + [(ikp + j, -1.0)], -b_)
+        h_ref = float(r0[2]) if cfg.climb_ref_height is None else float(cfg.climb_ref_height)
+        for k in range(n_cl):
+            # c_k >= max(0, h_(k+1) - h_ref)
+            row([(icl + k, -1.0)], 0.0)
+            row([(S(k + 1, 2), 1.0), (icl + k, -1.0)], h_ref)
         if cfg.sink_gain > 0.0:
             # vz_k >= -(v_td + c (h_k - h_target)) - s_k   (linear in the state)
             c_s = cfg.sink_gain
@@ -625,11 +642,12 @@ class Planner3D:
         # only the last seconds: earlier a low, far booster must not be
         # pushed up to get inside it
         q[iap:iap + N] = self.approach_cone_weight * dt * lax2 * np.interp(t_f - t_k[1:], self.approach_cone_t, [1.0, 0.0])
-        q[ikp:n] = self.keep_out_weight * dt
+        q[ikp:icl] = self.keep_out_weight * dt
+        q[icl:n] = cfg.climb_weight * dt
         for i in range(n):
             add_p(i, i, 1e-7)
         P = hessian.matrix()
-        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, isg=isg, ifs=ifs, ivs=ivs, iao=iao, ikp=ikp, n=n,
+        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, isg=isg, ifs=ifs, ivs=ivs, iao=iao, ikp=ikp, icl=icl, n=n,
                       NX=NX, G=Gm)
         return P, q, A, b_vec, n_zero, n_nonneg, soc_dims, layout, drag, const
 
@@ -656,7 +674,7 @@ class Planner3D:
             glide_violation=float(np.max(x[L["isg"]: L["isg"] + N], initial=0.0)), fuel_violation=float(max(0.0, x[L["ifs"]])),
             lateral_violation=float(np.max(x[L["ivs"]: L["ivs"] + N], initial=0.0)),
             aoa_violation=float(np.max(x[L["iao"]: L["iao"] + N], initial=0.0)),
-            keep_out_violation=float(np.max(x[L["ikp"]: L["n"]], initial=0.0)), relax=int(cfg.relax),
+            keep_out_violation=float(np.max(x[L["ikp"]: L["icl"]], initial=0.0)), relax=int(cfg.relax),
         )
 
     def search(self, r0, v0, m0, lo, hi, cfg, evaluations=10):
