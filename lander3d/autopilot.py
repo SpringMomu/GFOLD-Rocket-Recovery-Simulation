@@ -661,11 +661,13 @@ class Autopilot3D:
         """For the display: None, or (kind, status) -- 'fail' when the last
         re-plans found no solution (shown for 2 s), 'miss' when the plan in
         hand does not reach the gate."""
-        if not self.burn_locked:
+        if not self.burn_locked or self._holding:
+            # holding at the gate (or after the burn) nothing is planned:
+            # the plan in hand is stale and says nothing
             return None
         if self.solver_fail is not None and self.elapsed - self.solver_fail[0] < 2.0:
             return ("fail", self.solver_fail[1])
-        if self.plan is not None and not self.plan.reaches_pad:
+        if self.plan is not None and not self.plan.reaches_pad and self.elapsed - self.plan.created_at < 1.5:
             return ("miss", self.last_status)
         return None
 
