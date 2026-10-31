@@ -102,6 +102,11 @@ class PlanConfig3D:
     # reference heights, with a margin for the attitude lag) -- a reversal
     # faster than the booster can turn is flown late and overshoots.
     slew_deg: tuple | None = None
+    # Reference thrust direction (unit vectors) at given times, for the slew
+    # limit: throttling up along a tilted direction is not turning (at
+    # ignition the engine goes from nothing to full along a body already
+    # aligned with a slanted flow).  None: vertical.
+    dir_ref: Callable | None = None
     # Cost of a second of flight, in propellant units (m/s of thrust
     # acceleration integrated): the final time is chosen on propellant +
     # time_weight * t_f -- the cheapest route, and of nearly equal ones the
@@ -641,12 +646,15 @@ class Planner3D:
             row([(U(k, 1), -1.0)], 0.0)
             row([(U(k, 2), -1.0)], 0.0)
             soc_dims.append(4)
+        d_ref = np.asarray(cfg.dir_ref(mid), float).reshape(N, 3) if cfg.dir_ref is not None else np.tile([0.0, 0.0, 1.0], (N, 1))
         for k in range(N):
-            # sideways slew: || u_xy(k+1) - u_xy(k) || <= rate dt (+ slack) --
-            # the tilt rate is the size of the change, not each axis's
+            # sideways slew: || du_xy - d_xy dsigma || <= rate dt (+ slack) --
+            # the tilt rate is the size of the change (not each axis's), and
+            # a change of thrust along the reference direction is no turn
+            dx, dy = float(d_ref[k, 0]), float(d_ref[k, 1])
             row([(isl + k, -1.0)], float(lat[k]))
-            row([(U(k + 1, 0), -1.0), (U(k, 0), 1.0)], 0.0)
-            row([(U(k + 1, 1), -1.0), (U(k, 1), 1.0)], 0.0)
+            row([(U(k + 1, 0), -1.0), (U(k, 0), 1.0), (U(k + 1, 3), dx), (U(k, 3), -dx)], 0.0)
+            row([(U(k + 1, 1), -1.0), (U(k, 1), 1.0), (U(k + 1, 3), dy), (U(k, 3), -dy)], 0.0)
             soc_dims.append(3)
 
         A = row.matrix(n)

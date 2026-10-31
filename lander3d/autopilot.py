@@ -151,6 +151,7 @@ class Autopilot3D:
     retime_step = 0.08
     retime_freeze = 5.0           # s to go: no more retiming (unless lost)
     time_search_evals = 9
+    ignition_refine = 2               # re-solves about the first plan at ignition (successive convexification)
     # Tower catch: the burn ends with the collar this high above the arm tops,
     # sinking this slowly; there the booster holds, centred, until the arms
     # have closed round the barrel, and then settles onto them.
@@ -307,8 +308,14 @@ class Autopilot3D:
             for i, t in enumerate(times):
                 u_ref = None
                 if prev is None or t < 0.3:
-                    f = max(0.0, 1.0 - t / max(t_guess, 0.5))
-                    h, v, m, sig = r0[2] + v0[2] * t * 0.5, v0 * f, m0, max(sig_now, 0.6 * s.thrust_sl / m0)
+                    T = max(t_guess, 0.5)
+                    f = max(0.0, 1.0 - t / T)
+                    # height consistent with that velocity (its integral),
+                    # not below the gate: the old guess r0 + v0 t / 2 ran far
+                    # underground on a long horizon
+                    tt = min(float(t), T)
+                    h = max(float(self.gate_height), float(r0[2] + v0[2] * (tt - 0.5 * tt * tt / T)))
+                    v, m, sig = v0 * f, m0, max(sig_now, 0.6 * s.thrust_sl / m0)
                     if t < 0.3 and veh.throttle > 0.05:
                         u_ref = veh.last["thrust"] / m0
                 else:
@@ -427,6 +434,29 @@ class Autopilot3D:
 
         return heights
 
+    def _dir_ref(self, veh):
+        """Reference thrust direction at the knot times (for the planner's
+        slew limit): the previous plan's, stretched over the new horizon like
+        the heights; at ignition (no plan yet) the body axis."""
+        prev = self.plan if self.burn_locked else None
+        now = self.elapsed
+        axis = np.asarray(veh.axis, float)
+
+        def dirs(t_knots):
+            if prev is None:
+                return np.tile(axis, (len(t_knots), 1))
+            t_end = max(float(t_knots[-1]), 1e-6)
+            t0 = now - prev.created_at
+            span = max(0.0, prev.t_f - t0)
+            out = []
+            for t in t_knots:
+                u = np.asarray(prev.sample(t0 + span * float(t) / t_end)[2], float)
+                n = float(np.linalg.norm(u))
+                out.append(u / n if n > 1e-6 else axis)
+            return np.asarray(out)
+
+        return dirs
+
     def _config(self, veh, frac, keep_out=None):
         s = veh.spec
         return PlanConfig3D(
@@ -440,7 +470,7 @@ class Autopilot3D:
             sink_gain=self.sink_gain, keep_out=keep_out, q_aoa=self._aoa_table(veh), ground_alt=self._z_ground,
             body_length=s.length,
             tilt_trim=tuple(self._gate_trim(veh)), trim_fade=self._trim_fade(), tilt_budget=TILT_BUDGET,
-            height_ref=self._height_ref(veh), slew_deg=SLEW_DEG, time_weight=self.time_weight,
+            height_ref=self._height_ref(veh), slew_deg=SLEW_DEG, dir_ref=self._dir_ref(veh), time_weight=self.time_weight,
             min_sink=1.0 if self.catch_link is None else 0.0,
         )
 
@@ -667,7 +697,15 @@ class Autopilot3D:
             return None
         if self.solver_fail is not None and self.elapsed - self.solver_fail[0] < 2.0:
             return ("fail", self.solver_fail[1])
-        if self.plan is not None and not self.plan.reaches_pad and self.elapsed - self.plan.created_at < 1.5:
+        p = self.plan
+        if p is not None and self.elapsed - p.created_at < 1.5 and (
+                p.terminal_position_error >= 1.0 or p.terminal_velocity_error >= 0.8
+                or p.keep_out_violation >= 0.5 or p.ground_violation >= 0.5):
+            # really short of the gate, or only through an obstacle / the
+            # ground.  A plan that gets there leaning past the soft angle-of-
+            # attack limit is re-searched (reaches_pad) but is not "cannot
+            # reach": in a strong wind aloft that happens for a few seconds
+            # after ignition while the linearisation settles.
             return ("miss", self.last_status)
         return None
 
@@ -1399,6 +1437,17 @@ class Autopilot3D:
         plan = self._search_time(veh, wind_now, t_est) if self.planner.available else None
         if plan is not None:
             self._commit(plan)
+            # The search linearised drag and angle of attack about a straight
+            # descent (there was no plan yet) -- in a strong wind aloft that
+            # reference hovers in a 30-40 m/s flow, and the plan breaks the
+            # angle-of-attack cone along a path it will not fly.  Two passes
+            # about the plan itself (successive convexification) before it is
+            # flown.
+            for _ in range(self.ignition_refine):
+                p = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))(self.plan.t_f)
+                if p is None:
+                    break
+                self._commit(p)
         self._next_search = self.elapsed + self.search_backoff
         self._publish()
         self.next_replan = self.elapsed + self.burn_replan_period
