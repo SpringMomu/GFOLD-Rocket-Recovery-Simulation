@@ -144,11 +144,11 @@ class ConicSolver:
     def available(self) -> bool:
         return self.backend != "feedback-fallback"
 
-    def solve(self, P, q, A, b, n_zero, n_nonneg, soc_dims):
+    def solve(self, P, q, A, b, n_zero, n_nonneg, soc_dims, max_iter=MAX_ITERATIONS):
         """Return ``(x, status)``; ``x`` is None unless the status is acceptable."""
         if self._native is not None:
             try:
-                return self._native.solve(P, q, A, b, n_zero, n_nonneg, soc_dims, MAX_ITERATIONS)
+                return self._native.solve(P, q, A, b, n_zero, n_nonneg, soc_dims, max_iter)
             except (OSError, RuntimeError, ValueError) as error:
                 self.native_error = str(error)
                 self._native = None
@@ -159,7 +159,7 @@ class ConicSolver:
         cones.extend(clarabel.SecondOrderConeT(d) for d in soc_dims)
         settings = clarabel.DefaultSettings()
         settings.verbose = False
-        settings.max_iter = MAX_ITERATIONS
+        settings.max_iter = max_iter
         try:
             result = clarabel.DefaultSolver(P, q, A, b, cones, settings).solve()
         except Exception as error:  # a solver failure must not stop the control loop

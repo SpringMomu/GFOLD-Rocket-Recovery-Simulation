@@ -206,3 +206,23 @@ def test_catch_hold_bias_includes_what_the_model_misses():
     for _ in range(2000):
         ap._update_hold_bias(veh, 1.0 / 240.0)
     assert np.allclose(ap._hold_bias, [-1.0, 0.0], atol=1e-3)
+
+
+def test_the_plan_is_solvable_from_a_state_outside_its_limits():
+    from lander3d.planner import PlanConfig3D, Planner3D
+
+    # Near the catch in a strong cross wind the booster can be outside every
+    # limit tied to its current state at once: full throttle (beyond the
+    # plan's 85 % margin), leaning the wrong way, far past the tilt budget,
+    # with the command flown elsewhere.  The plan must still come back (the
+    # limits are elastic), and say how far outside they had to be.
+    P = Planner3D()
+    tmax = 0.85 * 360e3
+    cfg = PlanConfig3D(thrust_min=0.2 * 360e3, thrust_max=tmax, isp=282.0, dry_mass=8150.0,
+                       sigma_now=360e3 / 11000.0, u_now=(12.0, -6.0, 30.0), u_cmd=(-3.0, 2.0, 12.0), engine_on=True,
+                       max_tilt_deg=2.0, touchdown_speed=1.2, sink_gain=0.5, tilt_trim=(-1.5, 0.0), trim_fade=(0.0, 0.1),
+                       tilt_budget=((0.0, 3.0, 40.0), (0.6, 5.0, 20.0)), slew_deg=((2.0, 30.0), (8.0, 15.0)))
+    plan = P.solve(np.array([2.0, -1.0, 8.0]), np.array([1.5, 0.0, -2.0]), 11000.0, 4.0, cfg)
+    assert plan is not None
+    assert plan.limit_violation > 0.5 and not plan.reaches_pad
+    assert abs(plan.sigma[0] - tmax / 11000.0) < 0.2 * tmax / 11000.0    # starts where the engine can be

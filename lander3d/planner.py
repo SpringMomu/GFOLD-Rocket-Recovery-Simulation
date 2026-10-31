@@ -102,6 +102,11 @@ class PlanConfig3D:
     # reference heights, with a margin for the attitude lag) -- a reversal
     # faster than the booster can turn is flown late and overshoots.
     slew_deg: tuple | None = None
+    # Reference thrust direction (unit vectors) at given times, for the slew
+    # limit: throttling up along a tilted direction is not turning (at
+    # ignition the engine goes from nothing to full along a body already
+    # aligned with a slanted flow).  None: vertical.
+    dir_ref: Callable | None = None
     # Cost of a second of flight, in propellant units (m/s of thrust
     # acceleration integrated): the final time is chosen on propellant +
     # time_weight * t_f -- the cheapest route, and of nearly equal ones the
@@ -300,6 +305,7 @@ class Plan3D:
     aoa_violation: float = 0.0        # m/s^2 of thrust outside the angle-of-attack cone
     keep_out_violation: float = 0.0   # m inside an obstacle
     ground_violation: float = 0.0     # m below the ground
+    limit_violation: float = 0.0      # m/s^2 outside the tilt cone / slew rate / first-knot thrust (now)
     created_at: float = 0.0
 
     @property
@@ -313,7 +319,7 @@ class Plan3D:
         # count: the tracker cannot fly such a plan.
         return (self.terminal_position_error < 1.0 and self.terminal_velocity_error < 0.8
                 and self.fuel_violation < 1e-3 and self.keep_out_violation < 0.5
-                and self.ground_violation < 0.5 and self.aoa_violation < 2.0)
+                and self.ground_violation < 0.5 and self.aoa_violation < 2.0 and self.limit_violation < 1.0)
 
     @property
     def final_mass(self) -> float:
@@ -377,6 +383,7 @@ class Planner3D:
     aoa_weight = 100.0             # per m/s^2 of thrust outside the angle-of-attack cone (per s)
     keep_out_weight = 2000.0       # per m inside an obstacle's half-space (per s)
     ground_weight = 2000.0         # per m below the ground (per s)
+    elastic_weight = 1.0e4         # per m/s^2 outside a state-tied limit (tilt cone, slew, first knot)
 
     def __init__(self) -> None:
         self.solve_count = 0
@@ -415,7 +422,17 @@ class Planner3D:
         ikp = imn + N                  # keep-out slacks, one per half-space
         t_k = np.arange(N + 1) * dt
         keep = [kp for kp in cfg.keep_out(t_k) if kp[0] >= 1] if cfg.keep_out is not None else []
-        n = ikp + len(keep)
+        # Elastic slacks of the limits tied to the state the booster is in
+        # now (tilt cone, slew rate, the first knot pinned to the current
+        # thrust): the actual vehicle can be outside them -- leaning further
+        # than the budget in a gust, at full throttle in the feedback margin
+        # -- and then no plan satisfies them all.  Heavily penalised, so they
+        # bind exactly whenever they can, but the problem is always feasible.
+        itc = ikp + len(keep)          # tilt cone, knots 0..N
+        isl = itc + N + 1              # lateral slew, intervals 0..N-1
+        ipn = isl + N                  # first knot: thrust magnitude, vertical thrust
+        icn = ipn + 2                  # first knot sideways: command continuity, lag behind the vehicle
+        n = icn + 2
 
         def S(k, c):
             return NX * k + c
@@ -487,6 +504,8 @@ class Planner3D:
             row([(igr + k, -1.0)], 0.0)
         for k in range(N):
             row([(imn + k, -1.0)], 0.0)
+        for i in range(itc, n):
+            row([(i, -1.0)], 0.0)
         if math.isfinite(cfg.ground_alt):
             # the ground: h_k + s_k >= h_ground  (the last knot is the gate)
             for k in range(1, N):
@@ -584,7 +603,7 @@ class Planner3D:
             # upright at the very end like the tracker's)
             axis = np.array([float(cfg.tilt_trim[0]) * fade[k], float(cfg.tilt_trim[1]) * fade[k], G0])
             axis /= np.linalg.norm(axis)
-            row([(U(k, 3), float(cos_tilt[k]))] + [(U(k, c), -float(axis[c])) for c in range(3) if axis[c] != 0.0], 0.0)
+            row([(U(k, 3), float(cos_tilt[k])), (itc + k, -1.0)] + [(U(k, c), -float(axis[c])) for c in range(3) if axis[c] != 0.0], 0.0)
         rate_s = 0.8 * 1.2 * cfg.thrust_max / m0 * dt
         lat = np.full(N, self.lateral_rate)
         if cfg.slew_deg is not None:
@@ -594,18 +613,29 @@ class Planner3D:
         for k in range(N):
             row([(U(k + 1, 3), 1.0), (U(k, 3), -1.0)], rate_s)
             row([(U(k, 3), 1.0), (U(k + 1, 3), -1.0)], rate_s)
-            for c in (0, 1):
-                row([(U(k + 1, c), 1.0), (U(k, c), -1.0)], float(lat[k]))
-                row([(U(k, c), 1.0), (U(k + 1, c), -1.0)], float(lat[k]))
         spool = 0.8 * 1.2 * cfg.thrust_max / m0 * 0.15
-        row([(U(0, 3), 1.0)], cfg.sigma_now + spool)
-        row([(U(0, 3), -1.0)], -(cfg.sigma_now - spool))
+        row([(U(0, 3), 1.0), (ipn, -1.0)], cfg.sigma_now + spool)
+        row([(U(0, 3), -1.0), (ipn, -1.0)], -(cfg.sigma_now - spool))
         if cfg.engine_on:
             # Vertical thrust is pinned near the current value (engine spool);
-            # the lateral components are only pulled toward it by the cost,
-            # so a lagging attitude never makes the problem infeasible.
-            row([(U(0, 2), 1.0)], cfg.u_now[2] + spool + 1.0)
-            row([(U(0, 2), -1.0)], -(cfg.u_now[2] - spool - 1.0))
+            # the lateral components are only pulled toward it by the cost.
+            row([(U(0, 2), 1.0), (ipn + 1, -1.0)], cfg.u_now[2] + spool + 1.0)
+            row([(U(0, 2), -1.0), (ipn + 1, -1.0)], -(cfg.u_now[2] - spool - 1.0))
+            # Sideways, the first knot continues the command being flown
+            # (re-plans must not jump it: five re-plans a second, each free to
+            # start elsewhere, swung the command far faster than the slew
+            # limit inside a plan -- the body lagged a second behind and the
+            # booster crossed the catch axis at 4 m/s between the arms), and
+            # that command may run ahead of what the vehicle is really doing
+            # by about one attitude lag of slew, no more.
+            slew_now = float(lat[0]) / dt
+            lag_band = 0.8 * slew_now / self.slew_margin + 0.5
+            for c in (0, 1):
+                if cfg.u_cmd is not None:
+                    row([(U(0, c), 1.0), (icn, -1.0)], float(cfg.u_cmd[c]) + 0.1)
+                    row([(U(0, c), -1.0), (icn, -1.0)], -(float(cfg.u_cmd[c]) - 0.1))
+                row([(U(0, c), 1.0), (icn + 1, -1.0)], float(cfg.u_now[c]) + lag_band)
+                row([(U(0, c), -1.0), (icn + 1, -1.0)], -(float(cfg.u_now[c]) - lag_band))
         n_nonneg = len(row) - n_zero
 
         # ---- second-order cones
@@ -616,6 +646,16 @@ class Planner3D:
             row([(U(k, 1), -1.0)], 0.0)
             row([(U(k, 2), -1.0)], 0.0)
             soc_dims.append(4)
+        d_ref = np.asarray(cfg.dir_ref(mid), float).reshape(N, 3) if cfg.dir_ref is not None else np.tile([0.0, 0.0, 1.0], (N, 1))
+        for k in range(N):
+            # sideways slew: || du_xy - d_xy dsigma || <= rate dt (+ slack) --
+            # the tilt rate is the size of the change (not each axis's), and
+            # a change of thrust along the reference direction is no turn
+            dx, dy = float(d_ref[k, 0]), float(d_ref[k, 1])
+            row([(isl + k, -1.0)], float(lat[k]))
+            row([(U(k + 1, 0), -1.0), (U(k, 0), 1.0), (U(k + 1, 3), dx), (U(k, 3), -dx)], 0.0)
+            row([(U(k + 1, 1), -1.0), (U(k, 1), 1.0), (U(k + 1, 3), dy), (U(k, 3), -dy)], 0.0)
+            soc_dims.append(3)
 
         A = row.matrix(n)
         b_vec = row.rhs
@@ -681,11 +721,13 @@ class Planner3D:
         q[imn:imn + N] = self.sink_envelope_weight
         q[iao:iao + N] = self.aoa_weight * dt
         q[igr:igr + N] = self.ground_weight * dt
-        q[ikp:n] = self.keep_out_weight * dt
+        q[ikp:itc] = self.keep_out_weight * dt
+        q[itc:n] = self.elastic_weight
+        q[icn] = 0.1 * self.elastic_weight     # continuity gives way to the vehicle's own lag
         for i in range(n):
             add_p(i, i, 1e-7)
         P = hessian.matrix()
-        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, ifs=ifs, iao=iao, igr=igr, ikp=ikp, n=n,
+        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, ifs=ifs, iao=iao, igr=igr, ikp=ikp, itc=itc, n=n,
                       NX=NX, G=Gm)
         return P, q, A, b_vec, n_zero, n_nonneg, soc_dims, layout, drag, const
 
@@ -694,6 +736,11 @@ class Planner3D:
             return None
         P, q, A, b, nz, nn, socs, L, drag, const = self.build(r0, v0, m0, t_f, cfg)
         x, status = self.solver.solve(P, q, A, b, nz, nn, socs)
+        if x is None and status not in ("no-solver",):
+            # The problem is always feasible (every state-tied limit is
+            # elastic), so a failure is numerical -- the iteration cap or no
+            # progress on a badly scaled step: once more with more room.
+            x, status = self.solver.solve(P, q, A, b, nz, nn, socs, max_iter=400)
         self.last_status = status
         if x is None:
             return None
@@ -712,7 +759,8 @@ class Planner3D:
             fuel_violation=float(max(0.0, x[L["ifs"]])),
             aoa_violation=float(np.max(x[L["iao"]: L["iao"] + N], initial=0.0)),
             ground_violation=float(np.max(x[L["igr"]: L["igr"] + N], initial=0.0)),
-            keep_out_violation=float(np.max(x[L["ikp"]: L["n"]], initial=0.0)),
+            keep_out_violation=float(np.max(x[L["ikp"]: L["itc"]], initial=0.0)),
+            limit_violation=float(np.max(x[L["itc"]: L["n"] - 2], initial=0.0)),
         )
 
     def search(self, r0, v0, m0, lo, hi, cfg, evaluations=10):
