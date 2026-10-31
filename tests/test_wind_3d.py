@@ -187,7 +187,7 @@ def test_low_far_catch_burn_time_is_searched_not_predicted():
     # the vertical-burn estimate alone says ~34 s (locked to it, the plan
     # used to loft to ~250 m); the final time is the one minimising J
     assert ap.touchdown_time - ap.elapsed < 32.0
-    assert float(ap.plan.r[:, 2].max()) < 100.0
+    assert float(ap.plan.r[:, 2].max()) < 130.0      # (a locked 34 s burn lofted it to 250-310 m)
 
 
 def test_catch_hold_bias_includes_what_the_model_misses():

@@ -50,7 +50,7 @@ def test_a_plan_through_a_physical_limit_does_not_reach():
     plan = Plan3D(t_f=10.0, dt=1.0, r=z, v=z, z=z, u=z, sigma=z, drag=z, status="Solved", objective=0.0,
                   terminal_position_error=0.2, terminal_velocity_error=0.1, fuel_violation=0.0)
     assert plan.reaches_pad
-    for limit in ("keep_out_violation", "ground_violation", "aoa_violation"):
+    for limit in ("keep_out_violation", "ground_violation"):
         setattr(plan, limit, 5.0)
         assert not plan.reaches_pad
         setattr(plan, limit, 0.0)
@@ -91,28 +91,22 @@ def test_snapshot_is_valid_json_for_the_browser():
     assert json.loads(text)["scenario"] == sim.scenario_name
 
 
-def _first_phase(pos, vel):
-    sim = Sim3D(cfd=False)
-    sim.vehicle.reset(position=pos, velocity=vel, propellant=4000, on_pad=False)
-    sim.vehicle.pos[2] += sim.vehicle.rest_height
-    sim.autopilot.reset()
-    sim.autopilot_on = True
-    sim.step(1.0 / 240.0)
-    return sim.autopilot.phase
-
-
-def test_mid_range_miss_boosts_back_instead_of_a_low_sideways_burn():
-    # ~240 m off from a slow 2 km fall: the glide cannot remove it and the
-    # landing burn would brake to a hover at ~80 m to traverse sideways.
-    assert _first_phase((150.0, 100.0, 2000.0), (0.0, 0.0, -30.0)) == "BOOSTBACK"
-    # A small (wind) drift is left to the glide.
-    assert _first_phase((0.0, 0.0, 2000.0), (0.0, 0.0, -30.0)) == "COAST"
-
-
-def test_low_far_booster_hops_instead_of_a_long_powered_traverse():
-    # 2 km off at 600 m, at rest: the landing burn would traverse at ~20 m/s
-    # for ~75 s (gravity loss all the way) and run the tank dry.
-    assert _first_phase((2000.0, 0.0, 600.0), (0.0, 0.0, 0.0)) == "BOOSTBACK"
+def test_the_engine_lights_at_most_twice():
+    # one boost-back and one landing burn: a third start is refused
+    veh = Vehicle()
+    veh.reset(position=(0.0, 0.0, 3000.0), propellant=3000.0, on_pad=False)
+    for _ in range(3):
+        veh.controls.throttle = 0.5
+        for _ in range(60):
+            veh.step(1.0 / 240.0)
+        veh.controls.throttle = 0.0
+        for _ in range(240):
+            veh.step(1.0 / 240.0)
+    assert veh.ignitions == 2 and not veh.engine_lit
+    veh.controls.throttle = 1.0
+    for _ in range(60):
+        veh.step(1.0 / 240.0)
+    assert veh.throttle == 0.0
 
 
 def _fly(pos, vel, propellant=4000, t_max=260.0):

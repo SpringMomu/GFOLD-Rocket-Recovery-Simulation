@@ -65,10 +65,6 @@ class PlanConfig3D:
     # loose high up, it only keeps the last metres slow (no braking hard into
     # contact), like the tracker's envelope.
     sink_gain: float = 0.0
-    # No hover near the pad (soft): sink at least min_sink between these
-    # heights above the gate (at the reference heights, height_ref).
-    min_sink: float = 0.0
-    min_sink_band: tuple = (1.5, 10.0)
     # Angle-of-attack cap vs dynamic pressure ((Pa...), (deg...)): the angle
     # between the thrust and the oncoming flow (engines-first attitude).  The
     # drag model then also returns the predicted dynamic pressure and flow
@@ -107,6 +103,17 @@ class PlanConfig3D:
     # ignition the engine goes from nothing to full along a body already
     # aligned with a slanted flow).  None: vertical.
     dir_ref: Callable | None = None
+    # Reference velocities at given times (the plan the aerodynamics are
+    # linearised about) and the weight of a trust region round them (per
+    # (m/s)^2 s): successive convexification about a plan the next plan may
+    # not wander far from, else it exploits the linearisation and diverges.
+    vel_ref: Callable | None = None
+    trust_weight: float = 0.0
+    # Engine burn windows ((t0, t1), ...): thrust at least thrust_min inside,
+    # zero outside (engine starts are limited).  None: thrust anywhere in
+    # [0, thrust_max] (or [thrust_min, ...] with a minimum, lossless).
+    burn_windows: tuple | None = None
+    nose_first_aoa_deg: float = 20.0   # nose-first burns: thrust within this of the motion
     # Cost of a second of flight, in propellant units (m/s of thrust
     # acceleration integrated): the final time is chosen on propellant +
     # time_weight * t_f -- the cheapest route, and of nearly equal ones the
@@ -306,6 +313,8 @@ class Plan3D:
     keep_out_violation: float = 0.0   # m inside an obstacle
     ground_violation: float = 0.0     # m below the ground
     limit_violation: float = 0.0      # m/s^2 outside the tilt cone / slew rate / first-knot thrust (now)
+    windows: tuple | None = None      # engine burn windows it was planned with (None: free)
+    lift: np.ndarray | None = None    # glide lift acceleration per interval (engine off)
     created_at: float = 0.0
 
     @property
@@ -314,12 +323,13 @@ class Plan3D:
 
     @property
     def reaches_pad(self) -> bool:
-        # Reaching the pad by breaking a physical limit (through an obstacle
-        # or the ground, nose-first beyond what the air allows) does not
-        # count: the tracker cannot fly such a plan.
+        # At the gate, with the propellant there is, and clear of the
+        # obstacles and the ground (hard limits).  How it gets there (the soft
+        # angle-of-attack cost, the elastic limits tied to the state now) is
+        # the optimiser's business.
         return (self.terminal_position_error < 1.0 and self.terminal_velocity_error < 0.8
                 and self.fuel_violation < 1e-3 and self.keep_out_violation < 0.5
-                and self.ground_violation < 0.5 and self.aoa_violation < 2.0 and self.limit_violation < 1.0)
+                and self.ground_violation < 0.5)
 
     @property
     def final_mass(self) -> float:
@@ -370,6 +380,11 @@ class Planner3D:
     # expensive: the plan let the wind carry the booster off and came back
     # low and late.)
     lateral_accel_weight = 1.0
+    # ... over the final approach only (time to go, s): it is about not
+    # swinging near the gate.  Earlier it would spread a boost-back over a
+    # long, weak, lofting burn (a short hard one costs the same propellant).
+    lateral_accel_t = (15.0, 25.0)
+    lateral_accel_far = 0.02       # share of the weight left before that
     # Touchdown phase (not the route): over the last ~10 s be over the pad
     # and nearly still sideways -- the burn runs to contact, so a lateral
     # error left for the last metres can only be fixed by a swing the
@@ -383,6 +398,8 @@ class Planner3D:
     aoa_weight = 100.0             # per m/s^2 of thrust outside the angle-of-attack cone (per s)
     keep_out_weight = 2000.0       # per m inside an obstacle's half-space (per s)
     ground_weight = 2000.0         # per m below the ground (per s)
+    glide_weight = 0.05            # per (m/s^2)^2 s of glide lift
+    glide_change_weight = 0.2      # per (m/s^2)^2 / s of its change between intervals
     elastic_weight = 1.0e4         # per m/s^2 outside a state-tied limit (tilt cone, slew, first knot)
 
     def __init__(self) -> None:
@@ -403,7 +420,7 @@ class Planner3D:
         far = max(8.0, far_deg)
         return np.radians(np.interp(t_go, [0.0, 1.0, 3.0, 8.0], [min(6.0, far), min(8.0, far), min(22.0, far), far]))
 
-    def build(self, r0, v0, m0, t_f, cfg: PlanConfig3D):
+    def build(self, r0, v0, m0, t_f, cfg: PlanConfig3D, hard: bool = True):
         N = int(np.clip(round(t_f / 1.0), self.knots, 70))
         dt = t_f / N
         g = G0
@@ -432,7 +449,8 @@ class Planner3D:
         isl = itc + N + 1              # lateral slew, intervals 0..N-1
         ipn = isl + N                  # first knot: thrust magnitude, vertical thrust
         icn = ipn + 2                  # first knot sideways: command continuity, lag behind the vehicle
-        n = icn + 2
+        ilf = icn + 2                  # glide lift acceleration per interval (3 each): the coast's control
+        n = ilf + 3 * N
 
         def S(k, c):
             return NX * k + c
@@ -443,6 +461,8 @@ class Planner3D:
         mid = (np.arange(N) + 0.5) * dt
         Gm = None
         q_mid = w_mid = dq_mid = None
+        Jv = v_lin = None
+        lift_max = np.zeros(N)
         if cfg.drag_model is not None:
             res = cfg.drag_model(mid)
             if isinstance(res, tuple):
@@ -451,6 +471,11 @@ class Planner3D:
                     q_mid, w_mid = np.asarray(res[2], float).reshape(N), np.asarray(res[3], float).reshape(N, 3)
                 if len(res) > 4:
                     dq_mid = np.asarray(res[4], float).reshape(N)
+                if len(res) > 6:
+                    Jv = np.asarray(res[5], float).reshape(N, 3, 3)
+                    v_lin = np.asarray(res[6], float).reshape(N, 3)
+                if len(res) > 7:
+                    lift_max = np.asarray(res[7], float).reshape(N)
             else:
                 drag = np.asarray(res, float).reshape(N, 3)
         else:
@@ -481,14 +506,42 @@ class Planner3D:
                         if Gm[k, c, j] != 0.0:
                             lift_p.append((U(k, j), -0.5 * dt * dt * Gm[k, c, j]))
                             lift_v.append((U(k, j), -dt * Gm[k, c, j]))
-                row([(S(k + 1, c), 1.0), (S(k, c), -1.0), (S(k, 3 + c), -dt), (U(k, c), -h2a), (U(k + 1, c), -h2b)] + lift_p,
-                    0.5 * dt * dt * (dk[c] + gc))
-                row([(S(k + 1, 3 + c), 1.0), (S(k, 3 + c), -1.0), (U(k, c), -0.5 * dt), (U(k + 1, c), -0.5 * dt)] + lift_v,
-                    dt * (dk[c] + gc))
+                damp_p, damp_v, dc = [], [], 0.0
+                if Jv is not None:
+                    # drag linearised in the interval's mean velocity too:
+                    # d + J ((v_k + v_k+1)/2 - v_ref)
+                    for j in range(3):
+                        jc = float(Jv[k, c, j])
+                        if jc != 0.0:
+                            for kk in (k, k + 1):
+                                damp_p.append((S(kk, 3 + j), -0.25 * dt * dt * jc))
+                                damp_v.append((S(kk, 3 + j), -0.5 * dt * jc))
+                            dc -= jc * float(v_lin[k, j])
+                glide_p = [(ilf + 3 * k + c, -0.5 * dt * dt)]
+                glide_v = [(ilf + 3 * k + c, -dt)]
+                row([(S(k + 1, c), 1.0), (S(k, c), -1.0), (S(k, 3 + c), -dt), (U(k, c), -h2a), (U(k + 1, c), -h2b)] + lift_p + damp_p + glide_p,
+                    0.5 * dt * dt * (dk[c] + gc + dc))
+                row([(S(k + 1, 3 + c), 1.0), (S(k, 3 + c), -1.0), (U(k, c), -0.5 * dt), (U(k + 1, c), -0.5 * dt)] + lift_v + damp_v + glide_v,
+                    dt * (dk[c] + gc + dc))
             row([(S(k + 1, 6), 1.0), (S(k, 6), -1.0), (U(k, 3), 0.5 * dt * alpha), (U(k + 1, 3), 0.5 * dt * alpha)], 0.0)
         target = (float(cfg.target_xy[0]), float(cfg.target_xy[1]), float(cfg.target_alt), 0.0, 0.0, -abs(cfg.touchdown_speed))
         for c in range(6):
             row([(S(N, c), 1.0), (iep + c, -1.0), (iem + c, 1.0)], target[c])
+        # Glide (aerodynamic) lift: the coast's control.  Engine off, the body
+        # is tilted a little off engines-first and the body / grid-fin lift
+        # pushes it sideways: across the flow (w . a = 0), at most what the
+        # largest glide angle of attack gives at that dynamic pressure
+        # (cone below).  Inside a burn the attitude is the thrust's (its lift
+        # is the G u term), so none there.
+        glide_on = np.zeros(N, bool)
+        for k in range(N):
+            coast = cfg.burn_windows is None or not any(a - 1e-6 <= mid[k] <= b + 1e-6 for a, b in cfg.burn_windows)
+            glide_on[k] = coast and lift_max[k] > 1e-3 and w_mid is not None and bool(np.any(w_mid[k]))
+            if glide_on[k]:
+                row([(ilf + 3 * k + c, float(w_mid[k][c])) for c in range(3) if w_mid[k][c] != 0.0], 0.0)
+            else:
+                for c in range(3):
+                    row([(ilf + 3 * k + c, 1.0)], 0.0)
         n_zero = len(row)
 
         # ---- nonnegative cone (A x <= b)
@@ -504,7 +557,7 @@ class Planner3D:
             row([(igr + k, -1.0)], 0.0)
         for k in range(N):
             row([(imn + k, -1.0)], 0.0)
-        for i in range(itc, n):
+        for i in range(itc, ilf):
             row([(i, -1.0)], 0.0)
         if math.isfinite(cfg.ground_alt):
             # the ground: h_k + s_k >= h_ground  (the last knot is the gate)
@@ -521,27 +574,39 @@ class Planner3D:
             if lever > 0.0 and abs(float(nrm[2])) < 0.5:
                 row([(S(k, c), -float(nrm[c])) for c in range(2) if nrm[c] != 0.0]
                     + [(U(k, c), -lever * float(nrm[c])) for c in range(2) if nrm[c] != 0.0] + [(ikp + j, -1.0)], -b_)
-        if cfg.min_sink > 0.0:
-            # No hover just above the pad (the acceptance rule): over the last
-            # metres the booster keeps sinking, vz_k <= -v_min + s_k -- a
-            # sideways error must be fixed higher up, not by stopping low
-            # down where the tilt budget makes it slow.
-            h_k = np.asarray(cfg.height_ref(t_k), float) if cfg.height_ref is not None else None
-            if h_k is not None:
-                for k in range(1, N):
-                    hk = float(h_k[k]) - cfg.target_alt
-                    if cfg.min_sink_band[0] < hk < cfg.min_sink_band[1]:
-                        row([(S(k, 5), 1.0), (imn + k - 1, -1.0)], -cfg.min_sink)
+        if hard:
+            # obstacles and the ground are hard limits: their slacks stay 0
+            for k in range(N):
+                row([(igr + k, 1.0)], 0.0)
+            for j in range(len(keep)):
+                row([(ikp + j, 1.0)], 0.0)
         if cfg.sink_gain > 0.0:
             # vz_k >= -(v_td + c (h_k - h_target)) - s_k   (linear in the state)
             c_s = cfg.sink_gain
             v_td = abs(cfg.touchdown_speed)
             for k in range(1, N + 1):
                 row([(S(k, 5), -1.0), (S(k, 2), -c_s), (isk + k - 1, -1.0)], v_td - c_s * cfg.target_alt)
+        def _inside(k):
+            return any(a - 1e-6 <= t_k[k] <= b + 1e-6 for a, b in cfg.burn_windows)
+
         for k in range(N + 1):
             # sigma <= mu2 (1 - z + z0)  ->  sigma + mu2 z <= mu2 (1 + z0)
             row([(U(k, 3), 1.0), (S(k, 6), mu2[k])], mu2[k] * (1.0 + z0[k]))
-            if cfg.thrust_min > 0.0 and t_k[k] >= 0.6:
+            # and never more than the engine gives the empty booster: with the
+            # propellant soft, a plan far off would otherwise burn past dry
+            # mass, where the linearised bound above keeps growing
+            row([(U(k, 3), 1.0)], cfg.thrust_max / cfg.dry_mass)
+            if cfg.burn_windows is not None:
+                # Engine starts are limited: thrust only inside the burn
+                # windows (zero outside -- the engine is off), and inside them
+                # at least the minimum throttle, so a burn never flames out
+                # (relighting would take another start).  The first knot of a
+                # window is free: the engine spools up from zero.
+                if not _inside(k):
+                    row([(U(k, 3), 1.0)], 0.0)
+                elif cfg.thrust_min > 0.0 and k > 0 and _inside(k - 1):
+                    row([(U(k, 3), -1.0), (S(k, 6), -mu1[k])], -mu1[k] * (1.0 + z0[k]))
+            elif cfg.thrust_min > 0.0 and t_k[k] >= 0.6:
                 row([(U(k, 3), -1.0), (S(k, 6), -mu1[k])], -mu1[k] * (1.0 + z0[k]))
         # propellant: z_N >= ln(m_dry) - s_fuel
         row([(S(N, 6), -1.0), (ifs, -1.0)], -math.log(cfg.dry_mass))
@@ -565,9 +630,20 @@ class Planner3D:
             # reference ~g in that term, so that flying lower to lean into
             # the wind is visible to the optimiser.
             h_mid = np.asarray(cfg.height_ref(mid), float) if cfg.height_ref is not None else None
+            d_nf = np.asarray(cfg.dir_ref(mid), float).reshape(N, 3) if cfg.dir_ref is not None else None
+            last_burn = cfg.burn_windows[-1][0] if cfg.burn_windows else math.inf
             for k in range(1, N + 1):
                 w = w_mid[k - 1]
                 if not np.any(w):
+                    continue
+                if (d_nf is not None and float(np.dot(d_nf[k - 1], w)) < 0.0 and mid[k - 1] < last_burn - 1e-6):
+                    # Nose-first (a boost-back thrusting along the motion,
+                    # grid fins stowed): the other attitude the air allows --
+                    # the thrust within nose_first_aoa_deg of the motion.  The
+                    # reference plan's thrust picks which cone (successive
+                    # linearisation); never in the landing burn.
+                    cn = math.cos(math.radians(cfg.nose_first_aoa_deg))
+                    row([(U(k, 3), cn), (iao + k - 1, -1.0)] + [(U(k, c), float(w[c])) for c in range(3)], 0.0)
                     continue
                 floor = math.acos(float(np.clip(w[2], -1.0, 1.0))) - tilt[k] + math.radians(3.0)
 
@@ -648,6 +724,12 @@ class Planner3D:
             soc_dims.append(4)
         d_ref = np.asarray(cfg.dir_ref(mid), float).reshape(N, 3) if cfg.dir_ref is not None else np.tile([0.0, 0.0, 1.0], (N, 1))
         for k in range(N):
+            if glide_on[k]:
+                row([], float(lift_max[k]))
+                for c in range(3):
+                    row([(ilf + 3 * k + c, -1.0)], 0.0)
+                soc_dims.append(4)
+        for k in range(N):
             # sideways slew: || du_xy - d_xy dsigma || <= rate dt (+ slack) --
             # the tilt rate is the size of the change (not each axis's), and
             # a change of thrust along the reference direction is no turn
@@ -670,10 +752,11 @@ class Planner3D:
         const = 0.0
 
         # propellant (sum of thrust acceleration x dt), sideways effort, time
-        lam = self.lateral_accel_weight
+        lam_k = self.lateral_accel_weight * np.interp(t_f - np.arange(N + 1) * dt, self.lateral_accel_t, (1.0, self.lateral_accel_far))
         for k in range(N + 1):
             q[U(k, 3)] += w[k]
             d_k = drag[min(k, N - 1)]
+            lam = float(lam_k[k])
             for c_ in (0, 1):
                 # lam |u_c + d_c|^2: the net sideways acceleration
                 add_p(U(k, c_), U(k, c_), 2 * lam * w[k])
@@ -692,6 +775,13 @@ class Planner3D:
                 q[S(k, c_)] += -2 * wr[k] * w[k] * t_
                 const += wr[k] * w[k] * t_ * t_
                 add_p(S(k, 3 + c_), S(k, 3 + c_), 2 * wvv[k] * w[k])
+        if cfg.vel_ref is not None and cfg.trust_weight > 0.0:
+            vr_k = np.asarray(cfg.vel_ref(t_k), float).reshape(N + 1, 3)
+            for k in range(1, N + 1):
+                for c_ in range(3):
+                    add_p(S(k, 3 + c_), S(k, 3 + c_), 2 * cfg.trust_weight * w[k])
+                    q[S(k, 3 + c_)] += -2 * cfg.trust_weight * w[k] * float(vr_k[k, c_])
+                    const += cfg.trust_weight * w[k] * float(vr_k[k, c_]) ** 2
         jw = self.jerk_weight / dt
         for k in range(N):
             for c in range(3):
@@ -722,23 +812,40 @@ class Planner3D:
         q[iao:iao + N] = self.aoa_weight * dt
         q[igr:igr + N] = self.ground_weight * dt
         q[ikp:itc] = self.keep_out_weight * dt
-        q[itc:n] = self.elastic_weight
+        q[itc:ilf] = self.elastic_weight
+        for k in range(N):
+            for c in range(3):
+                # a little cost on the glide lift and its changes (a smooth,
+                # purposeful glide, not a flutter of the attitude)
+                add_p(ilf + 3 * k + c, ilf + 3 * k + c, 2 * self.glide_weight * dt)
+                if k + 1 < N:
+                    jg = self.glide_change_weight / dt
+                    add_p(ilf + 3 * k + c, ilf + 3 * k + c, 2 * jg)
+                    add_p(ilf + 3 * (k + 1) + c, ilf + 3 * (k + 1) + c, 2 * jg)
+                    add_p(ilf + 3 * k + c, ilf + 3 * (k + 1) + c, -2 * jg)
         q[icn] = 0.1 * self.elastic_weight     # continuity gives way to the vehicle's own lag
         for i in range(n):
             add_p(i, i, 1e-7)
         P = hessian.matrix()
-        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, ifs=ifs, iao=iao, igr=igr, ikp=ikp, itc=itc, n=n,
+        layout = dict(N=N, dt=dt, nS=nS, iu=iu, iep=iep, iem=iem, ifs=ifs, iao=iao, igr=igr, ikp=ikp, itc=itc, icn=icn, ilf=ilf, n=n,
                       NX=NX, G=Gm)
         return P, q, A, b_vec, n_zero, n_nonneg, soc_dims, layout, drag, const
 
     def solve(self, r0, v0, m0, t_f, cfg: PlanConfig3D) -> Plan3D | None:
         if not self.available or not (t_f > 0.3):
             return None
-        P, q, A, b, nz, nn, socs, L, drag, const = self.build(r0, v0, m0, t_f, cfg)
+        # Obstacles and the ground hard; only when no plan from here can stay
+        # clear of them (already too close to stop, or the linearised faces
+        # cannot all be met) they become soft, so there is always a plan --
+        # that one does not count as reaching (reaches_pad).
+        P, q, A, b, nz, nn, socs, L, drag, const = self.build(r0, v0, m0, t_f, cfg, hard=True)
         x, status = self.solver.solve(P, q, A, b, nz, nn, socs)
         if x is None and status not in ("no-solver",):
-            # The problem is always feasible (every state-tied limit is
-            # elastic), so a failure is numerical -- the iteration cap or no
+            P, q, A, b, nz, nn, socs, L, drag, const = self.build(r0, v0, m0, t_f, cfg, hard=False)
+            x, status = self.solver.solve(P, q, A, b, nz, nn, socs)
+        if x is None and status not in ("no-solver",):
+            # Every other limit is soft or elastic, so the problem is always
+            # feasible and a failure is numerical -- the iteration cap or no
             # progress on a badly scaled step: once more with more room.
             x, status = self.solver.solve(P, q, A, b, nz, nn, socs, max_iter=400)
         self.last_status = status
@@ -748,8 +855,13 @@ class Planner3D:
         N = L["N"]
         X = x[: L["nS"]].reshape(N + 1, L["NX"])
         Uc = x[L["iu"]: L["iep"]].reshape(N + 1, 4)
-        if L["G"] is not None:
-            drag = drag + np.einsum("kij,kj->ki", L["G"], Uc[:N, 0:3])
+        X_ = x[: L["nS"]].reshape(N + 1, L["NX"])
+        lift = x[L["ilf"]: L["ilf"] + 3 * N].reshape(N, 3).copy()
+        # the whole non-thrust acceleration of each interval as planned (drag
+        # with its lift and speed terms, glide lift), so that sample() follows
+        # the planned states exactly
+        g_vec = np.array([0.0, 0.0, -G0])
+        drag = (X_[1:, 3:6] - X_[:-1, 3:6]) / L["dt"] - 0.5 * (Uc[:-1, 0:3] + Uc[1:, 0:3]) - g_vec
         e = x[L["iep"]: L["iep"] + 6] + x[L["iem"]: L["iem"] + 6]
         obj = objective_value(P, q, x, const)
         return Plan3D(
@@ -760,7 +872,8 @@ class Planner3D:
             aoa_violation=float(np.max(x[L["iao"]: L["iao"] + N], initial=0.0)),
             ground_violation=float(np.max(x[L["igr"]: L["igr"] + N], initial=0.0)),
             keep_out_violation=float(np.max(x[L["ikp"]: L["itc"]], initial=0.0)),
-            limit_violation=float(np.max(x[L["itc"]: L["n"] - 2], initial=0.0)),
+            limit_violation=float(np.max(x[L["itc"]: L["icn"]], initial=0.0)),
+            lift=lift,
         )
 
     def search(self, r0, v0, m0, lo, hi, cfg, evaluations=10):

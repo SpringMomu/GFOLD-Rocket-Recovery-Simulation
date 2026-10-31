@@ -66,7 +66,7 @@ class Sim3D:
         self.events: list = []
         self._hold_axis = None
         self._realtime_debt = 0.0
-        self.load_scenario(3)
+        self.load_scenario(8)          # scenario 9: tower catch from a 12 km entry
 
     # -- setup -----------------------------------------------------------------
     def load_scenario(self, index: int, autopilot: bool = True) -> None:
