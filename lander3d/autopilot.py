@@ -14,6 +14,7 @@ import numpy as np
 
 from common.conic import golden_section_search
 
+from .aero import grid_fin_forces
 from .attitude import attitude_control
 from .planner import (
     KeepOutBox,
@@ -227,6 +228,7 @@ class Autopilot3D:
         self._trim_xy = np.zeros(2)
         self._aoa_cache = (-1e9, Q_AOA_BUDGET)
         self._q_filt = 0.0
+        self.solver_fail = None       # (time, status) of the last re-plan that found no solution at all
         self._hold_bias = np.zeros(2)
         self._boostback = False
         self._boostback_done = False
@@ -439,6 +441,7 @@ class Autopilot3D:
             body_length=s.length,
             tilt_trim=tuple(self._gate_trim(veh)), trim_fade=self._trim_fade(), tilt_budget=TILT_BUDGET,
             height_ref=self._height_ref(veh), slew_deg=SLEW_DEG, time_weight=self.time_weight,
+            min_sink=1.0 if self.catch_link is None else 0.0,
         )
 
     def _solver(self, veh, wind_now, frac, keep_out):
@@ -649,6 +652,22 @@ class Autopilot3D:
         self.last_status = self.planner.last_status
         if plan is not None:
             self._commit(plan)
+        else:
+            # no solution at all this time (the solver gave up or found the
+            # problem infeasible): the booster flies on along the last plan
+            self.solver_fail = (self.elapsed, self.planner.last_status)
+
+    def solver_alert(self):
+        """For the display: None, or (kind, status) -- 'fail' when the last
+        re-plans found no solution (shown for 2 s), 'miss' when the plan in
+        hand does not reach the gate."""
+        if not self.burn_locked:
+            return None
+        if self.solver_fail is not None and self.elapsed - self.solver_fail[0] < 2.0:
+            return ("fail", self.solver_fail[1])
+        if self.plan is not None and not self.plan.reaches_pad:
+            return ("miss", self.last_status)
+        return None
 
     def _commit(self, plan):
         plan.created_at = self.elapsed
@@ -885,10 +904,12 @@ class Autopilot3D:
         """Angle-of-attack limit vs dynamic pressure, from physics: the
         largest angle between the thrust (body axis) and the oncoming flow,
         counted from engines-first, at which the aerodynamic moment stays
-        within ``aoa_moment_margin`` of what the gimbal can hold (thrust ~
-        weight, at the current mass and centre of mass).  The moment is
-        taken from the aerodynamic model (per Pa at each angle, refreshed
-        every ``aoa_refresh``).  A hovering booster in a cross wind leans into
+        within ``aoa_moment_margin`` of what the controls can hold: the
+        gimbal (thrust ~ weight, at the current mass and centre of mass) and
+        the four grid fins at full deflection (each fin in its own local
+        flow, so their moment grows with the dynamic pressure like the
+        aerodynamic one).  Both moments are taken from the models (per Pa at
+        each angle, refreshed every ``aoa_refresh``).  A hovering booster in a cross wind leans into
         it at ~90-110 deg from the flow: what limits it there is the dynamic
         pressure, hardly the lean (leaning 20 deg adds ~20 % moment), and
         near the ground, where the wind is weaker, it can lean much more."""
@@ -897,14 +918,15 @@ class Autopilot3D:
             return table
         s = veh.spec
         m, zc, _, _ = veh.mass_properties()
-        m_ctrl = self.aoa_moment_margin * m * G0 * math.sin(s.gimbal_limit) * max(0.5, zc - s.gimbal_z)
+        m_gim = m * G0 * math.sin(s.gimbal_limit) * max(0.5, zc - s.gimbal_z)
         rho, _, _, a_s = atmosphere(max(0.0, float(veh.pos[2])))
         q_ref = 1000.0
         sp = math.sqrt(2.0 * q_ref / rho)
         last = getattr(self.aero, "last", None)
         angles = np.arange(0.0, 181.0, 10.0)
-        k = []
+        k, k_fin = [], []
         w = np.array([1.0, 0.0, 0.0])                     # where the air goes, relative to the booster
+        patterns = [np.array(p, float) * s.fin_max_defl for p in ((1, 0, -1, 0), (0, 1, 0, -1), (1, 1, -1, -1), (1, -1, -1, 1))]
         for ang in angles:
             a = math.radians(float(ang))
             axis = np.array([math.cos(a), 0.0, math.sin(a)])
@@ -913,18 +935,35 @@ class Autopilot3D:
             assert np.allclose(R[:, 2], axis)
             _, mom, _ = self.aero(_AttitudeProbe(veh, R), -w * sp, rho, a_s, veh.com_world())
             k.append(float(np.linalg.norm(mom)) / q_ref)
+            # what the four fins can add (pitch/yaw, best deflection pattern)
+            _, m0, _ = grid_fin_forces(s, R, zc, np.zeros(3), -w * sp, rho, a_s, np.zeros(4), 1.0)
+            best = 0.0
+            for d in patterns:
+                _, m1, _ = grid_fin_forces(s, R, zc, np.zeros(3), -w * sp, rho, a_s, d, 1.0)
+                dm = m1 - m0
+                best = max(best, float(np.linalg.norm(dm - axis * float(np.dot(dm, axis)))))
+            k_fin.append(best / q_ref)
         if last is not None:
             self.aero.last = last
-        k = np.maximum.accumulate(np.asarray(k))            # the cone from engines-first must hold throughout
+        # highest dynamic pressure each angle can be held at:
+        #   K q <= margin (M_gimbal + K_fin q)
+        mg = self.aoa_moment_margin
+        excess = np.asarray(k) - mg * np.asarray(k_fin)
+        q_max = np.where(excess > 0.0, mg * m_gim / np.maximum(excess, 1e-12), np.inf)
+        q_max = np.minimum.accumulate(q_max)                # the cone from engines-first must hold throughout
         out = []
         for q in AOA_Q_GRID:
-            lim = m_ctrl / q
-            if k[-1] <= lim:
+            ok = q_max >= q
+            if ok.all():
                 out.append(180.0)
-            elif k[0] > lim:
+            elif not ok[0]:
                 out.append(0.0)
             else:
-                out.append(float(np.interp(lim, k, angles)))
+                j = int(np.argmin(ok))                      # first angle that cannot be held
+                # interpolate in 1/q_max between the last good and first bad angle
+                a0, a1 = angles[j - 1], angles[j]
+                r0, r1 = 1.0 / q_max[j - 1], 1.0 / q_max[j]
+                out.append(float(a0 + (a1 - a0) * (1.0 / q - r0) / max(r1 - r0, 1e-12)))
         table = (AOA_Q_GRID, tuple(out))
         self._aoa_cache = (self.elapsed, table)
         return table

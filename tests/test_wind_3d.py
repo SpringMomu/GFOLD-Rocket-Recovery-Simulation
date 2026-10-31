@@ -161,15 +161,15 @@ def test_aoa_limit_does_not_push_downwind_while_rising():
     assert abs(out[2] - min(accel[2], G0)) < 1e-9         # and what it gives up does not go into a climb
 
 
-def test_angle_of_attack_limit_comes_from_the_moment_the_gimbal_can_hold():
+def test_angle_of_attack_limit_comes_from_the_moment_the_controls_can_hold():
     sim = Sim3D(cfd=False)
     sim.load_scenario(9)
     ap = sim.autopilot
     ap.elapsed = 10.0
     qs, lim = ap._aoa_table(sim.vehicle)
     lim = dict(zip(qs, lim))
-    assert lim[150.0] == 180.0                          # a light wind: any lean is holdable
-    assert lim[20000.0] < 10.0                          # fast flight: close to engines-first only
+    assert lim[150.0] == 180.0 and lim[500.0] == 180.0  # a 30 m/s cross wind: any lean is holdable
+    assert lim[20000.0] < 15.0                          # fast flight: close to engines-first only
     assert all(a >= b for a, b in zip(list(lim.values()), list(lim.values())[1:]))
 
 
