@@ -116,7 +116,7 @@ def test_planner_tilt_cone_leans_into_the_wind():
     if not P.available:
         return
     # hold position above the pad against a steady 1 m/s^2 eastward wind drag
-    cfg = PlanConfig3D(mode="smooth", thrust_min=0.2 * 360e3, thrust_max=0.85 * 360e3, isp=282.0, dry_mass=8150.0,
+    cfg = PlanConfig3D(thrust_min=0.2 * 360e3, thrust_max=0.85 * 360e3, isp=282.0, dry_mass=8150.0,
                        sigma_now=9.8, u_now=(-1.0, 0.0, 9.8), engine_on=True, max_tilt_deg=2.0, touchdown_speed=1.2,
                        sink_gain=0.5, drag_model=lambda t: np.tile([1.0, 0.0, 0.0], (len(t), 1)),
                        tilt_trim=(-1.0, 0.0), trim_fade=(0.0, 0.1))
@@ -125,3 +125,72 @@ def test_planner_tilt_cone_leans_into_the_wind():
     lean = np.degrees(np.arctan2(-plan.u[:-1, 0], plan.u[:-1, 2]))
     assert lean.min() > 3.0                        # leans west to hold against the drag (2 deg cone about ~5.8)
     assert plan.terminal_position_error < 0.5
+
+
+def test_the_final_time_is_the_optimisers_and_it_does_not_loft():
+    from lander3d.planner import PlanConfig3D, Planner3D
+
+    P = Planner3D()
+    if not P.available:
+        return
+    # low and 150 m off: the cost J = propellant + time picks the final time
+    # (a longer burn costs ~g per second of gravity loss), and the cheapest
+    # route does not climb -- no envelope makes it do anything else
+    r0, v0 = np.array([-150.0, 0.0, 87.0]), np.array([0.0, 0.0, -5.0])
+    cfg = PlanConfig3D(thrust_min=0.2 * 360e3, thrust_max=0.85 * 360e3, isp=282.0, dry_mass=8150.0,
+                       sigma_now=3.6, u_now=(0.0, 0.0, 3.6), engine_on=True, max_tilt_deg=65.0, touchdown_speed=1.2,
+                       sink_gain=0.5, ground_alt=0.0, time_weight=1.0)
+    best = P.search(r0, v0, 12150.0, 8.0, 40.0, cfg)
+    assert best.reaches_pad and 18.0 < best.t_f < 32.0
+    rushed, slow = (P.solve(r0, v0, 12150.0, t, cfg) for t in (12.0, 40.0))
+    assert rushed.objective > best.objective + 100.0 and slow.objective > best.objective
+    assert float(best.r[:, 2].max()) < 88.0          # no loft: nothing in the cost asks for one
+
+
+def test_aoa_limit_does_not_push_downwind_while_rising():
+    from lander3d.autopilot import Autopilot3D
+    from lander3d.vehicle import G0, Vehicle
+
+    veh = Vehicle()
+    veh.reset(position=(0.0, 0.0, 120.0), velocity=(0.0, 0.0, 12.0), on_pad=False)
+    veh.last["q"] = 450.0
+    wind = np.array([0.0, 22.0, 0.0])                    # from the south, the booster climbing
+    accel = np.array([0.0, -2.0, G0 + 2.0])              # lean into the wind
+    out = Autopilot3D._aoa_limit(veh, accel, wind, math.radians(75.0))
+    assert out[1] <= 1e-9                                 # never turned downwind (+y)
+    assert abs(out[2] - accel[2]) < 1e-9                  # vertical part kept
+
+
+def test_low_far_catch_burn_time_is_searched_not_predicted():
+    from lander3d.sim import PHYSICS_DT
+
+    sim = Sim3D(cfd=False)
+    if not sim.autopilot.planner.available:
+        return
+    sim.load_scenario(9)                                 # behind the tower, 150 m off, 87 m above the catch point
+    ap = sim.autopilot
+    while not ap.burn_locked and sim.time < 3.0:         # lights almost at once (low, slow, far off)
+        sim.step(PHYSICS_DT)
+    assert ap.burn_locked and ap.plan is not None and ap.plan.reaches_pad
+    # the vertical-burn estimate alone says ~34 s (locked to it, the plan
+    # used to loft to ~250 m); the final time is the one minimising J
+    assert ap.touchdown_time - ap.elapsed < 32.0
+    assert float(ap.plan.r[:, 2].max()) < 100.0
+
+
+def test_catch_hold_bias_includes_what_the_model_misses():
+    from lander3d.autopilot import Autopilot3D
+    from lander3d.vehicle import Vehicle
+
+    ap = Autopilot3D()
+    veh = Vehicle()
+    veh.reset(position=(0.0, 0.0, 50.0), on_pad=False)
+    m = veh.mass
+    ap.cmd_accel = np.array([-0.7, 0.0, 9.8])
+    # the thrust delivers only part of the commanded lean (gimbal holding the
+    # attitude), the wind pushes east at 0.75 m/s^2
+    veh.last["thrust"] = np.array([-0.45, 0.0, 9.8]) * m
+    veh.last["aero"] = np.array([0.75, 0.0, 0.0]) * m
+    for _ in range(2000):
+        ap._update_hold_bias(veh, 1.0 / 240.0)
+    assert np.allclose(ap._hold_bias, [-1.0, 0.0], atol=1e-3)
