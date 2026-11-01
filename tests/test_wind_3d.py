@@ -226,3 +226,26 @@ def test_the_plan_is_solvable_from_a_state_outside_its_limits():
     assert plan is not None
     assert plan.limit_violation > 0.5 and not plan.reaches_pad
     assert abs(plan.sigma[0] - tmax / 11000.0) < 0.2 * tmax / 11000.0    # starts where the engine can be
+
+
+def _glide_ref(N, lift_max):
+    flow = np.tile([0.0, 0.0, 1.0], (N, 1))              # falling straight down: engines-first axis up
+    return dict(drag=np.tile([0.0, 0.0, 9.0], (N, 1)), jac=np.zeros((N, 3, 3)), v_ref=np.tile([0.0, 0.0, -100.0], (N, 1)),
+                flow=flow, lift_max=np.full(N, lift_max), x_end=np.array([60.0, -20.0, 500.0, 0.0, 0.0, -100.0]),
+                miss=np.array([60.0, -20.0]), miss_jac=np.hstack([np.eye(2), np.zeros((2, 4))]))
+
+
+def test_the_glide_plan_flies_the_miss_out_with_lift_across_the_flow():
+    from lander3d.glide import GlidePlanner
+
+    G = GlidePlanner()
+    if not G.available:
+        return
+    r0, v0 = np.array([60.0, -20.0, 1500.0]), np.array([0.0, 0.0, -100.0])
+    plan = G.solve(r0, v0, 10.0, _glide_ref(20, 3.0))
+    assert plan is not None and float(np.linalg.norm(plan.miss)) < 1.0
+    assert np.all(np.abs(plan.lift[:, 2]) < 1e-6)                    # across the (vertical) flow
+    assert np.all(np.linalg.norm(plan.lift, axis=1) <= 3.0 + 1e-6)   # within the lift it has
+    # too little lift: still a plan (exact penalty), with what is left of the miss
+    weak = G.solve(r0, v0, 10.0, _glide_ref(20, 0.2))
+    assert weak is not None and float(np.linalg.norm(weak.miss)) > 40.0 and weak.usage > 0.99
