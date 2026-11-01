@@ -35,6 +35,7 @@ OPTIONS = (
     Option("trim_gain", "float", 1.0, 0.0, 1.0, 0.05),           # lean into the wind (tilt-cone / tracker trim)
     Option("lateral_aero_share", "float", 1.0, 0.0, 1.0, 0.05),  # share of the aerodynamic force the sideways-effort cost nets off
     Option("shear_fit", "bool", 1, 0, 1, 1),                     # fit the wind shear from the winds measured on the way down
+    Option("lift_trim", "bool", 1, 0, 1, 1),                     # lift as the attitude loop trims it (fins), calibrated in flight
     Option("aoa_margin", "float", 0.8, 0.3, 1.0, 0.05),          # share of the control moment the aerodynamic moment may use
     # --- planner / solver
     Option("time_weight", "float", 1.0, 0.0, 3.0, 0.1),          # cost of a second of flight (propellant units)
@@ -91,6 +92,7 @@ def apply(autopilot, values: dict) -> None:
     ap.aero_pred = int(values["aero_pred"])
     ap.trim_gain = float(values["trim_gain"])
     ap.shear_fit = bool(values["shear_fit"])
+    ap.lift_trim = bool(values["lift_trim"])
     ap.aoa_moment_margin = float(values["aoa_margin"])
     ap.time_weight = float(values["time_weight"])
     ap.divert_tilt_deg = float(values["divert_tilt_deg"])

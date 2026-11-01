@@ -107,20 +107,27 @@ def grid_fin_forces(spec, R, zc, omega_b, v_rel_w, rho, a_snd, defl, deploy):
     return R @ F_b, R @ M_b, F_b
 
 
-def fin_static_force(spec, u, axis, alpha, q, mach, deploy):
-    """Sum of the four grid fins at zero deflection (for trajectory
-    prediction, where the roll angle is unknown): identical to the per-fin
-    model for any roll angle at small angle of attack."""
+def fin_static_parts(spec, u, axis, alpha, q, mach, deploy):
+    """The four grid fins at zero deflection (for trajectory prediction,
+    where the roll angle is unknown): identical to the per-fin model for any
+    roll angle at small angle of attack.  Returns (drag, normal) forces."""
     if deploy <= 0.01:
-        return np.zeros(3)
+        return np.zeros(3), np.zeros(3)
     c = float(np.dot(u, axis))
     perp = u - c * axis
     pn = float(np.linalg.norm(perp))
     S = spec.fin_area * deploy
-    f = -u * q * 4.0 * S * spec.fin_cd0
+    drag = -u * q * 4.0 * S * spec.fin_cd0
+    normal = np.zeros(3)
     if pn > 1e-9:
-        f += -(perp / pn) * q * 4.0 * S * fin_mach_factor(mach) * fin_normal_coeff(alpha, spec.fin_cn_alpha)
-    return f
+        normal = -(perp / pn) * q * 4.0 * S * fin_mach_factor(mach) * fin_normal_coeff(alpha, spec.fin_cn_alpha)
+    return drag, normal
+
+
+def fin_static_force(spec, u, axis, alpha, q, mach, deploy):
+    """Sum of the four grid fins at zero deflection (see ``fin_static_parts``)."""
+    drag, normal = fin_static_parts(spec, u, axis, alpha, q, mach, deploy)
+    return drag + normal
 
 
 class AeroModel:
@@ -149,8 +156,17 @@ class AeroModel:
         ca = ca0 * cabs * cabs
         return ca, cn_pot, cn_visc
 
-    def quick_force(self, v_rel, axis, rho, a_snd, legs=0.0, fins=1.0):
-        """Force only (no moments) for trajectory prediction in guidance."""
+    def quick_force(self, v_rel, axis, rho, a_snd, legs=0.0, fins=1.0, trim=None):
+        """Force only (no moments) for trajectory prediction in guidance.
+
+        The fins are taken at zero deflection.  In flight the attitude loop
+        deflects them to cancel the aerodynamic moment of the body, and their
+        normal force then cancels most of the body's lift (at 8 kPa, 15 deg
+        off the flow: -2.7 m/s^2 at zero deflection, -0.4 m/s^2 flown).
+        ``trim(theta, q)`` -- ``theta`` the angle between the axis and the
+        engines-first direction, ``q`` the dynamic pressure -- returns the
+        factor by which the trimmed booster's normal force (body + fins)
+        differs from this untrimmed one (``Autopilot3D._lift_trim``)."""
         s = self.spec
         speed = float(vnorm(v_rel))
         if speed < 0.3 or rho <= 0.0:
@@ -167,9 +183,14 @@ class AeroModel:
         perp = u - c * axis
         pn = float(vnorm(perp))
         f = -math.copysign(1.0, c) * q * a_ref * ca * axis
+        f_n = np.zeros(3)
         if pn > 1e-6:
-            f += -(perp / pn) * q * a_ref * (cn_pot + cn_visc)
-        f += fin_static_force(s, u, axis, alpha, q, mach, fins)
+            f_n = -(perp / pn) * q * a_ref * (cn_pot + cn_visc)
+        f_drag, f_fin_n = fin_static_parts(s, u, axis, alpha, q, mach, fins)
+        f_n = f_n + f_fin_n
+        if trim is not None:
+            f_n = f_n * trim(math.acos(max(-1.0, min(1.0, -c))), q)
+        f += f_n + f_drag
         f += -u * q * 4.0 * legs * 0.9
         return f
 
