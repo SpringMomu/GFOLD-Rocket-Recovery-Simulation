@@ -1432,8 +1432,8 @@ class Autopilot3D:
                     accel[2] += 2.0 * (v_lim - v[2])
             if self.elapsed - self.plan.created_at > self.brake_floor_age:
                 accel = self._braking_floor(veh, r, v, m, accel)
-                if self._commit_to_ground(veh, r, v):
-                    c.legs_down = True
+            if self._commit_to_ground(veh, r, v):
+                c.legs_down = True
             # Tilt budget tightens with height (upright at contact) and with
             # dynamic pressure: there the body lift of an engines-first
             # booster opposes its tilt and outweighs the thrust's sideways
@@ -1481,11 +1481,11 @@ class Autopilot3D:
 
     def _commit_to_ground(self, veh, r, v) -> bool:
         """Put the legs out for a given-up catch (``_given_up_catch``) at the
-        last moment: below ``ground_legs_height`` (the feet then reach the
-        ground before the hull does).  Not before: the legs cannot be folded
+        last moment: below ``ground_legs_height`` and still sinking (the feet then reach
+        the ground before the hull does).  Not before: the legs cannot be folded
         again, and a booster that is only recovering from an overshoot (low,
         far off, climbing back) would lose its catch."""
-        return self._given_up_catch(r) and float(veh.altitude) < self.ground_legs_height
+        return self._given_up_catch(r) and float(veh.altitude) < self.ground_legs_height and float(v[2]) < -1.0
 
     def _braking_floor(self, veh, r, v, m, accel):
         """The vertical thrust acceleration of the command, raised to what it
