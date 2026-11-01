@@ -171,6 +171,8 @@ class Autopilot3D:
     lift_gain_tau = 3.0           # s, memory of that ratio
     lift_trim = True              # the planner and the glide use the lift of the booster as the attitude loop trims it
     lineup_q_max = 1500.0         # Pa: above this dynamic pressure the glide goes on until ignition (no line-up)
+    bail_height = 40.0            # m: below this an unreachable plan counts towards bailing out ...
+    bail_after = 8.0              # ... after this many seconds the booster lands where it is (FALLBACK)
     plan_stale_after = 5.0        # s without a new plan (nothing solves): the one in hand is not trusted any more
     fallback_pull_max = 2.0       # m/s^2: pull towards the pad of the plan-less fallback law
     # Wind profile for the predictions: the wind measured now, extrapolated
@@ -258,6 +260,8 @@ class Autopilot3D:
         self._boostback = False
         self._boostback_done = False
         self._hop = False
+        self._unreach_t = 0.0
+        self._bail = False
         self._bb_floor = self.boostback_end_alt
         self._route = None            # reference path round the obstacles while no plan gets through
         self._touched = False
@@ -943,8 +947,20 @@ class Autopilot3D:
                 and float(np.linalg.norm(r[:2])) < 6.0)):
             self._catch_hold(veh, r, v, dt)
             return
+        # A plan that cannot reach the pad, with the booster already low: it
+        # would hug the ground for as long as the propellant lasts (the tilt
+        # budget near the ground does not let it traverse) and crash dry.
+        # After bail_after seconds of that, come down where it is instead.
+        if self.plan is not None and not self.plan.reaches_pad and h < self.bail_height and self.catch_link is None:
+            self._unreach_t += dt
+            if self._unreach_t > self.bail_after:
+                self._bail = True
+        elif self.plan is not None and self.plan.reaches_pad:
+            self._unreach_t = 0.0
+        if self._bail:
+            self.plan = None
         stranded = t_go <= 0.6 and (h > 20.0 or float(np.linalg.norm(r[:2])) > 15.0)
-        if self.replan_enabled and self.planner.available and self.elapsed >= self.next_replan and (t_go > 0.6 or stranded):
+        if self.replan_enabled and not self._bail and self.planner.available and self.elapsed >= self.next_replan and (t_go > 0.6 or stranded):
             self._replan(veh, wind_now)
             self._publish()
             t_go = self.touchdown_time - self.elapsed

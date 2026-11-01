@@ -115,7 +115,7 @@ def test_low_far_booster_hops_instead_of_a_long_powered_traverse():
     assert _first_phase((2000.0, 0.0, 600.0), (0.0, 0.0, 0.0)) == "BOOSTBACK"
 
 
-def _fly(pos, vel, propellant=4000, t_max=260.0):
+def _fly(pos, vel, propellant=8000, t_max=260.0):
     sim = Sim3D(cfd=False)
     sim.vehicle.reset(position=pos, velocity=vel, propellant=propellant, on_pad=False)
     sim.vehicle.pos[2] += sim.vehicle.rest_height
