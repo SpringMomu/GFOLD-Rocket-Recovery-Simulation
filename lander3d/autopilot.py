@@ -186,9 +186,7 @@ class Autopilot3D:
     lift_trim = True              # the planner and the glide use the lift of the booster as the attitude loop trims it
     lineup_q_max = 1500.0         # Pa: above this dynamic pressure the glide goes on until ignition (no line-up)
     brake_floor = True            # a plan that is not being renewed, and the plan-less law, never command less vertical thrust than stopping the fall takes
-    ground_legs_time = 3.0        # s to the ground (at the present sink) at which a given-up catch puts the legs out (the legs take 2 s) ...
-    ground_legs_alt = 200.0       # ... below this height, or below ground_legs_height whatever the sink
-    ground_legs_height = 80.0
+    ground_legs_height = 30.0     # m: a given-up catch puts the legs out below this height (the feet go down first)
     catch_far_distance = 25.0     # m from the catch axis beyond which a catch with a stale plan puts the legs out
     brake_floor_age = 1.0         # s without a new plan after which the one in hand is held to that floor
     brake_margin = 1.1            # the floor asks this much more deceleration than the bare stopping need
@@ -1482,17 +1480,12 @@ class Autopilot3D:
         return (not self.use_legs) and float(np.linalg.norm(r[:2])) > self.catch_far_distance
 
     def _commit_to_ground(self, veh, r, v) -> bool:
-        """Put the legs out for a given-up catch (``_given_up_catch``) that is
-        about to reach the ground -- below ``ground_legs_height``, or within
-        ``ground_legs_time`` s of it at the present sink (low enough to count,
-        ``ground_legs_alt``).  Not before: the legs cannot be folded again,
-        and with them out a catch is gone."""
-        if not self._given_up_catch(r):
-            return False
-        alt = float(veh.altitude)
-        if alt < self.ground_legs_height:
-            return True
-        return alt < self.ground_legs_alt and alt / max(5.0, -float(v[2])) < self.ground_legs_time
+        """Put the legs out for a given-up catch (``_given_up_catch``) at the
+        last moment: below ``ground_legs_height`` (the feet then reach the
+        ground before the hull does).  Not before: the legs cannot be folded
+        again, and a booster that is only recovering from an overshoot (low,
+        far off, climbing back) would lose its catch."""
+        return self._given_up_catch(r) and float(veh.altitude) < self.ground_legs_height
 
     def _braking_floor(self, veh, r, v, m, accel):
         """The vertical thrust acceleration of the command, raised to what it
