@@ -14,7 +14,7 @@ from lander3d.sim import Sim3D
 # option key -> (owner, attribute)
 TARGETS = {
     "wind_plan_gain": ("ap", "wind_plan_gain"), "aero_pred": ("ap", "aero_pred"), "trim_gain": ("ap", "trim_gain"),
-    "shear_fit": ("ap", "shear_fit"), "aoa_margin": ("ap", "aoa_moment_margin"), "time_weight": ("ap", "time_weight"),
+    "shear_fit": ("ap", "shear_fit"), "lift_trim": ("ap", "lift_trim"), "aoa_margin": ("ap", "aoa_moment_margin"), "time_weight": ("ap", "time_weight"),
     "divert_tilt_deg": ("ap", "divert_tilt_deg"), "burn_fraction": ("ap", "burn_fraction_nominal"),
     "time_search_evals": ("ap", "time_search_evals"), "retime_step": ("ap", "retime_step"),
     "lateral_aero_share": ("pl", "lateral_aero_share"), "knots": ("pl", "knots"),

@@ -15,7 +15,7 @@ import numpy as np
 from common.conic import golden_section_search
 
 from .aero import grid_fin_forces
-from .attitude import attitude_control
+from .attitude import FIN_MIN_EFF, attitude_control
 from .planner import (
     KeepOutBox,
     Plan3D,
@@ -26,7 +26,7 @@ from .planner import (
     detour_paths,
     separating_planes,
 )
-from .vehicle import G0, atmosphere
+from .vehicle import G0, atmosphere, fin_mix
 
 # Landing-burn tilt budget vs height (m -> deg): upright at contact.  It is
 # measured from the wind trim (Autopilot3D._trim_xy: in a cross wind the
@@ -162,6 +162,9 @@ class Autopilot3D:
     catch_hold_tilt_deg = 4.0     # tilt budget about the wind trim while holding
     catch_integral_radius = 1.0   # m: the hold's integral only builds up this close to the axis
     glide_gain = 1.5
+    lift_calibrate = True         # ... and scaled by the ratio of the lift measured in flight to the lift of that model
+    lift_gain_tau = 3.0           # s, memory of that ratio
+    lift_trim = True              # the planner and the glide use the lift of the booster as the attitude loop trims it
     lineup_q_max = 1500.0         # Pa: above this dynamic pressure the glide goes on until ignition (no line-up)
     plan_stale_after = 5.0        # s without a new plan (nothing solves): the one in hand is not trusted any more
     fallback_pull_max = 2.0       # m/s^2: pull towards the pad of the plan-less fallback law
@@ -237,6 +240,12 @@ class Autopilot3D:
         self.wind_shear_est = 1.0
         self._trim_xy = np.zeros(2)
         self._aoa_cache = (-1e9, Q_AOA_BUDGET)
+        self._trim_cache = (-1e9, None)
+        self._trim_fn = None
+        self._lift_gain = 1.0         # measured / modelled lift of the booster (_update_lift_gain)
+        self._lift_num = 0.0
+        self._lift_den = 0.0
+        self._next_lift_fit = 0.0
         self._q_filt = 0.0
         self.solver_fail = None       # (time, status) of the last re-plan that found no solution at all
         self._hold_bias = np.zeros(2)
@@ -381,9 +390,9 @@ class Autopilot3D:
                 axis0 = base + tilt
                 axis0 /= np.linalg.norm(axis0)
                 if broadside is not None:
-                    out[i] = self.aero.quick_force(vr, broadside, rho, a, legs) / m
+                    out[i] = self._quick(veh, vr, broadside, rho, a, legs) / m
                     continue
-                f0 = self.aero.quick_force(vr, axis0, rho, a, legs)
+                f0 = self._quick(veh, vr, axis0, rho, a, legs)
                 if self.aero_pred == 1:
                     out[i] = f0 / m         # drag at the reference attitude, no lift gradient
                     continue
@@ -394,7 +403,7 @@ class Autopilot3D:
                 Gi = np.zeros((3, 3))
                 for e in (e1, e2):
                     ax1 = axis0 + d * e
-                    f1 = self.aero.quick_force(vr, ax1 / np.linalg.norm(ax1), rho, a, legs)
+                    f1 = self._quick(veh, vr, ax1 / np.linalg.norm(ax1), rho, a, legs)
                     grad = (f1 - f0) / d / m                  # accel per radian of tilt along e
                     # Keep the net effect of a tilt in the thrust direction
                     # (limits over-reliance on a local linearisation).
@@ -877,6 +886,7 @@ class Autopilot3D:
         self._dt = dt
         self._wind_ref = (np.asarray(wind_now, float).copy(), max(0.5, float(veh.altitude)))
         self._update_wind_profile(veh, wind_now)
+        self._update_lift_gain(veh, wind_now)
         s = veh.spec
         r, v, m = self._state(veh)
         g = G0
@@ -1111,6 +1121,120 @@ class Autopilot3D:
         table = (AOA_Q_GRID, tuple(out))
         self._aoa_cache = (self.elapsed, table)
         return table
+
+    def _lift_trim(self, veh):
+        """The trimmed-lift factor ``kappa(theta, q)`` (see ``AeroModel.quick_force``).
+
+        The attitude loop cancels the aerodynamic moment of the body with the
+        grid fins first (least squares on their measured effectiveness,
+        commands within +-1), and only what is left with the gimbal and the
+        RCS.  So the lift that really acts on the booster is that of the body
+        plus the fins *as deflected for that*, not at zero deflection: it is
+        taken here from the same models and the same allocation as the loop,
+        per angle ``theta`` from engines-first (every ``aoa_refresh``, at a
+        reference dynamic pressure: body and fins both scale with q, so the
+        deflection needed does not).  Below the fins' effectiveness threshold
+        the loop leaves them neutral, hence the fade with q."""
+        if not self.lift_trim or self.aero is None:
+            return None
+        t_last, cached = self._trim_cache
+        if self.elapsed - t_last < self.aoa_refresh and cached is not None:
+            return cached
+        s = veh.spec
+        _, zc, _, _ = veh.mass_properties()
+        rho, _, _, a_s = atmosphere(max(0.0, float(veh.pos[2])))
+        q_ref = 1000.0
+        sp = math.sqrt(2.0 * q_ref / rho)
+        last = getattr(self.aero, "last", None)
+        w = np.array([1.0, 0.0, 0.0])
+        v_rel = -w * sp
+        angles = np.arange(0.0, 181.0, 10.0)
+        kappas, b_refs = [], []
+        zero3 = np.zeros(3)
+        for ang in angles:
+            a = math.radians(float(ang))
+            axis = np.array([math.cos(a), 0.0, math.sin(a)])
+            R = np.array([[math.sin(a), 0.0, math.cos(a)], [0.0, 1.0, 0.0], [-math.cos(a), 0.0, math.sin(a)]])
+            body = _AttitudeProbe(veh, R)
+            body.fins_deploy = 0.0
+            f_b, m_b, _ = self.aero(body, v_rel, rho, a_s, veh.com_world())
+
+            def fins(u, R=R):
+                d = np.clip(fin_mix(u) * s.fin_max_defl, -s.fin_max_defl, s.fin_max_defl)
+                f, m, _ = grid_fin_forces(s, R, zc, zero3, v_rel, rho, a_s, d, 1.0)
+                return f, R.T @ m
+
+            f0, m0 = fins(zero3)
+            B = np.zeros((3, 3))
+            for j in range(3):
+                e = np.zeros(3)
+                e[j] = 0.5
+                B[:, j] = fins(e)[1] - fins(-e)[1]
+            try:
+                u, *_ = np.linalg.lstsq(B, -(R.T @ m_b) - m0, rcond=1e-3)
+            except np.linalg.LinAlgError:
+                u = np.zeros(3)
+            f_trim = f_b + fins(np.clip(u, -1.0, 1.0))[0]
+            f_zero = f_b + f0
+            pz = f_zero - float(np.dot(f_zero, axis)) * axis
+            pt = f_trim - float(np.dot(f_trim, axis)) * axis
+            den = float(np.dot(pz, pz))
+            kappas.append(float(np.clip(np.dot(pt, pz) / den, -0.5, 1.5)) if den > 1e-3 * (q_ref * 10.0) ** 2 else 1.0)
+            b_refs.append(float(np.abs(B).max()))
+        if last is not None:
+            self.aero.last = last
+        kappas, b_refs = np.asarray(kappas), np.asarray(b_refs)
+
+        def kappa(theta, q):
+            th = math.degrees(theta)
+            b = float(np.interp(th, angles, b_refs)) * q / q_ref
+            fade = float(np.clip((b - FIN_MIN_EFF) / FIN_MIN_EFF, 0.0, 1.0))
+            return (1.0 + fade * (float(np.interp(th, angles, kappas)) - 1.0)) * self._lift_gain
+
+        self._trim_cache = (self.elapsed, kappa)
+        return kappa
+
+    def _update_lift_gain(self, veh, wind_now):
+        """Calibrate the trimmed-lift model against the flight: the ratio
+        of the lift measured now (the aerodynamic force the accelerometer
+        senses, less the drag of the booster aligned with the flow) to what
+        the model gives at the attitude flown, least squares with an
+        exponential memory.  The attitude loop adds more fin deflection than
+        the pure trim (angle and rate terms, saturation), most at high
+        dynamic pressure; the model scales by what is found.  Only with the
+        fins out and a lift worth measuring."""
+        if not (self.lift_trim and self.lift_calibrate) or self.aero is None or self.elapsed < self._next_lift_fit:
+            return
+        dt = 0.05
+        self._next_lift_fit = self.elapsed + dt
+        trim = self._lift_trim(veh)
+        aero = veh.last.get("aero")
+        if trim is None or aero is None or veh.fins_deploy < 0.9:
+            return
+        vr = veh.vel - wind_now
+        sp = float(np.linalg.norm(vr))
+        if sp < 20.0:
+            return
+        rho, _, _, a = atmosphere(max(0.0, float(veh.pos[2])))
+        q = 0.5 * rho * sp * sp
+        m = veh.mass
+        base = self.aero.quick_force(vr, -vr / sp, rho, a, veh.legs)
+        raw = self.aero.quick_force(vr, np.asarray(veh.axis, float), rho, a, veh.legs, trim=lambda th, qq: trim(th, qq) / self._lift_gain)
+        l_model = (raw - base) / m
+        l_meas = (np.asarray(aero, float) - base) / m
+        decay = math.exp(-dt / self.lift_gain_tau)
+        self._lift_num *= decay
+        self._lift_den *= decay
+        n2 = float(np.dot(l_model, l_model))
+        if q > 300.0 and n2 > 0.09:                 # > 0.3 m/s^2
+            self._lift_num += float(np.dot(l_model, l_meas))
+            self._lift_den += n2
+        if self._lift_den > 0.5:
+            self._lift_gain = float(np.clip(self._lift_num / self._lift_den, 0.3, 1.5))
+
+    def _quick(self, veh, vr, axis, rho, a_snd, legs):
+        """``AeroModel.quick_force`` with the lift as flown (``_lift_trim``)."""
+        return self.aero.quick_force(vr, axis, rho, a_snd, legs, trim=self._lift_trim(veh))
 
     @staticmethod
     def _aoa_limit(veh, accel, wind_now, max_tilt, table=Q_AOA_BUDGET, q_dyn=None):
@@ -1524,12 +1648,12 @@ class Autopilot3D:
             return base
         e_a = a_des / an
         rho, _, _, a_snd = atmosphere(max(0.0, r[2]))
-        l0 = float(np.dot(self.aero.quick_force(vr, base, rho, a_snd, veh.legs), e_a))
+        l0 = float(np.dot(self._quick(veh, vr, base, rho, a_snd, veh.legs), e_a))
         a_max = math.radians(self.aero_steer_max_deg)
 
         def lift(alpha, e):
             axis = math.cos(alpha) * base + math.sin(alpha) * e
-            return float(np.dot(self.aero.quick_force(vr, axis, rho, a_snd, veh.legs), e_a)) - l0
+            return float(np.dot(self._quick(veh, vr, axis, rho, a_snd, veh.legs), e_a)) - l0
 
         # Engines-first, the lift points against the tilt: find the side that
         # pushes along e_a, then the angle (secant on the real lift curve).
