@@ -203,6 +203,11 @@ class CatchTower:
             b = veh.pos
         return b[:2] + veh.vel[:2] * AIM_LEAD
 
+    def _barrel_xy(self, veh):
+        """Where the barrel is at arm height right now (the approach tracking's
+        lead point minus its lead; the base point if the body is flat)."""
+        return self._aim_point(veh) - np.asarray(veh.vel[:2], float) * AIM_LEAD
+
     def face_gaps(self, veh):
         """Barrel-to-face gap of each arm at arm height (inf if not alongside)."""
         b = self._axis_at(veh, self.arm_top - 0.5 * ARM_DEPTH)
@@ -235,14 +240,28 @@ class CatchTower:
             self.events.append("ARMS READY")
         if self.mode == "READY":
             sink = max(0.3, -float(veh.vel[2]))
-            here = veh.pos[:2] if veh.axis[2] <= 0.3 else self._aim_point(veh) - veh.vel[:2] * AIM_LEAD
+            here = self._barrel_xy(veh)
             in_window = CAPTURE_ALONG[0] < float(here[0]) < CAPTURE_ALONG[1] and abs(float(here[1])) < CAPTURE_ACROSS
             steady = math.hypot(float(veh.vel[0]), float(veh.vel[1])) < CLOSE_SIDE_SPEED
             if in_window and steady and -0.3 < h < max(CLOSE_HEIGHT, sink * CLOSE_LEAD_TIME):
                 self.mode = "CLOSING"
                 self.events.append("ARMS CLOSING")
-                self._close_xy = np.array(here, float)       # the arms close on where it is now: they do not chase it
+                self._close_xy = np.array(here, float)       # the arms close on where it is now
         gaps = self.face_gaps(veh)
+        if self.mode == "CLOSING" and not self.secured and min(gaps) > 0.0:
+            # ... but keep the aim on the barrel while it settles into the hold.
+            # A point latched when the close starts 4.5 m up is half a metre
+            # stale by the catch gate: the arms then stop short of the barrel
+            # (one face touching, the other 0.3 m clear), "secured" never
+            # latches, and the booster hovers at the gate.  Re-aim only while
+            # the booster is inside the capture window and slow, and stop once
+            # a face is pressed into the barrel: from then on the arms must not
+            # chase what they are pushing.
+            here = self._barrel_xy(veh)
+            in_window = CAPTURE_ALONG[0] < float(here[0]) < CAPTURE_ALONG[1] and abs(float(here[1])) < CAPTURE_ACROSS
+            steady = math.hypot(float(veh.vel[0]), float(veh.vel[1])) < CLOSE_SIDE_SPEED
+            if in_window and steady:
+                self._close_xy = here
         done = []
         touching = False
         for k, sgn in enumerate((1.0, -1.0)):

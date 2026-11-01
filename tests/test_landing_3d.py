@@ -154,3 +154,34 @@ def test_tower_arms_steer_to_an_off_centre_booster():
     assert abs(a_plus - a_minus) > 0.02                    # not the symmetric pose of a centred booster
     assert all(g < 0.2 for g in tower.face_gaps(veh))
     assert len(tower.snapshot()["arms"]) == 2
+
+
+def test_closing_arms_re_aim_when_the_booster_centres_after_the_latch():
+    # The close starts ~4.5 m above the arms while the booster still drifts
+    # sideways; a point latched there is half a metre stale by the catch gate.
+    # The arms then stopped short of the barrel (one face touching, the other
+    # ~0.3 m clear), "secured" never latched on all faces, and the booster
+    # hovered at the gate until a transient gap dip.  The arms must keep
+    # aiming at the barrel as it finishes centring over them.
+    tower = CatchTower()
+    veh = Vehicle()
+    z = tower.catch_base_z
+    x0, y0 = 0.65, 0.14
+    veh.reset(position=(x0, y0, z + 3.0), on_pad=False)
+    veh.vel[:] = (0.0, 0.0, -1.0)
+    dt = 1.0 / 120.0
+    for _ in range(4):
+        tower.update(dt, veh)
+        veh.pos[2] = z + 3.0
+    assert tower.mode == "CLOSING"
+    # The booster decelerates onto the axis (as the catch hold does); the
+    # tower has to follow it, not stay on the latched point.
+    for k in range(3 * 120):
+        f = min(1.0, (k + 1) / 240.0)
+        veh.pos[0] = x0 * (1.0 - f) - 0.05 * f
+        veh.pos[1] = y0 * (1.0 - f)
+        tower.update(dt, veh)
+        if tower.secured:
+            break
+    assert tower.secured, (tower.mode, tower.snapshot(), tower.face_gaps(veh))
+    assert all(g <= FACE_CLEARANCE + 0.05 for g in tower.face_gaps(veh)), tower.face_gaps(veh)
