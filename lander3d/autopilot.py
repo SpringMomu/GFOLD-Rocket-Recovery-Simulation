@@ -183,8 +183,25 @@ class Autopilot3D:
     replan_enabled = True         # continuous planning (front-end switch); off: the plan in hand is flown to touchdown, no new ones
     lift_calibrate = True         # ... and scaled by the ratio of the lift measured in flight to the lift of that model
     lift_gain_tau = 3.0           # s, memory of that ratio
+    # Sideways thrust actually flown per tilt of the body axis.  The attitude loop
+    # points the *axis* where the plan points the thrust; to hold the axis
+    # against the aerodynamic moment the gimbal (what the fins cannot hold)
+    # then swings the thrust back towards the flow -- at high dynamic pressure
+    # the thrust is tilted only a fraction 1 - kappa of the axis (14 deg of
+    # axis, 6 deg of thrust at 12 kPa) while the lift follows the axis.  The
+    # plan counts the lost sideways thrust ``kappa u_perp`` in its aerodynamics,
+    # kappa = kappa_coef q / sigma, kappa_coef measured in flight (_update_kappa).
+    kappa_model = True
+    burn_authority = True         # _burn_miss bleeds the sideways speed only as far as tilting the thrust can (at high q hardly at all)
+    miss_tail = 5.0               # s, how far speed left at the end of the burn carries the booster
+    kappa_coef0 = 9.0e-4          # prior of kappa_coef, 1/(Pa s^2/m)
+    kappa_tau = 1.0               # s, memory of the measurement
+    kappa_max = 0.9
     lift_trim = True              # the planner and the glide use the lift of the booster as the attitude loop trims it
     lineup_q_max = 1500.0         # Pa: above this dynamic pressure the glide goes on until ignition (no line-up)
+    brake_floor = True            # the tracker never commands less vertical thrust than stopping the fall takes
+    brake_margin = 1.1            # the braking floor asks this much more deceleration than the bare stopping need
+    brake_floor_limit = 0.97      # ... and never more than this share of the available thrust
     plan_stale_after = 5.0        # s without a new plan (nothing solves): the one in hand is not trusted any more
     fallback_pull_max = 2.0       # m/s^2: pull towards the pad of the plan-less fallback law
     # Wind profile for the predictions: the wind measured now, extrapolated
@@ -505,6 +522,8 @@ class Autopilot3D:
         self._lift_gain = 1.0         # measured / modelled lift of the booster (_update_lift_gain)
         self._lift_num = 0.0
         self._lift_den = 0.0
+        self._kappa_coef = self.kappa_coef0
+        self._next_kappa = 0.0
         self._next_lift_fit = 0.0
         self._q_filt = 0.0
         self.solver_fail = None       # (time, status) of the last re-plan that found no solution at all
@@ -698,6 +717,10 @@ class Autopilot3D:
                 if np.any(tilted):
                     out_g[tilted] -= np.einsum("nij,nj->ni", Gi[tilted], u_ref[grad][tilted])
                 out[grad] = out_g
+                if self.kappa_model:
+                    kap = np.clip(self._kappa_coef * qd[grad] / sig[grad], 0.0, self.kappa_max)
+                    bg = base[grad]
+                    Gi = Gi - kap[:, None, None] * (np.eye(3)[None] - np.einsum("ni,nj->nij", bg, bg))
                 G[grad] = Gi
             out[~live] = 0.0
             return out, G, qd, wd, dq
@@ -815,6 +838,9 @@ class Autopilot3D:
                         grad *= self.lift_gradient_cap * sig / gn
                     Gi += np.outer(grad, e) / sig             # tilt along e ~ (e . u) / sigma
                 out[i] = f0 / m - (Gi @ u_ref if u_ref is not None and np.any(tilt) else 0.0)
+                if self.kappa_model:
+                    kap = float(np.clip(self._kappa_coef * qd[i] / sig, 0.0, self.kappa_max))
+                    Gi = Gi - kap * (np.eye(3) - np.outer(base, base))
                 G[i] = Gi
             return out, G, qd, wd, dq
 
@@ -1324,6 +1350,7 @@ class Autopilot3D:
         self._wind_ref = (np.asarray(wind_now, float).copy(), max(0.5, float(veh.altitude)))
         self._update_wind_profile(veh, wind_now)
         self._update_lift_gain(veh, wind_now)
+        self._update_kappa(veh, wind_now)
         s = veh.spec
         r, v, m = self._state(veh)
         g = G0
@@ -1424,6 +1451,7 @@ class Autopilot3D:
                 v_lim = -(self.gate_speed + self.sink_gain * max(0.0, h))
                 if v[2] < v_lim:
                     accel[2] += 2.0 * (v_lim - v[2])
+            accel = self._braking_floor(veh, r, v, m, accel)
             # Tilt budget tightens with height (upright at contact) and with
             # dynamic pressure: there the body lift of an engines-first
             # booster opposes its tilt and outweighs the thrust's sideways
@@ -1452,12 +1480,44 @@ class Autopilot3D:
             if pn > self.fallback_pull_max:
                 pull *= self.fallback_pull_max / pn
             accel = np.array([pull[0] - 0.9 * v[0], pull[1] - 0.9 * v[1], g + a_brake + 1.5 * (vz_ref - v[2])])   # ... fed forward
+            accel = self._braking_floor(veh, r, v, m, accel)
             max_tilt = math.radians(35.0)
             center = None
             if self.aero is not None:
                 accel = self._aoa_limit(veh, accel, wind_now, max_tilt, self._aoa_table(veh), self._q_filt)
         self._mark()
         self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 and (self.plan is not None or accel[2] > 0.7 * g) else None, center=center)
+
+    def _braking_floor(self, veh, r, v, m, accel):
+        """The vertical thrust acceleration of the command, raised to what it
+        takes to stop the fall at the gate with the thrust the engine has.
+
+        A plan (or the plan-less law) may count on drag, lag behind a stale
+        reference or be starved of fresh solves while the booster falls; the
+        stopping distance does not care.  From the height ``h`` and sink ``vz``
+        a constant deceleration ``a = (vz^2 - v_gate^2) / 2 h`` brings it to
+        the gate speed there; the thrust has to carry ``g + a`` less the drag
+        that is helping now.  Asking for that (``brake_margin`` more, up to
+        ``brake_floor_limit`` of the available thrust) keeps a bad plan from
+        flying the booster into the ground with the engine still throttled
+        back; a plan that already brakes harder is left alone."""
+        if not self.brake_floor:
+            return accel
+        vz = float(v[2])
+        h_eff = float(r[2]) - self.gate_height - 0.3 * max(0.0, -vz)       # spool-up margin
+        if vz > -(self.gate_speed + 0.5) or h_eff < 0.3:
+            return accel
+        a_v = (vz * vz - self.gate_speed ** 2) / (2.0 * max(h_eff, 0.5))
+        aero = veh.last.get("aero")
+        drag_up = max(0.0, float(aero[2]) / m) if aero is not None else 0.0
+        need = self.brake_margin * a_v + G0 - drag_up
+        cap = self.brake_floor_limit * self._thrust_available(veh, float(r[2])) * self.thrust_scale / m
+        need = min(need, cap)
+        if need <= float(accel[2]):
+            return accel
+        out = np.array(accel, float)
+        out[2] = need
+        return out
 
     def _catch_hold(self, veh, r, v, dt):
         """Tower catch: hold the collar just above the arm tops, centred on the
@@ -1705,6 +1765,37 @@ class Autopilot3D:
             self._lift_den += n2
         if self._lift_den > 0.5:
             self._lift_gain = float(np.clip(self._lift_num / self._lift_den, 0.3, 1.5))
+
+    def _update_kappa(self, veh, wind_now):
+        """Measure how much of the axis tilt the thrust really follows (see
+        ``kappa_model``): ``1 - kappa`` = (thrust tilt off the flow line)/(axis
+        tilt off the flow line), with ``kappa = kappa_coef q / sigma``; the
+        coefficient is an exponential average of what the flight shows."""
+        if not self.kappa_model or self.elapsed < self._next_kappa:
+            return
+        dt = 0.05
+        self._next_kappa = self.elapsed + dt
+        thrust = np.asarray(veh.last.get("thrust", (0.0, 0.0, 0.0)), float)
+        tn = float(np.linalg.norm(thrust))
+        vr = veh.vel - wind_now
+        sp = float(np.linalg.norm(vr))
+        if veh.throttle < 0.1 or tn < 1.0 or sp < 20.0:
+            return
+        rho, _, _, _ = atmosphere(max(0.0, float(veh.pos[2])))
+        q = 0.5 * rho * sp * sp
+        if q < 800.0:
+            return
+        w = -vr / sp
+        axis = np.asarray(veh.axis, float)
+        a_perp = axis - w * float(np.dot(axis, w))
+        na2 = float(np.dot(a_perp, a_perp))
+        if na2 < math.sin(math.radians(3.0)) ** 2 or float(np.dot(axis, w)) < 0.5:
+            return                      # too little tilt to tell, or not engines-first
+        td = thrust / tn
+        t_perp = td - w * float(np.dot(td, w))
+        kappa = float(np.clip(1.0 - float(np.dot(t_perp, a_perp)) / na2, 0.0, 0.95))
+        coef = kappa * (tn / veh.mass) / q
+        self._kappa_coef += (float(np.clip(coef, 0.0, 3.0e-3)) - self._kappa_coef) * (1.0 - math.exp(-dt / self.kappa_tau))
 
     def _net_gain_feedback(self, veh, wind_now, u_ff, fb):
         """The sideways feedback of the PD loop, converted from a wish for net
@@ -2077,13 +2168,61 @@ class Autopilot3D:
                 if n_h > 1e-9 and not blind:
                     a_h *= max(0.0, n_h - cap) / n_h
             # steady thrust decel that stops the along-track drift by t_br
-            # (drag does part of it)
-            a_h -= e0 * max(0.0, float(np.dot(u[:2], e0))) / max(dt, t_br - t)
+            # (drag does part of it) -- as far as the controls can give it:
+            # at high dynamic pressure tilting the thrust moves the booster
+            # sideways by ~nothing (the lift of the tilted body takes it
+            # back), so the speed is only bled off lower down, and what is
+            # left of it at the end of the burn is a miss to come
+            along = max(0.0, float(np.dot(u[:2], e0)))
+            bleed = along / max(dt, t_br - t)
+            if self.burn_authority and self.aero is not None and along > 0.0:
+                bleed = min(bleed, self._lateral_authority(veh, p, u, wv if self.aero is not None else None, e0, a_v, m))
+            a_h -= e0 * bleed
             u[:2] += a_h * dt
             u[2] += a_v * dt
             p = p + u * dt
             t += dt
+        if self.burn_authority:
+            # speed still on at the end of the burn takes the booster
+            # further on while the last of it is bled off
+            return p[:2] + self.miss_tail * u[:2], t_br
         return p[:2], t_br
+
+    def _lateral_authority(self, veh, p, u, wv, e0, a_v, m):
+        """Largest sideways acceleration (m/s^2) a landing burn at ``p`` (speed
+        ``u``) can get against the horizontal direction ``e0`` by tilting its
+        thrust: thrust tilt within the angle-of-attack limit and the tilt
+        budget, times the *net* effect of a tilt -- the sideways thrust that
+        is flown (the gimbal holds the axis against the aerodynamic moment,
+        ``kappa``) plus the lift of the tilted body, which opposes it."""
+        rho, _, _, a_snd = atmosphere(max(0.0, float(p[2])))
+        vr = u - (wv if wv is not None else 0.0)
+        sp = float(np.linalg.norm(vr))
+        if sp < 20.0:
+            return math.inf
+        q = 0.5 * rho * sp * sp
+        table = self._aoa_table(veh)
+        if q <= table[0][0]:
+            return math.inf
+        w = -vr / sp                                       # engines-first axis: along the flow
+        t_dir = np.array([-e0[0], -e0[1], 0.0])
+        t_dir -= w * float(np.dot(t_dir, w))
+        tn = float(np.linalg.norm(t_dir))
+        if tn < 1e-6:
+            return math.inf
+        t_dir /= tn
+        theta = min(math.radians(float(np.interp(q, *table))),
+                    math.radians(float(np.interp(max(0.0, float(p[2]) - self.gate_height), *TILT_BUDGET))),
+                    math.radians(35.0))
+        d = math.radians(3.0)
+        ax_p, ax_m = w + d * t_dir, w - d * t_dir
+        f_p = self._quick(veh, vr, ax_p / np.linalg.norm(ax_p), rho, a_snd, 0.0)
+        f_m = self._quick(veh, vr, ax_m / np.linalg.norm(ax_m), rho, a_snd, 0.0)
+        g_lift = float(np.dot(f_p - f_m, t_dir)) / (2.0 * d) / m           # m/s^2 per rad of tilt
+        sig = G0 + a_v
+        kap = float(np.clip(self._kappa_coef * q / sig, 0.0, self.kappa_max)) if self.kappa_model else 0.0
+        net = sig * (1.0 - kap) + g_lift
+        return max(0.0, net) * theta
 
     def _boostback_target(self, veh, r, v, m, wind_now):
         """Velocity change that brings the booster back over the pad.
