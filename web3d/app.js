@@ -265,8 +265,9 @@ function angDiff(a, b) { let d = a - b; while (d > Math.PI) d -= 2 * Math.PI; wh
 // cloud responds to throttle, height and gimbal instead of being scripted.
 const smoke = [];     // {p, v, age, life, size, kind, col, a0, seed, rot, rotV, heat, grow}
 const MAX_SMOKE = 1400;
-const MAX_DUST = 650, DUST_RATE = 260, DUST_TOP = 17, DUST_FULL = 15;   // pad dust: cap, puffs/s, onset heights [m]
-let dustCount = 0, dustAcc = 0;
+const MAX_DUST = 650, DUST_RATE = 260, DUST_TOP = 35, DUST_FULL = 16;   // pad dust: cap, puffs/s, onset / full-flow height of the jet above the pad [m]
+const MAX_TRAIL = 260, TRAIL_RATE = 70;                                // exhaust trail in flight: cap, puffs/s
+let dustCount = 0, dustAcc = 0, trailCount = 0, trailAcc = 0;
 let lastSimT = null;
 let plumeNow = null;
 const rnd = (a = 1) => (Math.random() * 2 - 1) * a;
@@ -290,22 +291,39 @@ function spawnEffects(st, dt, P) {
     // Perpendicular basis around the jet.
     const u1 = V.norm(V.cross(ex, Math.abs(ex[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0])), u2 = V.cross(ex, u1);
     // Exhaust blowing the pad: crisp dust puffs thrown radially outwards from
-    // the impingement point.  They start 17 m above the ground and are in full
-    // flow by 15 m; the count is capped so the cost stays small.
+    // the impingement point.  A thin trickle starts ~35 m up and grows with
+    // the square of the approach (a lot by 18 m, full from ~16 m).  The wall
+    // jet blows them away fast, so nothing stays under the engine
+    // (buildParticles clears the neighbourhood of the impingement point).
     if (P.hit) {
-      const ramp = Math.max(0, Math.min(1, (DUST_TOP - P.hdist) / (DUST_TOP - DUST_FULL)));
-      if (ramp > 0 && dustCount < MAX_DUST) {
+      const ramp = Math.pow(Math.max(0, Math.min(1, (DUST_TOP - P.hdist) / (DUST_TOP - DUST_FULL))), 2);
+      if (ramp > 0.002 && dustCount < MAX_DUST) {
         dustAcc += ramp * (0.85 + 0.15 * P.thr) * DUST_RATE * dt;   // big even at 20 % throttle
         const n = Math.min(Math.floor(dustAcc), MAX_DUST - dustCount);
         dustAcc -= Math.floor(dustAcc);
         const w = st.wind || [0, 0, 0];
         for (let i = 0; i < n; i++) {
           const a = Math.random() * 6.283, c = Math.cos(a), sn = Math.sin(a);
-          const r0 = 0.6 * P.Rj + 1.0, spd = (14 + 30 * Math.random()) * (0.8 + 0.2 * P.thr);
+          const r0 = 0.5 * P.Rj + 0.8 + 2.5 * Math.random(), spd = (22 + 38 * Math.random()) * (0.8 + 0.2 * P.thr);
           const tone = 0.78 + 0.22 * Math.random();
           addP({ p: [P.hit[0] + c * r0, P.hit[1] + sn * r0, 0.5], v: [c * spd + w[0] * 0.3, sn * spd + w[1] * 0.3, 0.6 + 1.6 * Math.random()],
-            life: 1.8 + 2.2 * Math.random(), size: 1.0 + 1.3 * Math.random(), kind: 5, col: [0.46 * tone, 0.42 * tone, 0.37 * tone], a0: 0.8, heat: 0, grow: 2.2 + 2.0 * Math.random() });
+            life: 1.6 + 1.6 * Math.random(), size: 0.8 + 0.8 * Math.random(), kind: 5, col: [0.46 * tone, 0.42 * tone, 0.37 * tone], a0: 0.8, heat: 0, grow: 1.8 + 1.4 * Math.random() });
         }
+      }
+    }
+    // Exhaust trail in flight: a thin string of small crisp puffs left in the
+    // air along the path (not near the ground, where the dust takes over, and
+    // not in the body camera, which sits beside the flame).
+    if (view.cam !== 3 && (!P.hit || P.hdist > DUST_TOP + 5) && trailCount < MAX_TRAIL) {
+      trailAcc += (0.3 + 0.7 * P.thr) * TRAIL_RATE * dt;
+      const n = Math.min(Math.floor(trailAcc), MAX_TRAIL - trailCount);
+      trailAcc -= Math.floor(trailAcc);
+      const thin = 0.35 + 0.65 * P.pamb;
+      for (let i = 0; i < n; i++) {
+        const f = Math.random() * dt, t = 0.5 + 2.5 * Math.random();
+        const base = V.sub(P.exit, V.mul(st.vel, f));
+        addP({ p: V.add(V.add(base, V.mul(ex, t)), [rnd(0.25), rnd(0.25), rnd(0.25)]), v: V.add(V.mul(ex, 6 + 6 * Math.random()), [rnd(1.2), rnd(1.2), rnd(1.2)]),
+          life: 2.5 + 2.5 * Math.random(), size: 0.5 + 0.4 * Math.random(), kind: 6, col: [0.8, 0.8, 0.82], a0: 0.5 * thin, heat: 0, grow: 0.7 + 0.5 * Math.random() });
       }
     }
     // Hot embers / grit ricocheting off the pad while the flame touches it.
@@ -378,19 +396,27 @@ function stepEffects(st, dt, P) {
   const wind = st.wind || [0, 0, 0];
   const jet = P && P.on;
   const U0 = jet ? 60 + 160 * P.thr : 0;                     // jet speed scale for forcing [m/s]
-  dustCount = 0;
+  dustCount = 0; trailCount = 0;
   for (let i = smoke.length - 1; i >= 0; i--) {
     const s = smoke[i];
     s.age += dt;
     if (s.age > s.life) { smoke.splice(i, 1); continue; }
     if (s.kind === 5) {                                        // pad dust: thrown outwards, slows, drifts with the wind
       dustCount++;
-      const k = Math.exp(-1.1 * dt), kw = (1 - k) * 0.3;
+      const k = Math.exp(-0.75 * dt), kw = (1 - k) * 0.3;
       s.v[0] = s.v[0] * k + wind[0] * kw; s.v[1] = s.v[1] * k + wind[1] * kw;
       s.v[2] += (0.7 - s.v[2]) * (1 - Math.exp(-2 * dt));
       s.p = V.add(s.p, V.mul(s.v, dt));
       if (s.p[2] < 0.3 * s.size) s.p[2] = 0.3 * s.size;
       s.size += s.grow * dt; s.grow *= Math.exp(-0.9 * dt);
+      continue;
+    }
+    if (s.kind === 6) {                                        // exhaust trail: the jet speed dies away, then it hangs in the air
+      trailCount++;
+      const k = Math.exp(-1.6 * dt), kw = (1 - k);
+      for (let c = 0; c < 3; c++) s.v[c] = s.v[c] * k + wind[c] * kw;
+      s.p = V.add(s.p, V.mul(s.v, dt));
+      s.size += s.grow * dt; s.grow *= Math.exp(-0.5 * dt);
       continue;
     }
     if (s.kind === 4) {                                        // embers: ballistic with light drag
@@ -450,7 +476,7 @@ function buildParticles(eye, P) {
   occGrid.clear();
   const cell = 5;
   const key = (p) => ((Math.floor(p[0] / cell) * 73856093) ^ (Math.floor(p[1] / cell) * 19349663) ^ (Math.floor(p[2] / cell) * 83492791));
-  for (const s of smoke) if (s.kind !== 4 && s.kind !== 2 && s.kind !== 5) { const k = key(s.p); occGrid.set(k, (occGrid.get(k) || 0) + s.a0 * Math.min(4, s.size)); }
+  for (const s of smoke) if (s.kind < 4 && s.kind !== 2) { const k = key(s.p); occGrid.set(k, (occGrid.get(k) || 0) + s.a0 * Math.min(4, s.size)); }
   const order = new Array(n);
   for (let i = 0; i < n; i++) { const p = smoke[i].p; order[i] = [i, (p[0] - eye[0]) ** 2 + (p[1] - eye[1]) ** 2 + (p[2] - eye[2]) ** 2]; }
   order.sort((a, b) => b[1] - a[1]);
@@ -463,7 +489,11 @@ function buildParticles(eye, P) {
     let a;
     if (s.kind === 2) a = s.a0 * Math.pow(1 - life, 1.6);
     else if (s.kind === 4) a = s.a0;
-    else if (s.kind === 5) a = s.a0 * Math.min(1, (1 - life) / 0.4);
+    else if (s.kind === 5) {
+      a = s.a0 * Math.min(1, (1 - life) / 0.4);
+      // nothing lingers under the engine: the wall jet has already swept it away
+      if (P && P.on && P.hit) { const d = Math.hypot(s.p[0] - P.hit[0], s.p[1] - P.hit[1]), R = 4 + 0.25 * Math.min(P.hdist, 30); a *= Math.max(0, Math.min(1, (d - R) / (0.6 * R))); }
+    } else if (s.kind === 6) a = s.a0 * Math.min(1, s.age * 4) * (1 - life);
     else a = s.a0 * Math.min(1, s.age * 3) * Math.pow(1 - life, 1.3);
     if (s.kind === 1 && rocketAxis) {
       const q = V.sub(s.p, rocketAxis[0]), t = Math.max(0, Math.min(20, V.dot(q, rocketAxis[1])));
@@ -477,7 +507,7 @@ function buildParticles(eye, P) {
     partData[o + 4] = s.col[0]; partData[o + 5] = s.col[1]; partData[o + 6] = s.col[2]; partData[o + 7] = a;
     let emis = 0, open = 1;
     if (s.kind === 4) { emis = 6 * Math.pow(1 - life, 2); open = -1; }
-    else if (s.kind === 5) open = -2;                          // crisp flat-shaded puff
+    else if (s.kind === 5 || s.kind === 6) open = -2;                          // crisp flat-shaded puff
     else if (s.kind !== 2) {
       emis = s.kind === 0 ? 0.25 * Math.exp(-s.age * 3) : 0;
       open = Math.exp(-0.05 * ((occGrid.get(key(s.p)) || 0) - s.a0 * Math.min(4, s.size)));
@@ -530,7 +560,7 @@ function frame(now) {
   const st = interpState(now);
   if (st) {
     const simDt = lastSimT === null ? 0 : Math.max(0, Math.min(0.1, st.t - lastSimT));
-    if (lastSimT !== null && st.t < lastSimT - 0.5) { smoke.length = 0; dustCount = 0; cam.smoothAt = null; cam.auto = true; if (fluid) fluid.reset(); }
+    if (lastSimT !== null && st.t < lastSimT - 0.5) { smoke.length = 0; dustCount = 0; trailCount = 0; cam.smoothAt = null; cam.auto = true; if (fluid) fluid.reset(); }
     lastSimT = st.t;
     scene.resize();
     updateCamera(st, dt);
