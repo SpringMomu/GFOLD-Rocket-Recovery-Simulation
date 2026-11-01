@@ -38,7 +38,7 @@ let latest = null;
 let online = true;
 const CLEAN = /[?&]clean/.test(location.search);
 const view = { flowMode: 0, volField: 1, cam: 0, cfdCoef: null, cfdSps: 0, flowTime: 0, showTraj: false };
-const CAM_NAMES = ["环绕", "着陆台", "侧视", "箭身"];
+const CAM_NAMES = ["环绕", "着陆台", "侧视", "箭身（裙部）", "箭身（栅格舵）"];
 const VOL_NAMES = ["染料", "涡量", "速度"];
 const VOL_TO_TUNNEL = ["dye", "vort", "speed"];
 
@@ -176,6 +176,96 @@ function toast(msg) {
   toastEl.textContent = msg; toastEl.style.display = "block"; toastUntil = performance.now() + 1800;
 }
 
+// ------------------------------------------------------------------ body-mounted cameras
+// Both cameras are rigidly fixed in the body frame: they can neither move nor
+// turn relative to the booster, they only ride with it.
+//  skirt: on a short boom at the skirt (3.4 m out on the -x side, 1.5 m above
+//         the base), looking down the vehicle and 16.5 deg inwards: the engine
+//         bell, the flame streaming away, the legs and the ground.  (From the
+//         hull itself the bell is hidden behind the cylinder.)  Image "up" =
+//         away from the axis.
+//  fin:   above the grid fins, on a boom 2.5 m above them (z = 19.3 m) and 3.9 m
+//         out at the 45 deg azimuth between two fins, looking down at the ring
+//         of fins (z = 16.8 m, r = 2.2 m) so that the panels, their hinges and
+//         their deflection are in view.  Image "up" = towards the nose.
+function bodyCam(st, which) {
+  let eyeB, look, upB, fov;
+  if (which === "fin") {
+    const u = Math.SQRT1_2, r = 3.9;
+    eyeB = [u * r, u * r, 19.3];
+    look = V.norm([u * 1.9 - eyeB[0], u * 1.9 - eyeB[1], 15.6 - eyeB[2]]);
+    upB = V.norm(V.sub([0, 0, 1], V.mul(look, look[2])));
+    fov = 1.3;
+  } else {
+    const tilt = 16.5 * Math.PI / 180;
+    eyeB = [-3.4, 0, 1.5];
+    look = [Math.sin(tilt), 0, -Math.cos(tilt)];
+    upB = [-Math.cos(tilt), 0, -Math.sin(tilt)];
+    fov = 1.4;
+  }
+  const eye = V.add(st.pos, rot(st.q, eyeB));
+  return { eye, at: V.add(eye, V.mul(rot(st.q, look), 40)), up: rot(st.q, upB), fov };
+}
+
+// Camera panel: the chosen body camera in a small window next to the main
+// view, so the third-person camera and the onboard picture can be watched
+// together.  It is a second (small) render pass, only while the panel is open.
+const PIP_W = 480, PIP_H = 270;
+const pipCanvas = document.getElementById("camView");
+const pipCtx = pipCanvas.getContext("2d");
+const pipImg = pipCtx.createImageData(PIP_W, PIP_H);
+const PIP_KEY = "booster3d.pipcam.v1";
+let pipCam = "fin";
+try { const v = localStorage.getItem(PIP_KEY); if (v === "fin" || v === "skirt") pipCam = v; } catch (e) { /* private mode */ }
+const PIP_NAMES = { fin: "栅格舵", skirt: "裙部 / 发动机" };
+function setPipCam(c) {
+  pipCam = c;
+  try { localStorage.setItem(PIP_KEY, c); } catch (e) { /* private mode */ }
+  document.getElementById("camTag").textContent = PIP_NAMES[c];
+  for (const b of document.querySelectorAll("#camSel button")) b.classList.toggle("on", b.dataset.c === c);
+}
+for (const b of document.querySelectorAll("#camSel button")) b.addEventListener("click", () => setPipCam(b.dataset.c));
+setPipCam(pipCam);
+// Resize by the corner grip (mouse or finger); the picture keeps its 16:9 shape.
+const camPanel = document.getElementById("camPanel");
+const SIZE_KEY = "booster3d.pipsize.v1";
+const maxPipW = () => Math.max(160, Math.min(900, window.innerWidth * 0.96));
+const setPipW = (w, remember) => {
+  w = Math.max(160, Math.min(maxPipW(), w));
+  camPanel.style.width = w + "px";
+  // a panel placed by its left edge slides left instead of growing off screen
+  if (camPanel.style.left) camPanel.style.left = Math.max(0, Math.min(parseFloat(camPanel.style.left), window.innerWidth - 4 - w)) + "px";
+  if (remember) { try { localStorage.setItem(SIZE_KEY, String(Math.round(w))); } catch (e) { /* private mode */ } }
+};
+try { const w = Number(localStorage.getItem(SIZE_KEY)); if (w > 0) setPipW(w, false); } catch (e) { /* private mode */ }
+document.addEventListener("layoutreset", () => { camPanel.style.width = ""; try { localStorage.removeItem(SIZE_KEY); } catch (e) { /* private mode */ } });
+{
+  const grip = document.getElementById("camGrip");
+  let drag = null;
+  grip.addEventListener("pointerdown", (e) => {
+    grip.setPointerCapture(e.pointerId);
+    const r = camPanel.getBoundingClientRect();       // pin the left edge so the corner follows the pointer
+    camPanel.style.left = r.left + "px"; camPanel.style.top = r.top + "px"; camPanel.style.right = "auto"; camPanel.style.bottom = "auto";
+    drag = { x: e.clientX, w: camPanel.offsetWidth };
+    e.preventDefault(); e.stopPropagation();
+  });
+  grip.addEventListener("pointermove", (e) => { if (drag) setPipW(drag.w + (e.clientX - drag.x), false); });
+  const end = () => { if (drag) { drag = null; setPipW(camPanel.offsetWidth, true); } };
+  grip.addEventListener("pointerup", end);
+  grip.addEventListener("pointercancel", end);
+}
+let pipFrame = 0;
+function drawPip(st, fx) {
+  if (hud.isFolded("camPanel") || (++pipFrame & 1)) return;      // 30 Hz is plenty for a window this small
+  const bc = bodyCam(st, pipCam);
+  const px = scene.render({ eye: bc.eye, at: bc.at, up: bc.up, fov: bc.fov, dist: 20 }, st,
+    { rcs: fx.rcs, particles: fx.particles, plume: fx.plume, lines: lineBuf.subarray(0, 0) }, { pip: { w: PIP_W, h: PIP_H } });
+  if (!px) return;
+  const src = new Uint32Array(px.buffer), dst = new Uint32Array(pipImg.data.buffer);
+  for (let y = 0; y < PIP_H; y++) dst.set(src.subarray((PIP_H - 1 - y) * PIP_W, (PIP_H - y) * PIP_W), y * PIP_W);   // GL rows run bottom-up
+  pipCtx.putImageData(pipImg, 0, 0);
+}
+
 // ------------------------------------------------------------------ camera
 const cam = { yaw: -2.25, pitch: 0.18, dist: 70, fov: 0.9, eye: [0, 0, 0], at: [0, 0, 0], up: [0, 0, 1], smoothAt: null, auto: true };
 // Mouse or one finger drags the orbit, two fingers pinch the distance,
@@ -226,18 +316,9 @@ function updateCamera(st, dt) {
     cam.dist += (want - cam.dist) * (1 - Math.exp(-dt * 1.5));
   }
   let fov = 0.9, eye, up = [0, 0, 1];
-  if (view.cam === 3) {
-    // Body camera: fixed in the body frame on a short boom at the skirt (3.4 m
-    // out on the -x side, 1.5 m above the base), looking down the vehicle and
-    // 16 deg inwards: the engine bell, the flame streaming away, the legs and
-    // the ground come into view.  (From the hull itself the bell is hidden
-    // behind the cylinder.)  It turns with the booster; image "up" = away
-    // from the axis.
-    const tilt = 16.5 * Math.PI / 180;
-    eye = V.add(st.pos, rot(st.q, [-3.4, 0, 1.5]));
-    const look = rot(st.q, [Math.sin(tilt), 0, -Math.cos(tilt)]);
-    cam.eye = eye; cam.at = V.add(eye, V.mul(look, 40)); cam.fov = 1.4;
-    cam.up = rot(st.q, [-Math.cos(tilt), 0, -Math.sin(tilt)]);
+  if (view.cam >= 3) {
+    const bc = bodyCam(st, view.cam === 3 ? "skirt" : "fin");
+    cam.eye = bc.eye; cam.at = bc.at; cam.up = bc.up; cam.fov = bc.fov;
     return;
   }
   if (view.cam === 1) {
@@ -265,8 +346,9 @@ function angDiff(a, b) { let d = a - b; while (d > Math.PI) d -= 2 * Math.PI; wh
 // cloud responds to throttle, height and gimbal instead of being scripted.
 const smoke = [];     // {p, v, age, life, size, kind, col, a0, seed, rot, rotV, heat, grow}
 const MAX_SMOKE = 1400;
-const MAX_DUST = 650, DUST_RATE = 260, DUST_TOP = 17, DUST_FULL = 15;   // pad dust: cap, puffs/s, onset heights [m]
-let dustCount = 0, dustAcc = 0;
+const MAX_DUST = 650, DUST_RATE = 260, DUST_TOP = 35, DUST_FULL = 16;   // pad dust: cap, puffs/s, onset / full-flow height of the jet above the pad [m]
+const MAX_TRAIL = 260, TRAIL_RATE = 70;                                // exhaust trail in flight: cap, puffs/s
+let dustCount = 0, dustAcc = 0, trailCount = 0, trailAcc = 0;
 let lastSimT = null;
 let plumeNow = null;
 const rnd = (a = 1) => (Math.random() * 2 - 1) * a;
@@ -290,22 +372,39 @@ function spawnEffects(st, dt, P) {
     // Perpendicular basis around the jet.
     const u1 = V.norm(V.cross(ex, Math.abs(ex[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0])), u2 = V.cross(ex, u1);
     // Exhaust blowing the pad: crisp dust puffs thrown radially outwards from
-    // the impingement point.  They start 17 m above the ground and are in full
-    // flow by 15 m; the count is capped so the cost stays small.
+    // the impingement point.  A thin trickle starts ~35 m up and grows with
+    // the square of the approach (a lot by 18 m, full from ~16 m).  The wall
+    // jet blows them away fast, so nothing stays under the engine
+    // (buildParticles clears the neighbourhood of the impingement point).
     if (P.hit) {
-      const ramp = Math.max(0, Math.min(1, (DUST_TOP - P.hdist) / (DUST_TOP - DUST_FULL)));
-      if (ramp > 0 && dustCount < MAX_DUST) {
+      const ramp = Math.pow(Math.max(0, Math.min(1, (DUST_TOP - P.hdist) / (DUST_TOP - DUST_FULL))), 2);
+      if (ramp > 0.002 && dustCount < MAX_DUST) {
         dustAcc += ramp * (0.85 + 0.15 * P.thr) * DUST_RATE * dt;   // big even at 20 % throttle
         const n = Math.min(Math.floor(dustAcc), MAX_DUST - dustCount);
         dustAcc -= Math.floor(dustAcc);
         const w = st.wind || [0, 0, 0];
         for (let i = 0; i < n; i++) {
           const a = Math.random() * 6.283, c = Math.cos(a), sn = Math.sin(a);
-          const r0 = 0.6 * P.Rj + 1.0, spd = (14 + 30 * Math.random()) * (0.8 + 0.2 * P.thr);
+          const r0 = 0.5 * P.Rj + 0.8 + 2.5 * Math.random(), spd = (22 + 38 * Math.random()) * (0.8 + 0.2 * P.thr);
           const tone = 0.78 + 0.22 * Math.random();
           addP({ p: [P.hit[0] + c * r0, P.hit[1] + sn * r0, 0.5], v: [c * spd + w[0] * 0.3, sn * spd + w[1] * 0.3, 0.6 + 1.6 * Math.random()],
-            life: 1.8 + 2.2 * Math.random(), size: 1.0 + 1.3 * Math.random(), kind: 5, col: [0.46 * tone, 0.42 * tone, 0.37 * tone], a0: 0.8, heat: 0, grow: 2.2 + 2.0 * Math.random() });
+            life: 1.6 + 1.6 * Math.random(), size: 0.8 + 0.8 * Math.random(), kind: 5, col: [0.46 * tone, 0.42 * tone, 0.37 * tone], a0: 0.8, heat: 0, grow: 1.8 + 1.4 * Math.random() });
         }
+      }
+    }
+    // Exhaust trail in flight: a thin string of small crisp puffs left in the
+    // air along the path (not near the ground, where the dust takes over, and
+    // not in the body camera, which sits beside the flame).
+    if (view.cam !== 3 && (!P.hit || P.hdist > DUST_TOP + 5) && trailCount < MAX_TRAIL) {
+      trailAcc += (0.3 + 0.7 * P.thr) * TRAIL_RATE * dt;
+      const n = Math.min(Math.floor(trailAcc), MAX_TRAIL - trailCount);
+      trailAcc -= Math.floor(trailAcc);
+      const thin = 0.35 + 0.65 * P.pamb;
+      for (let i = 0; i < n; i++) {
+        const f = Math.random() * dt, t = 0.5 + 2.5 * Math.random();
+        const base = V.sub(P.exit, V.mul(st.vel, f));
+        addP({ p: V.add(V.add(base, V.mul(ex, t)), [rnd(0.25), rnd(0.25), rnd(0.25)]), v: V.add(V.mul(ex, 6 + 6 * Math.random()), [rnd(1.2), rnd(1.2), rnd(1.2)]),
+          life: 2.5 + 2.5 * Math.random(), size: 0.5 + 0.4 * Math.random(), kind: 6, col: [0.8, 0.8, 0.82], a0: 0.5 * thin, heat: 0, grow: 0.7 + 0.5 * Math.random() });
       }
     }
     // Hot embers / grit ricocheting off the pad while the flame touches it.
@@ -378,19 +477,27 @@ function stepEffects(st, dt, P) {
   const wind = st.wind || [0, 0, 0];
   const jet = P && P.on;
   const U0 = jet ? 60 + 160 * P.thr : 0;                     // jet speed scale for forcing [m/s]
-  dustCount = 0;
+  dustCount = 0; trailCount = 0;
   for (let i = smoke.length - 1; i >= 0; i--) {
     const s = smoke[i];
     s.age += dt;
     if (s.age > s.life) { smoke.splice(i, 1); continue; }
     if (s.kind === 5) {                                        // pad dust: thrown outwards, slows, drifts with the wind
       dustCount++;
-      const k = Math.exp(-1.1 * dt), kw = (1 - k) * 0.3;
+      const k = Math.exp(-0.75 * dt), kw = (1 - k) * 0.3;
       s.v[0] = s.v[0] * k + wind[0] * kw; s.v[1] = s.v[1] * k + wind[1] * kw;
       s.v[2] += (0.7 - s.v[2]) * (1 - Math.exp(-2 * dt));
       s.p = V.add(s.p, V.mul(s.v, dt));
       if (s.p[2] < 0.3 * s.size) s.p[2] = 0.3 * s.size;
       s.size += s.grow * dt; s.grow *= Math.exp(-0.9 * dt);
+      continue;
+    }
+    if (s.kind === 6) {                                        // exhaust trail: the jet speed dies away, then it hangs in the air
+      trailCount++;
+      const k = Math.exp(-1.6 * dt), kw = (1 - k);
+      for (let c = 0; c < 3; c++) s.v[c] = s.v[c] * k + wind[c] * kw;
+      s.p = V.add(s.p, V.mul(s.v, dt));
+      s.size += s.grow * dt; s.grow *= Math.exp(-0.5 * dt);
       continue;
     }
     if (s.kind === 4) {                                        // embers: ballistic with light drag
@@ -450,7 +557,7 @@ function buildParticles(eye, P) {
   occGrid.clear();
   const cell = 5;
   const key = (p) => ((Math.floor(p[0] / cell) * 73856093) ^ (Math.floor(p[1] / cell) * 19349663) ^ (Math.floor(p[2] / cell) * 83492791));
-  for (const s of smoke) if (s.kind !== 4 && s.kind !== 2 && s.kind !== 5) { const k = key(s.p); occGrid.set(k, (occGrid.get(k) || 0) + s.a0 * Math.min(4, s.size)); }
+  for (const s of smoke) if (s.kind < 4 && s.kind !== 2) { const k = key(s.p); occGrid.set(k, (occGrid.get(k) || 0) + s.a0 * Math.min(4, s.size)); }
   const order = new Array(n);
   for (let i = 0; i < n; i++) { const p = smoke[i].p; order[i] = [i, (p[0] - eye[0]) ** 2 + (p[1] - eye[1]) ** 2 + (p[2] - eye[2]) ** 2]; }
   order.sort((a, b) => b[1] - a[1]);
@@ -463,7 +570,11 @@ function buildParticles(eye, P) {
     let a;
     if (s.kind === 2) a = s.a0 * Math.pow(1 - life, 1.6);
     else if (s.kind === 4) a = s.a0;
-    else if (s.kind === 5) a = s.a0 * Math.min(1, (1 - life) / 0.4);
+    else if (s.kind === 5) {
+      a = s.a0 * Math.min(1, (1 - life) / 0.4);
+      // nothing lingers under the engine: the wall jet has already swept it away
+      if (P && P.on && P.hit) { const d = Math.hypot(s.p[0] - P.hit[0], s.p[1] - P.hit[1]), R = 4 + 0.25 * Math.min(P.hdist, 30); a *= Math.max(0, Math.min(1, (d - R) / (0.6 * R))); }
+    } else if (s.kind === 6) a = s.a0 * Math.min(1, s.age * 4) * (1 - life);
     else a = s.a0 * Math.min(1, s.age * 3) * Math.pow(1 - life, 1.3);
     if (s.kind === 1 && rocketAxis) {
       const q = V.sub(s.p, rocketAxis[0]), t = Math.max(0, Math.min(20, V.dot(q, rocketAxis[1])));
@@ -477,7 +588,7 @@ function buildParticles(eye, P) {
     partData[o + 4] = s.col[0]; partData[o + 5] = s.col[1]; partData[o + 6] = s.col[2]; partData[o + 7] = a;
     let emis = 0, open = 1;
     if (s.kind === 4) { emis = 6 * Math.pow(1 - life, 2); open = -1; }
-    else if (s.kind === 5) open = -2;                          // crisp flat-shaded puff
+    else if (s.kind === 5 || s.kind === 6) open = -2;                          // crisp flat-shaded puff
     else if (s.kind !== 2) {
       emis = s.kind === 0 ? 0.25 * Math.exp(-s.age * 3) : 0;
       open = Math.exp(-0.05 * ((occGrid.get(key(s.p)) || 0) - s.a0 * Math.min(4, s.size)));
@@ -530,7 +641,7 @@ function frame(now) {
   const st = interpState(now);
   if (st) {
     const simDt = lastSimT === null ? 0 : Math.max(0, Math.min(0.1, st.t - lastSimT));
-    if (lastSimT !== null && st.t < lastSimT - 0.5) { smoke.length = 0; dustCount = 0; cam.smoothAt = null; cam.auto = true; if (fluid) fluid.reset(); }
+    if (lastSimT !== null && st.t < lastSimT - 0.5) { smoke.length = 0; dustCount = 0; trailCount = 0; cam.smoothAt = null; cam.auto = true; if (fluid) fluid.reset(); }
     lastSimT = st.t;
     scene.resize();
     updateCamera(st, dt);
@@ -578,7 +689,8 @@ function frame(now) {
     if (fluidOn && view.flowMode > 0) {
       fx.fluid = fluid; fx.fluidMode = view.volField; fx.fluidVolume = true;
     }
-    scene.render({ eye: cam.eye, at: cam.at, fov: cam.fov, dist: camDist(st.pos) }, stR, fx, view);
+    scene.render({ eye: cam.eye, at: cam.at, up: cam.up, fov: cam.fov, dist: camDist(st.pos) }, stR, fx, view);
+    drawPip(stR, fx);
     hud.update(latest ? Object.assign({}, latest, { pos: st.pos, vel: st.vel, q: st.q, alt: st.alt }) : st, view);
     if (frameNo % 6 === 0) controls.update(latest, view);
   }
