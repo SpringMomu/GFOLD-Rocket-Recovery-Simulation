@@ -186,11 +186,10 @@ class Autopilot3D:
     lift_trim = True              # the planner and the glide use the lift of the booster as the attitude loop trims it
     lineup_q_max = 1500.0         # Pa: above this dynamic pressure the glide goes on until ignition (no line-up)
     brake_floor = True            # a plan that is not being renewed, and the plan-less law, never command less vertical thrust than stopping the fall takes
+    catch_far_distance = 25.0     # m from the catch axis beyond which a catch with a stale plan puts the legs out
     brake_floor_age = 1.0         # s without a new plan after which the one in hand is held to that floor
     brake_margin = 1.1            # the floor asks this much more deceleration than the bare stopping need
     brake_floor_limit = 0.97      # ... and never more than this share of the available thrust
-    fly_best_effort = True        # a plan that cannot stop the booster in time (but has not run away) is still flown -- not used as a reference
-    net_gain_live = False         # the sideways PD feedback is converted by the net gain of a tilt also while re-planning
     plan_stale_after = 5.0        # s without a new plan (nothing solves): the one in hand is not trusted any more
     fallback_pull_max = 2.0       # m/s^2: pull towards the pad of the plan-less fallback law
     # Wind profile for the predictions: the wind measured now, extrapolated
@@ -1135,11 +1134,10 @@ class Autopilot3D:
         t_go = self.touchdown_time - self.elapsed
         self._plan_deadline = time.monotonic() + (self.plan_budget_short if t_go < 8.0 else self.plan_budget)
         solve = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))
-        fit = (lambda p: p.flyable) if self.fly_best_effort else (lambda p: p.sane)
-        if self.plan is not None and not fit(self.plan):
+        if self.plan is not None and not self.plan.sane:
             self.plan = None            # a runaway plan is no plan: fly the fallback law until a real one is found
         plan = solve(t_go)
-        if plan is not None and not fit(plan):
+        if plan is not None and not plan.sane:
             plan = None
         lost = plan is None or plan.terminal_position_error > 10.0
         if self.elapsed >= self._next_search and (t_go > self.retime_freeze or lost):
@@ -1420,7 +1418,7 @@ class Autopilot3D:
             nfb = float(np.linalg.norm(fb))
             if nfb > lim:
                 fb *= lim / nfb
-            if (self.frozen_net_gain if not self.replan_enabled else self.net_gain_live):
+            if not self.replan_enabled and self.frozen_net_gain:
                 fb = self._net_gain_feedback(veh, wind_now, u_ff, fb)
             accel = u_ff + fb
             if h < self.sink_track_height:
@@ -1433,6 +1431,11 @@ class Autopilot3D:
                     accel[2] += 2.0 * (v_lim - v[2])
             if self.elapsed - self.plan.created_at > self.brake_floor_age:
                 accel = self._braking_floor(veh, r, v, m, accel)
+                if (not self.use_legs and float(veh.altitude) < self.legs_deploy_height
+                        and float(np.linalg.norm(r[:2])) > self.catch_far_distance):
+                    # a catch that is nowhere near the tower any more and a plan
+                    # that is not renewed: the way out is a landing on the legs
+                    c.legs_down = True
             # Tilt budget tightens with height (upright at contact) and with
             # dynamic pressure: there the body lift of an engines-first
             # booster opposes its tilt and outweighs the thrust's sideways
