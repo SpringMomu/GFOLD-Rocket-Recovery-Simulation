@@ -313,6 +313,17 @@ class Plan3D:
         return len(self.sigma) - 1
 
     @property
+    def sane(self) -> bool:
+        """Fit to be the reference the next plan is linearised about: it lands
+        (nearly) softly, within the propellant, at speeds the booster can
+        have.  A runaway plan (the aerodynamics predicted along it are then
+        runaway too, and so is the next plan, ...) is not."""
+        return bool(np.all(np.isfinite(self.v)) and self.terminal_velocity_error < self.sane_velocity_error
+                    and self.fuel_violation < 0.05 and float(np.max(np.abs(self.v))) < 400.0)
+
+    sane_velocity_error = 5.0         # m/s
+
+    @property
     def reaches_pad(self) -> bool:
         # Reaching the pad by breaking a physical limit (through an obstacle
         # or the ground, nose-first beyond what the air allows) does not
