@@ -162,6 +162,7 @@ export class HUD {
       for (const el of rest) this.setFolded(el, open);
     };
     this.resetLayout = () => {
+      document.dispatchEvent(new Event("layoutreset"));
       try { localStorage.removeItem(KEY); localStorage.removeItem(FOLD_KEY); } catch (e) { /* ignore */ }
       saved = {}; folds = {};
       for (const el of panels) {

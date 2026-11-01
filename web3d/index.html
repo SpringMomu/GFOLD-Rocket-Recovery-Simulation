@@ -215,7 +215,10 @@ kbd { font-family: var(--mono); background: rgba(255,255,255,0.08); border: 1px 
 #windCfg .wb { display: flex; justify-content: flex-end; margin-top: 4px; }
 
 /* solver settings panel: one single-thumb slider per option, built by solver_panel.js */
-#camPanel { right: 282px; top: 128px; width: 250px; }
+#camPanel { right: 282px; top: 128px; width: 250px; max-width: 96vw; padding-bottom: 6px; }
+#camGrip { position: absolute; right: 1px; bottom: 1px; width: 22px; height: 22px; cursor: nwse-resize; touch-action: none; z-index: 5;
+  background: linear-gradient(135deg, transparent 0 55%, rgba(160,200,230,0.7) 55% 62%, transparent 62% 72%, rgba(160,200,230,0.7) 72% 79%, transparent 79%); }
+#camPanel.collapsed #camGrip { display: none; }
 #camPanel canvas { display: block; width: 100%; aspect-ratio: 16 / 9; background: #000; border: 1px solid rgba(140,190,225,0.25); border-radius: 3px; }
 #solverPanel { left: calc(50% + 170px); top: 84px; width: 290px; max-height: calc(100vh - 110px); overflow-y: auto; }
 #solverPanel .sg { margin: 8px 0 2px; padding-top: 5px; border-top: 1px solid var(--edge); color: var(--cyan); font-size: 10.5px; letter-spacing: 0.1em; }
@@ -276,6 +279,7 @@ body.pad #hint { display: none; }
   #events { left: 6px; top: 164px; width: 240px; display: block; }
   #res { right: 6px; top: 96px; width: 240px; }
   #aero { right: 6px; top: 130px; width: 240px; }
+  #camPanel { right: 6px; top: 164px; width: min(260px, calc(100vw - 12px)); }
   #tunnelPanel { right: 6px; top: 164px; width: calc(100vw - 12px); height: 55vh; min-width: 0; min-height: 0; resize: none; }
   #scope { left: auto; bottom: auto; right: 6px; top: 198px; }
   #cluster { left: 50%; bottom: auto; top: 96px; padding: 14px 6px 6px; gap: 4px; }
@@ -447,7 +451,7 @@ body.pad #hint { display: none; }
   <h3>摄像机 <span class="tag" id="camTag">栅格舵</span></h3>
   <div class="tn-bar"><div class="seg" id="camSel"><button data-c="fin" title="装在栅格舵上方，看舵面">栅格舵</button><button data-c="skirt" title="装在裙部外侧，朝下看发动机与着陆腿">裙部 / 发动机</button></div></div>
   <canvas id="camView" width="480" height="270"></canvas>
-  <div class="tn-foot"><span>固定机位 · 随箭体转动，不可移动旋转</span></div>
+  <div id="camGrip" title="拖动调整大小"></div>
 </div>
 
 <div id="solverPanel" class="panel">

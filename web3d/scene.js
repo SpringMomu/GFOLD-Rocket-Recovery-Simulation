@@ -874,7 +874,7 @@ export class Scene {
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, pa.data, 0, Math.min(pa.n, this.partMax) * 12);
     }
     if (pa && pa.nFar > 0) this._drawParticles(0, pa.nFar, partCtx);
-    if (P.on) this._drawPlume(P);
+    if (P.on) this._drawPlume(P, cam);
     if (pa && pa.n > pa.nFar) this._drawParticles(pa.nFar, Math.min(pa.n, this.partMax) - pa.nFar, partCtx);
     if (fx.rcs && fx.rcs.length) this._drawRcs(fx.rcs, cam);
 
@@ -898,7 +898,7 @@ export class Scene {
 
   // Simple game-style flame: three flat-coloured teardrops along the exhaust
   // axis (outer orange, yellow, white core), opaque, no spreading.
-  _drawPlume(P) {
+  _drawPlume(P, cam) {
     const gl = this.gl, T = this.targets, pp = this.progFlame;
     const z = P.axis, ang = Math.acos(Math.max(-1, Math.min(1, z[2]))), ax = V.cross([0, 0, 1], z);
     const m = M4.mul(M4.translate(P.exit), V.len(ax) > 1e-6 ? M4.rotAxis(ax, ang) : (z[2] < 0 ? M4.rotAxis([1, 0, 0], Math.PI) : M4.ident()));
@@ -909,11 +909,14 @@ export class Scene {
     gl.uniformMatrix4fv(pp.u.u_model, false, m);
     gl.uniform1f(pp.u.u_logFar, Math.log2(FAR + 1));
     gl.uniform1f(pp.u.u_time, t % 1000);
+    gl.uniform3fv(pp.u.u_cam, cam.eye);
     gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, T.depthTex); gl.uniform1i(pp.u.u_depth, 3);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     const I = 0.7 + 0.3 * P.thr;
-    const layers = [[1.0, 1.0, [3.2, 1.15, 0.2]], [0.62, 0.74, [4.6, 3.0, 0.75]], [0.32, 0.46, [5.2, 4.8, 3.4]]];
-    for (const [rs, ls, col] of layers) {
+    // [radius scale, length scale, colour, opacity]: soft shells, denser towards the core
+    const layers = [[1.25, 1.0, [3.2, 1.15, 0.2], 0.75], [0.8, 0.78, [4.6, 3.0, 0.75], 0.85], [0.42, 0.5, [5.2, 4.8, 3.4], 0.95]];
+    for (const [rs, ls, col, al] of layers) {
+      gl.uniform1f(pp.u.u_A, al);
       gl.uniform1f(pp.u.u_len, P.flameLen * flick * ls);
       gl.uniform1f(pp.u.u_rad, EXIT_R * 1.75 * (0.85 + 0.15 * P.thr) * rs);
       gl.uniform1f(pp.u.u_seed, rs * 7.0);

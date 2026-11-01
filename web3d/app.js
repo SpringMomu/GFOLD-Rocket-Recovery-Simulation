@@ -226,6 +226,34 @@ function setPipCam(c) {
 }
 for (const b of document.querySelectorAll("#camSel button")) b.addEventListener("click", () => setPipCam(b.dataset.c));
 setPipCam(pipCam);
+// Resize by the corner grip (mouse or finger); the picture keeps its 16:9 shape.
+const camPanel = document.getElementById("camPanel");
+const SIZE_KEY = "booster3d.pipsize.v1";
+const maxPipW = () => Math.max(160, Math.min(900, window.innerWidth * 0.96));
+const setPipW = (w, remember) => {
+  w = Math.max(160, Math.min(maxPipW(), w));
+  camPanel.style.width = w + "px";
+  // a panel placed by its left edge slides left instead of growing off screen
+  if (camPanel.style.left) camPanel.style.left = Math.max(0, Math.min(parseFloat(camPanel.style.left), window.innerWidth - 4 - w)) + "px";
+  if (remember) { try { localStorage.setItem(SIZE_KEY, String(Math.round(w))); } catch (e) { /* private mode */ } }
+};
+try { const w = Number(localStorage.getItem(SIZE_KEY)); if (w > 0) setPipW(w, false); } catch (e) { /* private mode */ }
+document.addEventListener("layoutreset", () => { camPanel.style.width = ""; try { localStorage.removeItem(SIZE_KEY); } catch (e) { /* private mode */ } });
+{
+  const grip = document.getElementById("camGrip");
+  let drag = null;
+  grip.addEventListener("pointerdown", (e) => {
+    grip.setPointerCapture(e.pointerId);
+    const r = camPanel.getBoundingClientRect();       // pin the left edge so the corner follows the pointer
+    camPanel.style.left = r.left + "px"; camPanel.style.top = r.top + "px"; camPanel.style.right = "auto"; camPanel.style.bottom = "auto";
+    drag = { x: e.clientX, w: camPanel.offsetWidth };
+    e.preventDefault(); e.stopPropagation();
+  });
+  grip.addEventListener("pointermove", (e) => { if (drag) setPipW(drag.w + (e.clientX - drag.x), false); });
+  const end = () => { if (drag) { drag = null; setPipW(camPanel.offsetWidth, true); } };
+  grip.addEventListener("pointerup", end);
+  grip.addEventListener("pointercancel", end);
+}
 let pipFrame = 0;
 function drawPip(st, fx) {
   if (hud.isFolded("camPanel") || (++pipFrame & 1)) return;      // 30 Hz is plenty for a window this small

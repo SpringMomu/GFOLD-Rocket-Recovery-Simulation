@@ -353,29 +353,33 @@ out vec2 v_uv;
 void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); v_uv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }`;
 
 // ------------------------------------------------------------------ engine flame
-// Game-style flame: three nested flat-coloured teardrops (orange / yellow /
-// white core) drawn opaque and hard-edged.  No spreading, no noise, no
-// volumetrics -- just a length that follows the throttle and a flicker.
+// Game-style flame: three nested teardrops (orange / yellow / white core) with
+// soft edges -- the opacity falls off towards the silhouette (like looking
+// through a glowing gas shell) and towards the tip.  No spreading plume, no
+// noise, no volumetrics: the length follows the throttle, plus a flicker.
 export const FLAME_VS = `#version 300 es
 precision highp float;
 layout(location=0) in vec3 a_pos; layout(location=1) in vec3 a_nrm;
 uniform mat4 u_vp, u_model; uniform float u_len, u_rad, u_time, u_seed;
-out float v_w; out float v_s;
+out float v_w; out float v_s; out vec3 v_n; out vec3 v_world;
 void main() {
   float s = a_pos.z;                                   // 0 at the nozzle exit, 1 at the tip
   float wob = 1.0 + 0.07 * sin(u_time * 47.0 + s * 9.0 + u_seed) * smoothstep(0.1, 0.8, s);
   vec4 w = u_model * vec4(a_pos.xy * u_rad * wob, s * u_len, 1.0);
-  v_s = s;
+  v_n = mat3(u_model) * vec3(a_nrm.xy / max(u_rad, 1e-3), a_nrm.z / max(u_len, 1e-3));
+  v_world = w.xyz; v_s = s;
   gl_Position = u_vp * w; v_w = gl_Position.w;
 }`;
 export const FLAME_FS = `#version 300 es
 precision highp float;
-in float v_w; in float v_s; out vec4 o;
-uniform highp sampler2D u_depth; uniform float u_logFar; uniform vec3 u_col; uniform float u_I;
+in float v_w; in float v_s; in vec3 v_n; in vec3 v_world; out vec4 o;
+uniform highp sampler2D u_depth; uniform float u_logFar; uniform vec3 u_col, u_cam; uniform float u_I, u_A;
 void main() {
   float wS = exp2(texelFetch(u_depth, ivec2(gl_FragCoord.xy), 0).r * u_logFar) - 1.0;
   if (v_w > wS) discard;
-  o = vec4(u_col * u_I, 1.0);
+  float f = abs(dot(normalize(v_n), normalize(u_cam - v_world)));       // 1 facing the eye, 0 at the silhouette
+  float a = u_A * smoothstep(0.0, 0.8, f) * (1.0 - smoothstep(0.5, 1.0, v_s));
+  o = vec4(u_col * u_I * a, a);
 }`;
 
 // ------------------------------------------------------------------ smoke / dust / sparks (instanced billboards)
