@@ -11,6 +11,7 @@ const SCENARIOS = ["HOVER-SLAM 100 m", "2000 m / +30 m/s UP", "2000 m / -30 m/s 
   "DIVERT -1000 m / 3-D", "ENTRY 12 km / 280 m/s", "TOWER CATCH 2000 m", "TOWER CATCH BOOSTBACK", "TOWER CATCH ENTRY 12 km",
   "TOWER CATCH OVER TOWER"];
 const PAD_KEY = "booster3d.pad.v1";
+const WIND_KEY = "booster3d.wind.v1";
 // Same as lander3d/vehicle.py Wind(): steady 6 m/s from the west, log-law shear.
 const WIND_DEFAULT = { from: [270, 270], speed: [6, 6], shear: 1 };
 const COMPASS = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"];
@@ -126,6 +127,7 @@ export function initControls({ press, command, act }) {
   const sendWind = () => {
     const c = windCfg();
     act("windcfg:" + JSON.stringify(c));
+    try { localStorage.setItem(WIND_KEY, JSON.stringify(c)); } catch (e) { /* ignore */ }
     windSent = c; windSentUntil = performance.now() + 5000;
   };
   for (const i of [...dirIn, ...spdIn, shIn]) {
@@ -134,9 +136,13 @@ export function initControls({ press, command, act }) {
     i.addEventListener("pointerdown", (ev) => ev.stopPropagation());
   }
   $("wReset").addEventListener("click", (ev) => { ev.stopPropagation(); setWind(WIND_DEFAULT); sendWind(); $("wReset").blur(); });
-  // Every load starts with the default wind (the server is told too, so a
-  // wind left over from an earlier visit does not carry on).
-  setWind(WIND_DEFAULT); sendWind();
+  // The last settings are remembered (the browser simulator starts afresh on
+  // every load; the server keeps its own until told otherwise).
+  let stored = null;
+  try { stored = JSON.parse(localStorage.getItem(WIND_KEY) || "null"); } catch (e) { stored = null; }
+  if (stored && Array.isArray(stored.from) && Array.isArray(stored.speed) && typeof stored.shear === "number") {
+    setWind(stored); sendWind();
+  } else setWind(WIND_DEFAULT);
 
   // ---- live state of the toggle buttons
   const on = (id, v) => { const el = $(id); if (el) el.classList.toggle("on", !!v); };
