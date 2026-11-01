@@ -85,7 +85,7 @@ def snapshot(sim: Sim3D) -> dict:
                      "cp_z": round(float(a.get("cp_z", zc)), 3), "com_z": round(zc, 3), "source": a.get("source", "MODEL"),
                      "force": _vec(a.get("force", np.zeros(3))), "tail_first": bool(a.get("tail_first", True)),
                      "rho": round(rho, 4), "cfd_forces": sim.aero.cfd_forces},
-            "wind": _vec(wind), "wind_on": sim.wind.enabled, "wind_cfg": sim.wind.config(),
+            "wind": _vec(wind), "wind_on": sim.wind.enabled, "wind_cfg": sim.wind.config(), "replan": sim.autopilot.replan_enabled,
             "solver_cfg": dict(sim.solver_cfg), "solver_opts": settings.options_snapshot(),
             "plan": [_vec(pt) for pt in plan], "trail": [_vec(pt) for pt in trail],
             "touchdown": v.touchdown, "tower": None if sim.tower is None else sim.tower.snapshot(), "events": [[round(t, 1), e] for t, e in sim.events[-6:]],
@@ -163,7 +163,7 @@ def make_handler(sim: Sim3D):
 
 
 def serve(port: int, open_browser: bool) -> None:
-    sim = Sim3D(cfd=True)
+    sim = Sim3D(cfd=True, scenario=8, wind_on=False)      # scenario 9, no wind
     Runner(sim).thread.start()
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(sim))
     url = f"http://127.0.0.1:{port}/"

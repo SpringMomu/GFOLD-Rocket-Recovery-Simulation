@@ -162,6 +162,7 @@ class Autopilot3D:
     catch_hold_tilt_deg = 4.0     # tilt budget about the wind trim while holding
     catch_integral_radius = 1.0   # m: the hold's integral only builds up this close to the axis
     glide_gain = 1.5
+    replan_enabled = True         # continuous planning (front-end switch); off: the plan in hand is flown to touchdown, no new ones
     lift_calibrate = True         # ... and scaled by the ratio of the lift measured in flight to the lift of that model
     lift_gain_tau = 3.0           # s, memory of that ratio
     lift_trim = True              # the planner and the glide use the lift of the booster as the attitude loop trims it
@@ -938,7 +939,7 @@ class Autopilot3D:
             self._catch_hold(veh, r, v, dt)
             return
         stranded = t_go <= 0.6 and (h > 20.0 or float(np.linalg.norm(r[:2])) > 15.0)
-        if self.planner.available and self.elapsed >= self.next_replan and (t_go > 0.6 or stranded):
+        if self.replan_enabled and self.planner.available and self.elapsed >= self.next_replan and (t_go > 0.6 or stranded):
             self._replan(veh, wind_now)
             self._publish()
             t_go = self.touchdown_time - self.elapsed

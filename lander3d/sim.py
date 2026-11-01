@@ -46,10 +46,13 @@ SCENARIOS = [
 
 
 class Sim3D:
-    def __init__(self, cfd: bool = True) -> None:
+    def __init__(self, cfd: bool = True, scenario: int = 3, wind_on: bool = True) -> None:
+        """``scenario`` is the one loaded at start, ``wind_on`` whether the wind
+        blows at start (the headless regressions keep the defaults; the server
+        and the browser simulator start in scenario 9 without wind)."""
         self.vehicle = Vehicle()
         self.aero = AeroModel(self.vehicle.spec)
-        self.wind = Wind()
+        self.wind = Wind(enabled=wind_on)
         self.autopilot = Autopilot3D(self.aero)
         self.solver_cfg = settings.defaults()      # guidance settings (the front end's solver panel)
         settings.apply(self.autopilot, self.solver_cfg)
@@ -69,7 +72,7 @@ class Sim3D:
         self.events: list = []
         self._hold_axis = None
         self._realtime_debt = 0.0
-        self.load_scenario(3)
+        self.load_scenario(scenario)
 
     # -- setup -----------------------------------------------------------------
     def load_scenario(self, index: int, autopilot: bool = True) -> None:
@@ -195,6 +198,10 @@ class Sim3D:
         elif action == "cfd_forces":
             self.aero.cfd_forces = not self.aero.cfd_forces
             self.events.append((self.time, "AERO FORCES: " + ("LIVE 3D CFD" if self.aero.cfd_forces else "ENGINEERING MODEL")))
+        elif action == "replan":
+            # Continuous planning off: the plan in hand (the last one made) is flown to touchdown by the tracker alone
+            self.autopilot.replan_enabled = not self.autopilot.replan_enabled
+            self.events.append((self.time, "REPLAN " + ("ON" if self.autopilot.replan_enabled else "OFF")))
         elif action == "wind":
             self.wind.enabled = not self.wind.enabled
             self.events.append((self.time, "WIND " + ("ON" if self.wind.enabled else "OFF")))

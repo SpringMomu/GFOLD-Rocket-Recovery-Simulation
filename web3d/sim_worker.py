@@ -12,7 +12,7 @@ sys.path.insert(0, "/home/pyodide/sim")
 from lander3d.server import finite, snapshot
 from lander3d.sim import Sim3D
 
-sim = Sim3D(cfd=True)
+sim = Sim3D(cfd=True, scenario=8, wind_on=False)      # scenario 9, no wind (as the local server)
 
 
 def advance(real_seconds: float) -> None:

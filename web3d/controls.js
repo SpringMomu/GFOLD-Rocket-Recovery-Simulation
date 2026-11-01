@@ -148,6 +148,24 @@ export function initControls({ press, command, act }) {
   // ---- solver settings panel (guidance options)
   const solver = initSolverPanel({ act });
 
+  // ---- the wind settings fold away (closed on first use, remembered)
+  const WFOLD_KEY = "booster3d.windfold.v1";
+  let wOpen = false;
+  try { wOpen = localStorage.getItem(WFOLD_KEY) === "open"; } catch (e) { /* ignore */ }
+  const paintWFold = () => {
+    $("windCfg").classList.toggle("collapsed", !wOpen);
+    $("wToggle").setAttribute("aria-expanded", wOpen ? "true" : "false");
+    $("wArrow").textContent = wOpen ? "▾" : "▸";
+  };
+  $("wToggle").addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    wOpen = !wOpen; paintWFold();
+    try { localStorage.setItem(WFOLD_KEY, wOpen ? "open" : "closed"); } catch (e) { /* ignore */ }
+    $("wToggle").blur();
+  });
+  $("wToggle").addEventListener("pointerdown", (ev) => ev.stopPropagation());
+  paintWFold();
+
   // ---- live state of the toggle buttons
   const on = (id, v) => { const el = $(id); if (el) el.classList.toggle("on", !!v); };
   return {
@@ -158,6 +176,7 @@ export function initControls({ press, command, act }) {
       if (wc && windSent && (sameWind(wc, windSent) || now > windSentUntil)) windSent = null;
       if (wc && !windSent && now > windHold && !$("windCfg").contains(document.activeElement) && !sameWind(wc, windCfg())) setWind(wc);
       on("tbAP", st.autopilot); on("padAP", st.autopilot);
+      on("tbReplan", st.replan !== false);
       on("tbPause", st.paused);
       on("padSAS", st.sas && st.sas !== "OFF");
       on("padLegs", st.legs > 0.5);
