@@ -1,9 +1,10 @@
 // On-screen controls: the menu panel (scenario selector + the keyboard
 // commands as buttons + the wind sliders) and the touch flight pad (virtual
 // stick = W/A/S/D, roll, throttle, autopilot / SAS / legs).  Both only send
-// inputs (the wind sliders the action "windcfg:<json>"); the state they show
+// inputs (the wind sliders the action "windcfg:<json>", the solver panel "solvercfg:<json>"); the state they show
 // is read from the snapshot.
 import * as ZH from "./zh.js";
+import { initSolverPanel } from "./solver_panel.js";
 
 const $ = (id) => document.getElementById(id);
 // Same order as lander3d/sim.py SCENARIOS (action "scenario:<index>").
@@ -144,11 +145,15 @@ export function initControls({ press, command, act }) {
     setWind(stored); sendWind();
   } else setWind(WIND_DEFAULT);
 
+  // ---- solver settings panel (guidance options)
+  const solver = initSolverPanel({ act });
+
   // ---- live state of the toggle buttons
   const on = (id, v) => { const el = $(id); if (el) el.classList.toggle("on", !!v); };
   return {
     update(st, view) {
       if (!st) return;
+      solver.update(st);
       const wc = st.wind_cfg, now = performance.now();
       if (wc && windSent && (sameWind(wc, windSent) || now > windSentUntil)) windSent = null;
       if (wc && !windSent && now > windHold && !$("windCfg").contains(document.activeElement) && !sameWind(wc, windCfg())) setWind(wc);

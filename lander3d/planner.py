@@ -313,6 +313,17 @@ class Plan3D:
         return len(self.sigma) - 1
 
     @property
+    def sane(self) -> bool:
+        """Fit to be the reference the next plan is linearised about: it lands
+        (nearly) softly, within the propellant, at speeds the booster can
+        have.  A runaway plan (the aerodynamics predicted along it are then
+        runaway too, and so is the next plan, ...) is not."""
+        return bool(np.all(np.isfinite(self.v)) and self.terminal_velocity_error < self.sane_velocity_error
+                    and self.fuel_violation < 0.05 and float(np.max(np.abs(self.v))) < 400.0)
+
+    sane_velocity_error = 5.0         # m/s
+
+    @property
     def reaches_pad(self) -> bool:
         # Reaching the pad by breaking a physical limit (through an obstacle
         # or the ground, nose-first beyond what the air allows) does not
@@ -384,6 +395,11 @@ class Planner3D:
     keep_out_weight = 2000.0       # per m inside an obstacle's half-space (per s)
     ground_weight = 2000.0         # per m below the ground (per s)
     elastic_weight = 1.0e4         # per m/s^2 outside a state-tied limit (tilt cone, slew, first knot)
+    # Share of the predicted aerodynamic force that the sideways-effort cost
+    # nets off (1: holding still against a cross wind is free, 0: the cost is
+    # on the thrust alone).  Front-end option (lander3d/settings.py).
+    lateral_aero_share = 1.0
+    max_iter = 100                 # interior-point iteration cap (settings)
 
     def __init__(self) -> None:
         self.solve_count = 0
@@ -673,7 +689,7 @@ class Planner3D:
         lam = self.lateral_accel_weight
         for k in range(N + 1):
             q[U(k, 3)] += w[k]
-            d_k = drag[min(k, N - 1)]
+            d_k = drag[min(k, N - 1)] * self.lateral_aero_share
             for c_ in (0, 1):
                 # lam |u_c + d_c|^2: the net sideways acceleration
                 add_p(U(k, c_), U(k, c_), 2 * lam * w[k])
@@ -735,12 +751,12 @@ class Planner3D:
         if not self.available or not (t_f > 0.3):
             return None
         P, q, A, b, nz, nn, socs, L, drag, const = self.build(r0, v0, m0, t_f, cfg)
-        x, status = self.solver.solve(P, q, A, b, nz, nn, socs)
+        x, status = self.solver.solve(P, q, A, b, nz, nn, socs, max_iter=self.max_iter)
         if x is None and status not in ("no-solver",):
             # The problem is always feasible (every state-tied limit is
             # elastic), so a failure is numerical -- the iteration cap or no
             # progress on a badly scaled step: once more with more room.
-            x, status = self.solver.solve(P, q, A, b, nz, nn, socs, max_iter=400)
+            x, status = self.solver.solve(P, q, A, b, nz, nn, socs, max_iter=max(400, self.max_iter))
         self.last_status = status
         if x is None:
             return None

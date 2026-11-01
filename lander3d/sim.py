@@ -11,6 +11,7 @@ import threading
 
 import numpy as np
 
+from . import settings
 from .aero import AeroModel, ExternalCFD
 from .attitude import attitude_control
 from .autopilot import Autopilot3D
@@ -50,6 +51,8 @@ class Sim3D:
         self.aero = AeroModel(self.vehicle.spec)
         self.wind = Wind()
         self.autopilot = Autopilot3D(self.aero)
+        self.solver_cfg = settings.defaults()      # guidance settings (the front end's solver panel)
+        settings.apply(self.autopilot, self.solver_cfg)
         self.cfd = ExternalCFD() if cfd else None
         self.aero.cfd = self.cfd
         self.lock = threading.RLock()
@@ -204,6 +207,27 @@ class Sim3D:
                 return
             c = self.wind.config()
             self.events.append((self.time, "WIND CFG {:.0f}-{:.0f} {:.1f}-{:.1f} {:.1f}".format(*c["from"], *c["speed"], c["shear"])))
+        elif action.startswith("solvercfg:"):
+            # {"<option>": value, ...} (lander3d/settings.py); the guidance replans with them from now on
+            try:
+                changed = self.set_solver_cfg(json.loads(action[len("solvercfg:"):]))
+            except ValueError:
+                return
+            if changed:
+                self.events.append((self.time, "SOLVER CFG"))
+        elif action == "solverreset":
+            self.solver_cfg = settings.defaults()
+            settings.apply(self.autopilot, self.solver_cfg)
+            self.events.append((self.time, "SOLVER CFG DEFAULT"))
+
+    def set_solver_cfg(self, raw) -> bool:
+        """Merge the valid entries of ``raw`` into the guidance settings."""
+        changes = settings.sanitize(raw)
+        if not changes:
+            return False
+        self.solver_cfg.update(changes)
+        settings.apply(self.autopilot, self.solver_cfg)
+        return True
 
     def handle_input(self, keys: dict, actions: list[str]) -> None:
         """Replace the held-key state and run the queued actions."""

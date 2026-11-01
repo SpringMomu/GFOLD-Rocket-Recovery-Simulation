@@ -162,6 +162,8 @@ class Autopilot3D:
     catch_hold_tilt_deg = 4.0     # tilt budget about the wind trim while holding
     catch_integral_radius = 1.0   # m: the hold's integral only builds up this close to the axis
     glide_gain = 1.5
+    plan_stale_after = 5.0        # s without a new plan (nothing solves): the one in hand is not trusted any more
+    fallback_pull_max = 2.0       # m/s^2: pull towards the pad of the plan-less fallback law
     # Wind profile for the predictions: the wind measured now, extrapolated
     # to other heights with a log-law profile whose shear strength k (as in
     # vehicle.Wind: 0 = the same at every height, 1 = the standard log law)
@@ -170,6 +172,12 @@ class Autopilot3D:
     wind_sample_period = 0.25     # s
     wind_memory = 60.0            # s, e-folding age of the samples
     wind_shear_prior_weight = 0.003   # (shapes of nearby k differ little: a stronger prior hides real shear)
+    # Wind-resistance options of the plan (front-end solver panel, see
+    # lander3d/settings.py; the defaults are the original behaviour):
+    wind_plan_gain = 1.0          # wind the planner's predictions assume, x the extrapolated measured wind
+    aero_pred = 2                 # aerodynamics in the plan: 0 none, 1 drag at the reference attitude, 2 + lift linearisation
+    trim_gain = 1.0               # share of the wind trim (lean into the wind) used by the tilt cone and the tracker
+    shear_fit = True              # fit the shear strength from the winds measured on the way down (else k = 1)
     # Wind trim: the sideways thrust acceleration that cancels the aerodynamic
     # force on the upright booster (lean into the wind).  The tracker's tilt
     # budget and the planner's tilt cone are both centred on it (fading to
@@ -268,6 +276,13 @@ class Autopilot3D:
         self.visited: list = []
 
     # ------------------------------------------------------------ helpers
+    def _ref_plan(self):
+        """The plan the next one is linearised about (aerodynamics, route,
+        heights, directions): the one in hand once the burn is on, unless it
+        has run away (``Plan3D.sane``) -- then a straight descent again."""
+        p = self.plan if self.burn_locked else None
+        return p if p is not None and p.sane else None
+
     def _state(self, veh):
         r = np.array([veh.pos[0], veh.pos[1], veh.altitude - self.h_off])
         return r, veh.vel.copy(), veh.mass
@@ -286,7 +301,7 @@ class Autopilot3D:
         booster this force points opposite to the tilt, which is why a plan
         that ignored it would overshoot laterally at high dynamic pressure.
         """
-        prev = self.plan if self.burn_locked else None
+        prev = self._ref_plan()
         now = self.elapsed
         r0, v0, m0 = self._state(veh)
         legs = max(veh.legs, 1.0 if veh.controls.legs_down else 0.0)
@@ -331,7 +346,7 @@ class Autopilot3D:
                     sig = max(3.0, prev.sigma_at(tau))
                     u_ref = acc
                 rho, _, _, a = atmosphere(max(0.0, h + self.h_off))
-                vr = v - self._wind(h)          # the wind where the plan will be, not the wind here
+                vr = v - self._wind_plan(h)     # the wind where the plan will be, not the wind here
                 sp = float(np.linalg.norm(vr))
                 qd[i] = 0.5 * rho * sp * sp
                 # lower down the wind is weaker (and the air a little denser):
@@ -339,12 +354,14 @@ class Autopilot3D:
                 qs = []
                 for dh in (5.0, -5.0):
                     rho_d = atmosphere(max(0.0, h + dh + self.h_off))[0]
-                    qs.append(0.5 * rho_d * float(np.linalg.norm(v - self._wind(h + dh))) ** 2)
+                    qs.append(0.5 * rho_d * float(np.linalg.norm(v - self._wind_plan(h + dh))) ** 2)
                 dq[i] = (qs[0] - qs[1]) / 10.0
                 if sp < 3.0:
                     continue
                 u = vr / sp
                 wd[i] = -u
+                if self.aero_pred <= 0:
+                    continue                # (the angle-of-attack cap above still sees the flow)
                 base = -u
                 # Linearise around the reference attitude (successive
                 # linearisation: each replan uses the previous plan's tilt).
@@ -366,6 +383,9 @@ class Autopilot3D:
                     out[i] = self.aero.quick_force(vr, broadside, rho, a, legs) / m
                     continue
                 f0 = self.aero.quick_force(vr, axis0, rho, a, legs)
+                if self.aero_pred == 1:
+                    out[i] = f0 / m         # drag at the reference attitude, no lift gradient
+                    continue
                 e1 = np.cross(u, [0.0, 0.0, 1.0] if abs(u[2]) < 0.9 else [1.0, 0.0, 0.0])
                 e1 /= np.linalg.norm(e1)
                 e2 = np.cross(u, e1)
@@ -397,7 +417,7 @@ class Autopilot3D:
             return None
         now = self.elapsed
         boxes = self.obstacles
-        prev = self.plan if self.burn_locked else None
+        prev = self._ref_plan()
         if path is not None or (prev is not None and not prev.reaches_pad):
             prev = None
         if prev is None and path is None:
@@ -420,7 +440,7 @@ class Autopilot3D:
     def _height_ref(self, veh):
         """Reference heights at the knot times (for the tilt budget): the
         previous plan stretched over the new horizon, else a straight descent."""
-        prev = self.plan if self.burn_locked else None
+        prev = self._ref_plan()
         now = self.elapsed
         h0 = float(self._state(veh)[0][2])
 
@@ -438,7 +458,7 @@ class Autopilot3D:
         """Reference thrust direction at the knot times (for the planner's
         slew limit): the previous plan's, stretched over the new horizon like
         the heights; at ignition (no plan yet) the body axis."""
-        prev = self.plan if self.burn_locked else None
+        prev = self._ref_plan()
         now = self.elapsed
         axis = np.asarray(veh.axis, float)
 
@@ -507,6 +527,11 @@ class Autopilot3D:
         shape = float(self._profile(z + self.h_off, k) / self._profile(z_now, k))
         return w * min(6.0, shape)
 
+    def _wind_plan(self, z):
+        """The wind the planner's predictions assume at height ``z``: the
+        extrapolated measured wind times ``wind_plan_gain`` (a setting)."""
+        return self._wind(z) * self.wind_plan_gain
+
     def _update_trim(self, veh, wind_now, dt):
         """Filtered wind trim (sideways thrust acceleration that holds the
         upright booster against the aerodynamic force on it)."""
@@ -519,6 +544,7 @@ class Autopilot3D:
         n = float(np.linalg.norm(target))
         if n > cap:
             target *= cap / n
+        target = target * self.trim_gain
         self._trim_xy += (target - self._trim_xy) * min(1.0, dt / self.trim_filter)
 
     def _update_hold_bias(self, veh, dt):
@@ -552,11 +578,11 @@ class Autopilot3D:
             return np.zeros(2)
         z = self.gate_height + 2.0
         rho, _, _, a_s = atmosphere(max(0.0, z + self.h_off))
-        vr = np.array([0.0, 0.0, -self.gate_speed]) - self._wind(z)
+        vr = np.array([0.0, 0.0, -self.gate_speed]) - self._wind_plan(z)
         t = -self.aero.quick_force(vr, np.array([0.0, 0.0, 1.0]), rho, a_s, 1.0)[:2] / veh.mass
         cap = math.tan(math.radians(self.trim_max_deg)) * G0
         n = float(np.linalg.norm(t))
-        return t * (cap / n) if n > cap else t
+        return (t * (cap / n) if n > cap else t) * self.trim_gain
 
     def _update_wind_profile(self, veh, wind_now):
         """Record the measured wind and refit the shear strength (every 1 s)."""
@@ -566,6 +592,9 @@ class Autopilot3D:
             cut = self.elapsed - 3.0 * self.wind_memory
             while self._wind_samples and self._wind_samples[0][0] < cut:
                 self._wind_samples.pop(0)
+        if not self.shear_fit:
+            self.wind_shear_est = 1.0
+            return
         if self.elapsed < self._next_shear_fit or len(self._wind_samples) < 8:
             return
         self._next_shear_fit = self.elapsed + 1.0
@@ -663,7 +692,11 @@ class Autopilot3D:
         decides how the booster gets there."""
         t_go = self.touchdown_time - self.elapsed
         solve = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))
+        if self.plan is not None and not self.plan.sane:
+            self.plan = None            # a runaway plan is no plan: fly the fallback law until a real one is found
         plan = solve(t_go)
+        if plan is not None and not plan.sane:
+            plan = None
         lost = plan is None or plan.terminal_position_error > 10.0
         if self.elapsed >= self._next_search and (t_go > self.retime_freeze or lost):
             if plan is None or not plan.reaches_pad:
@@ -684,8 +717,16 @@ class Autopilot3D:
             self._commit(plan)
         else:
             # no solution at all this time (the solver gave up or found the
-            # problem infeasible): the booster flies on along the last plan
+            # problem infeasible): the booster flies on along the last plan --
+            # until that one has ended (a plan's end is "on the pad, sinking
+            # slowly", which holds a booster that is nowhere near it in the
+            # air: the endless hover) or has gone stale (a plan the vehicle
+            # cannot follow, and nothing else solves): then the fallback law
+            # brings it down
             self.solver_fail = (self.elapsed, self.planner.last_status)
+            if self.plan is not None and (self.touchdown_time - self.elapsed <= 0.6
+                                          or self.elapsed - self.plan.created_at > self.plan_stale_after):
+                self.plan = None
 
     def solver_alert(self):
         """For the display: None, or (kind, status) -- 'fail' when the last
@@ -720,10 +761,17 @@ class Autopilot3D:
     def _search_time(self, veh, wind_now, t_guess):
         """Final time minimising J (golden section), on the best route round
         the obstacles; at full thrust if nothing reaches at the nominal one."""
-        r, v, _ = self._state(veh)
+        r, v, m = self._state(veh)
         t_far = self._far_time(r, v)
         lo = max(1.0, 0.35 * min(t_guess, t_far))
         hi = 1.5 * max(t_guess, t_far) + 2.0
+        # No longer than the propellant lasts at minimum throttle (the engine
+        # cannot go below it: a plan beyond that burns propellant that is not
+        # there, and the solver then returns nonsense).
+        t_cap = self._burn_time_limit(veh, m)
+        if t_cap < hi:
+            hi = max(3.0, t_cap)
+            lo = min(lo, 0.6 * hi)
         best = None
         for frac in dict.fromkeys((self.burn_fraction, 0.97)):
             keep_out = self._keep_out(veh, self._routes(veh, wind_now, frac, 0.5 * (lo + hi)))
@@ -734,7 +782,45 @@ class Autopilot3D:
                     self.burn_fraction = max(self.burn_fraction, frac)
             if best is not None and best.reaches_pad:
                 break
+        if best is not None and self._ref_plan() is None:
+            # Found about a straight descent, not about a plan: in a strong
+            # wind that reference hovers in the flow and flatters the plan
+            # (it "reaches" the pad where the plan itself would not).  Check
+            # it about itself, as at ignition.
+            best = self._verify(veh, wind_now, best)
+        if best is not None and not best.sane:
+            # The best plan found is a runaway (it trades the landing speed or
+            # propellant that is not there for distance): not a plan at all.
+            return None
         return best
+
+    def _verify(self, veh, wind_now, plan):
+        """Check of a plan found about a straight descent: ``plan`` itself if
+        it still gets there when re-solved ``ignition_refine`` times about
+        itself (the reference of the aerodynamics, route and heights, at its
+        own final time and thrust ceiling), else the re-solved plan that does
+        not -- it never got there."""
+        held = self.plan
+        p = plan
+        try:
+            for _ in range(self.ignition_refine):
+                p.created_at = self.elapsed             # (it is the reference: samples run from now)
+                self.plan = p
+                q = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))(p.t_f)
+                if q is None:
+                    return plan
+                p = q
+                if not p.reaches_pad:
+                    return p
+        finally:
+            self.plan = held
+        return plan
+
+    def _burn_time_limit(self, veh, m):
+        """Longest burn the propellant allows at minimum throttle (with a margin)."""
+        s = veh.spec
+        mdot = self.minimum_throttle * s.thrust_sl * self.thrust_scale / (s.isp_sl * G0)
+        return 0.92 * max(0.0, m - (s.dry_mass + 150.0)) / max(mdot, 1e-6)
 
     def _routes(self, veh, wind_now, frac, t_f):
         """Which way round the obstacles (over, round either side): one convex
@@ -878,14 +964,31 @@ class Autopilot3D:
             trim_tilt = math.atan2(float(np.linalg.norm(center)), G0)
             accel = self._aoa_limit(veh, accel, wind_now, max_tilt + trim_tilt, self._aoa_table(veh), self._q_filt)
         else:
+            # No plan (none that can be trusted): a plain vertical suicide
+            # burn, down wherever the booster is.  The pull towards the pad is
+            # capped (a far-off pad is not worth leaving the descent for), and
+            # the engine may stay off while the fall is still slower than the
+            # braking profile -- at minimum throttle it out-thrusts the weight
+            # and would carry the booster up.
             self.phase = "FALLBACK"
             a_max_now = s.thrust_sl / m
-            vz_ref = -math.sqrt(2 * 0.5 * (a_max_now - g) * max(h, 0.0)) - self.touchdown_speed
-            accel = np.array([-0.08 * r[0] - 0.9 * v[0], -0.08 * r[1] - 0.9 * v[1], g + 1.5 * (vz_ref - v[2])])
+            a_brake = 0.35 * (a_max_now - g)        # the deceleration of the braking profile ...
+            # (down to the ground, not to the end of the planned burn: a tower
+            # catch's end point is 30 m up, and the legs come out here)
+            vz_ref = -math.sqrt(2 * a_brake * max(float(veh.altitude), 0.0)) - self.touchdown_speed
+            if float(veh.altitude) < self.legs_deploy_height:
+                c.legs_down = True
+            pull = -0.08 * r[:2]
+            pn = float(np.linalg.norm(pull))
+            if pn > self.fallback_pull_max:
+                pull *= self.fallback_pull_max / pn
+            accel = np.array([pull[0] - 0.9 * v[0], pull[1] - 0.9 * v[1], g + a_brake + 1.5 * (vz_ref - v[2])])   # ... fed forward
             max_tilt = math.radians(35.0)
             center = None
+            if self.aero is not None:
+                accel = self._aoa_limit(veh, accel, wind_now, max_tilt, self._aoa_table(veh), self._q_filt)
         self._mark()
-        self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 else None, center=center)
+        self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 and (self.plan is not None or accel[2] > 0.7 * g) else None, center=center)
 
     def _catch_hold(self, veh, r, v, dt):
         """Tower catch: hold the collar just above the arm tops, centred on the
@@ -1445,7 +1548,7 @@ class Autopilot3D:
             # flown.
             for _ in range(self.ignition_refine):
                 p = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))(self.plan.t_f)
-                if p is None:
+                if p is None or not p.sane:
                     break
                 self._commit(p)
         self._next_search = self.elapsed + self.search_backoff
