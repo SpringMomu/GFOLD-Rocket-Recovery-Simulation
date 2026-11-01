@@ -191,7 +191,7 @@ class AeroModel:
         if trim is not None:
             f_n = f_n * trim(math.acos(max(-1.0, min(1.0, -c))), q)
         f += f_n + f_drag
-        f += -u * q * 4.0 * legs * 0.9
+        f += -u * q * s.leg_area * legs * 0.9
         return f
 
     def __call__(self, vehicle, v_rel, rho, a_snd, com_world):
@@ -246,7 +246,7 @@ class AeroModel:
         z_mid = s.length * 0.5
 
         # Deployed legs add drag near the base.
-        leg_area = 4.0 * vehicle.legs
+        leg_area = s.leg_area * vehicle.legs
         f_legs = -u * q * leg_area * 0.9
 
         forces = [(f_axial, z_mid), (f_normal_pot, z_lead), (f_normal_visc, z_mid), (f_legs, 2.0)]

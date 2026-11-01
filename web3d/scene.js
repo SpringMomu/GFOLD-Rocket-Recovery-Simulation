@@ -280,10 +280,11 @@ export class Scene {
 
   _buildRocket() {
     const gl = this.gl;
-    // Tank barrel + interstage (radius 1.5 m, 18 m), raceway along +x.
-    const body = merge([frustum(1.5, 1.5, 0.0, 15.0, 128), frustum(1.5, 1.5, 15.0, 18.0, 128),
-      box(0.26, 0.34, 13.7, 1.56, 0, 1.3 + 13.7 / 2),                        // raceway (cable tunnel)
-      box(0.2, 0.5, 0.5, 1.52, 0, 14.8)]);
+    // Falcon 9 first stage (radius 1.83 m, 41.2 m long; lander3d/vehicle.py): tank barrel + interstage, raceway along +x.
+    const BR = 1.83, BL = 41.2, FIN_Z = 38.0;
+    const body = merge([frustum(BR, BR, 0.0, 36.0, 128), frustum(BR, BR, 36.0, BL, 128),
+      box(0.3, 0.4, 31.0, BR + 0.06, 0, 1.6 + 31.0 / 2),                     // raceway (cable tunnel)
+      box(0.22, 0.6, 0.6, BR + 0.02, 0, 32.8)]);
     this.meshBody = createMesh(gl, body.d, body.idx);
     // Merlin bell: throat at z=-0.2, exit (r = EXIT_R) at EXIT_Z, parabolic contour.
     const bellProfile = (re, zt, ze, rt) => {
@@ -295,7 +296,7 @@ export class Scene {
     this.meshBell = createMesh(gl, bell.d, bell.idx);
     // Outer eight engines (fixed during the single-engine landing burn) + hardware.
     const outer = [], hw = [];
-    const ringR = 1.02;
+    const ringR = 1.2;
     for (let k = 0; k < 8; k++) {
       const a = (k / 8) * Math.PI * 2 + Math.PI / 8;
       const m = M4.translate([Math.cos(a) * ringR, Math.sin(a) * ringR, 0]);
@@ -313,7 +314,7 @@ export class Scene {
     const fairings = [];
     {
       const parts = [];
-      const x0 = 1.6, x1 = 2.85, y0 = -0.62, y1 = 0.62, zc = 16.8, dep = 0.32;
+      const x0 = BR + 0.1, x1 = BR + 1.4, y0 = -0.62, y1 = 0.62, zc = FIN_Z, dep = 0.32;
       parts.push(box(x1 - x0, 0.06, dep, (x0 + x1) / 2, y0, zc), box(x1 - x0, 0.06, dep, (x0 + x1) / 2, y1, zc));
       parts.push(box(0.06, y1 - y0 + 0.06, dep, x1, 0, zc), box(0.08, y1 - y0 + 0.06, dep, x0, 0, zc));
       const sp = 0.155;
@@ -330,16 +331,16 @@ export class Scene {
       const fp = merge(parts);
       this.meshFinPanel = createMesh(gl, fp.d, fp.idx);
     }
-    for (let k = 0; k < 4; k++) fairings.push(transformPart(box(0.2, 0.3, 0.5, 1.5, 0, 16.75), M4.rotAxis([0, 0, 1], (k * Math.PI) / 2)));
+    for (let k = 0; k < 4; k++) fairings.push(transformPart(box(0.22, 0.34, 0.55, BR, 0, FIN_Z - 0.05), M4.rotAxis([0, 0, 1], (k * Math.PI) / 2)));
     const fm = merge(fairings);
     this.meshFins = createMesh(gl, fm.d, fm.idx);                             // hinge / actuator fairings
     // Landing leg: tapered carbon-fibre beam + foot pad oriented flat on the ground when deployed.
-    const pad = transformPart(frustum(0.5, 0.42, -0.08, 0.1, 24), M4.mul(M4.translate([0.08, 0, 6.25]), M4.rotAxis([0, 1, 0], 35 * Math.PI / 180)));
-    const leg = merge([taperedBox(0.95, 0.42, 0.42, 0.24, 6.2), transformPart(box(0.12, 0.7, 0.1, 0, 0, 0), M4.translate([0.12, 0, 0.3])), pad]);
+    const pad = transformPart(frustum(0.5, 0.42, -0.08, 0.1, 24), M4.mul(M4.translate([0.08, 0, 11.05]), M4.rotAxis([0, 1, 0], 35 * Math.PI / 180)));
+    const leg = merge([taperedBox(1.1, 0.5, 0.5, 0.28, 11.0), transformPart(box(0.14, 0.8, 0.12, 0, 0, 0), M4.translate([0.14, 0, 0.35])), pad]);
     this.meshLeg = createMesh(gl, leg.d, leg.idx);
     const strut = merge([frustum(0.12, 0.12, 0, 0.55, 12), frustum(0.08, 0.08, 0.55, 1.0, 12), frustum(0.14, 0.14, 0.5, 0.58, 12)]);
     this.meshStrut = createMesh(gl, strut.d, strut.idx);
-    const rcs = merge([0, 1, 2, 3].map((k) => transformPart(merge([box(0.35, 0.35, 0.5, 1.58, 0, 17.3), frustum(0.06, 0.08, 17.3, 17.42, 8)]), M4.rotAxis([0, 0, 1], k * Math.PI / 2 + Math.PI / 4))));
+    const rcs = merge([0, 1, 2, 3].map((k) => transformPart(merge([box(0.4, 0.4, 0.55, BR + 0.08, 0, 39.5), frustum(0.07, 0.09, 39.5, 39.64, 8)]), M4.rotAxis([0, 0, 1], k * Math.PI / 2 + Math.PI / 4))));
     this.meshRcs = createMesh(gl, rcs.d, rcs.idx);
     this.meshPole = createMesh(gl, frustum(0.08, 0.08, 0, 6, 8).d, frustum(0.08, 0.08, 0, 6, 8).idx);
     const sock = frustum(0.45, 0.14, 0, 2.6, 16, false);
@@ -502,7 +503,7 @@ export class Scene {
   _buildTower() {
     const gl = this.gl;
     const steel = [], dark = [], hazard = [], concrete = [];
-    const X0 = -15, X1 = -9, HY = 3, TOP = 48;
+    const X0 = -15, X1 = -9, HY = 3, TOP = 66;
     const corners = [[X0, -HY], [X1, -HY], [X1, HY], [X0, HY]];
     for (const [x, y] of corners) steel.push(box(0.7, 0.7, TOP, x, y, TOP / 2));
     for (let z = 0; z <= TOP; z += 4) {
@@ -521,22 +522,22 @@ export class Scene {
     steel.push(box(X1 - X0 + 1.2, 2 * HY + 1.2, 0.4, (X0 + X1) / 2, 0, TOP + 0.2));
     steel.push(transformPart(frustum(0.15, 0.06, TOP + 0.4, TOP + 7, 8), M4.translate([(X0 + X1) / 2, 0, 0])));
     this.towerGlow = [[(X0 + X1) / 2, 0, TOP + 7.2]];
-    // Launch mount under the catch point: six legs and a ring table (MOUNT_TOP = 8 m).
+    // Launch mount under the catch point: six legs and a ring table (MOUNT_TOP = 4.5 m).
     for (let k = 0; k < 6; k++) {
       const a = (k / 6) * Math.PI * 2 + Math.PI / 6;
-      concrete.push(box(1.3, 1.3, 6.6, 4.9 * Math.cos(a), 4.9 * Math.sin(a), 3.3));
+      concrete.push(box(1.3, 1.3, 3.1, 4.9 * Math.cos(a), 4.9 * Math.sin(a), 1.55));
     }
     for (let k = 0; k < 20; k++) {
       const a = (k / 20) * Math.PI * 2;
-      const seg = transformPart(box(2.4, 2 * 4.8 * Math.tan(Math.PI / 20) + 0.05, 1.4, 4.8, 0, 7.3), M4.rotAxis([0, 0, 1], a));
+      const seg = transformPart(box(2.4, 2 * 4.8 * Math.tan(Math.PI / 20) + 0.05, 1.4, 4.8, 0, 3.8), M4.rotAxis([0, 0, 1], a));
       steel.push(seg);
       // hold-down clamps around the opening
-      if (k % 5 === 0) dark.push(transformPart(box(0.7, 0.5, 0.5, 3.9, 0, 8.25), M4.rotAxis([0, 0, 1], a + Math.PI / 20)));
+      if (k % 5 === 0) dark.push(transformPart(box(0.7, 0.5, 0.5, 3.9, 0, 4.75), M4.rotAxis([0, 0, 1], a + Math.PI / 20)));
     }
-    hazard.push(transformPart(frustum(6.02, 6.02, 7.7, 8.0, 48, false), M4.ident()));
+    hazard.push(transformPart(frustum(6.02, 6.02, 4.2, 4.5, 48, false), M4.ident()));
     // Carriage around the tower at arm height (moves with the shock absorbers).
     const car = [];
-    const C0 = 26.0, C1 = 31.2;
+    const C0 = 38.0, C1 = 43.2;
     for (const [x, y] of corners) car.push(box(0.5, 0.5, C1 - C0, x + Math.sign(x - (X0 + X1) / 2) * 0.55, y + Math.sign(y) * 0.55, (C0 + C1) / 2));
     for (const z of [C0, C1]) for (let k = 0; k < 4; k++) {
       const a = corners[k], b = corners[(k + 1) % 4];
@@ -545,7 +546,7 @@ export class Scene {
     }
     for (const y of [-HY, HY]) {
       car.push(beamBetween([X1 + 0.55, y + Math.sign(y) * 0.55, C0], [X1 + 0.55, y + Math.sign(y) * 0.55, C1], 0.9));
-      car.push(transformPart(frustum(0.75, 0.75, 27.6, 30.4, 20), M4.translate([X1, y, 0])));    // arm hinge drum
+      car.push(transformPart(frustum(0.75, 0.75, 39.6, 42.4, 20), M4.translate([X1, y, 0])));    // arm hinge drum
     }
     // Shock absorbers between the carriage and the tower (visual).
     const absorbers = [];
@@ -568,9 +569,9 @@ export class Scene {
       carriage: [[mk(car), 2, [0.42, 0.44, 0.47]], [mk(absorbers), 2, [0.75, 0.76, 0.78]]],
       arm: [[mk(arm), 2, [0.36, 0.37, 0.40]], [mk(rail), 6, [1, 1, 1]]],
     };
-    // Catch collar on the booster (body z = 15): band + eight hardpoint pins.
-    const collar = [frustum(1.56, 1.56, 14.75, 15.25, 64)];
-    for (let k = 0; k < 8; k++) collar.push(transformPart(box(0.62, 0.32, 0.36, 1.82, 0, 15.0), M4.rotAxis([0, 0, 1], (k / 8) * Math.PI * 2 + Math.PI / 8)));
+    // Catch collar on the booster (body z = 30, lander3d/tower.py CATCH_COLLAR_Z): band + eight hardpoint pins.
+    const collar = [frustum(1.9, 1.9, 29.7, 30.3, 64)];
+    for (let k = 0; k < 8; k++) collar.push(transformPart(box(0.7, 0.36, 0.4, 2.15, 0, 30.0), M4.rotAxis([0, 0, 1], (k / 8) * Math.PI * 2 + Math.PI / 8)));
     this.meshCollar = mk(collar);
   }
 
@@ -578,14 +579,15 @@ export class Scene {
   towerParts(st) {
     const tw = st.tower;
     if (!tw || !this.tower) return [];
-    const g = tw.geom, sink = tw.sink || 0, a = (tw.arm || 0) * Math.PI / 180;
+    const g = tw.geom, sink = tw.sink || 0, arms = tw.arms || [tw.arm || 0, tw.arm || 0];
     const out = this.tower.parts.map(([m, mat, c]) => [m, mat, M4.ident(), c]);
     const down = M4.translate([0, 0, -sink]);
     for (const [m, mat, c] of this.tower.carriage) out.push([m, mat, down, c]);
-    for (const sgn of [1, -1]) {
+    [1, -1].forEach((sgn, k) => {
+      const a = arms[k] * Math.PI / 180;
       const M = M4.mul(M4.translate([g.pivot[0], sgn * g.pivot[1], g.arm_top - sink]), M4.rotAxis([0, 0, 1], sgn * a));
       for (const [m, mat, c] of this.tower.arm) out.push([m, mat, M, c]);
-    }
+    });
     return out;
   }
 
@@ -641,8 +643,8 @@ export class Scene {
     // deflection (about the radial shaft), from the simulated actuator state.
     const fin = st.fins || { defl: [0, 0, 0, 0], deploy: 1 };
     const fold = -(Math.PI / 2) * (1 - Math.max(0, Math.min(1, fin.deploy)));
-    const hingeIn = M4.translate([1.5, 0, 16.8]), hingeOut = M4.translate([-1.5, 0, -16.8]);
-    const shaftIn = M4.translate([0, 0, 16.8]), shaftOut = M4.translate([0, 0, -16.8]);
+    const hingeIn = M4.translate([1.83, 0, 38.0]), hingeOut = M4.translate([-1.83, 0, -38.0]);
+    const shaftIn = M4.translate([0, 0, 38.0]), shaftOut = M4.translate([0, 0, -38.0]);
     for (let k = 0; k < 4; k++) {
       const d = (fin.defl[k] || 0) * Math.PI / 180;
       const local = M4.mul(M4.mul(hingeIn, M4.mul(M4.rotAxis([0, 1, 0], fold), hingeOut)),
@@ -658,13 +660,13 @@ export class Scene {
     const theta = (145 * Math.PI / 180) * deploy;
     for (let k = 0; k < 4; k++) {
       const az = Math.PI / 4 + (k * Math.PI) / 2;
-      const hinge = [Math.cos(az) * 1.55, Math.sin(az) * 1.55, 3.2];
+      const hinge = [Math.cos(az) * 1.88, Math.sin(az) * 1.88, 5.5];
       const tangent = [-Math.sin(az), Math.cos(az), 0];
       const m = M4.mul(M4.translate(hinge), M4.mul(M4.rotAxis(tangent, theta), M4.rotAxis([0, 0, 1], az)));
       parts.push([this.meshLeg, 4, M4.mul(base, m)]);
       if (deploy > 0.05) {
-        const foot = M4.xform(m, [0, 0, 3.4]);
-        const anchor = [Math.cos(az) * 1.5, Math.sin(az) * 1.5, 6.6];
+        const foot = M4.xform(m, [0, 0, 6.0]);
+        const anchor = [Math.cos(az) * 1.83, Math.sin(az) * 1.83, 11.6];
         const dir = V.sub(foot, anchor), len = V.len(dir);
         const zaxis = V.norm(dir), ang = Math.acos(Math.max(-1, Math.min(1, zaxis[2])));
         const ax = V.cross([0, 0, 1], zaxis);

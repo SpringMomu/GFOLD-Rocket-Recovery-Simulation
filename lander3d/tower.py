@@ -38,18 +38,18 @@ from .vehicle import cross3, vnorm
 # --- geometry (m) ---------------------------------------------------------
 TOWER_X = (-15.0, -9.0)        # tower footprint (x), |y| <= TOWER_HALF_Y
 TOWER_HALF_Y = 3.0
-TOWER_TOP = 48.0
-ARM_TOP = 30.0                 # arm top surface when unloaded
+TOWER_TOP = 66.0
+ARM_TOP = 42.0                 # arm top surface when unloaded
 ARM_DEPTH = 1.6                # arm height (top surface down to its bottom)
 ARM_HALF_WIDTH = 0.5
 ARM_LENGTH = 10.5
 PIVOT_X, PIVOT_Y = -9.0, 3.0   # arm pivots at the tower's front corners (y = +/-PIVOT_Y)
 MOUNT_RADIUS = 6.0             # launch mount table under the catch point
-MOUNT_TOP = 8.0
-CATCH_COLLAR_Z = 15.0          # body height of the catch collar (below the grid fins at 16.8)
-CATCH_COLLAR_R = 2.1           # collar contact radius (hardpoints stick out 0.6 m)
+MOUNT_TOP = 4.5
+CATCH_COLLAR_Z = 30.0          # body height of the catch collar (above the centre of mass, below the grid fins at 38)
+CATCH_COLLAR_R = 2.45          # collar contact radius (hardpoints stick out 0.6 m)
 COLLAR_POINTS = 16
-BODY_RADIUS = 1.5
+BODY_RADIUS = 1.83
 FACE_CLEARANCE = 0.1           # closed arm face to barrel
 
 ARM_OPEN = math.radians(40.0)
@@ -57,15 +57,19 @@ ARM_READY = math.radians(22.0)
 ARM_FAST_RATE = math.radians(28.0)
 ARM_SLOW_SPEED = 0.35          # m/s at the face once within ARM_SLOW_GAP of the barrel
 ARM_SLOW_GAP = 0.5
-READY_RATE = math.radians(8.0)
+READY_RATE = math.radians(10.0)   # slew rate while the arms follow the booster
+ARM_MIN = math.radians(-12.0)     # arm travel: most closed ...
+STANDOFF = 1.3                    # ... arms follow the barrel with this much extra gap until the close
+AIM_LEAD = 0.6                    # s: the arms aim at where the barrel will be
 
 READY_HEIGHT = 120.0           # collar height above the arms at which they pre-close ...
 READY_RADIUS = 15.0            # ... with the booster this close to the catch axis
 CLOSE_HEIGHT = 4.5             # close when the collar is this far above the arms ...
 CLOSE_LEAD_TIME = 1.7          # ... or will arrive within this time
-CAPTURE_ALONG = 2.5            # capture window: along the arms (|x|) ...
-CAPTURE_ACROSS = 1.2           # ... and across them (|y|)
-CLOSE_SIDE_SPEED = 1.0         # m/s: no closing on a booster still moving sideways faster
+ABORT_RADIUS = 4.5             # a closing tower that is not touching the booster opens again beyond this
+CAPTURE_ALONG = (-2.0, 0.8)    # capture window along the arms (x): the arms end at x ~ 1.5, the collar needs them under it ...
+CAPTURE_ACROSS = 1.0           # ... and across them (|y|)
+CLOSE_SIDE_SPEED = 0.5         # m/s: no closing on a booster still moving sideways faster
 
 # --- dynamics ---------------------------------------------------------------
 CONTACT_K, CONTACT_C, CONTACT_MU = 2.0e6, 6.0e4, 0.6
@@ -76,8 +80,8 @@ FACE_K, FACE_C, FACE_FORCE_MAX = 4.0e5, 4.0e4, 6.0e4
 ARM_IMPACT_SPEED = 3.0         # m/s at the face: faster is a collision
 # Keep-out boxes for the planner: margin beyond the barrel (sideways) and
 # beyond the base/top of the booster (vertically).
-KEEP_OUT_MARGIN = 2.0
-KEEP_OUT_MARGIN_Z = 1.5
+KEEP_OUT_MARGIN = 3.0
+KEEP_OUT_MARGIN_Z = 4.0
 SETTLE_TIME = 0.8
 
 
@@ -90,18 +94,37 @@ def _closed_angle() -> float:
 ARM_CLOSED = _closed_angle()
 
 
+def arm_angle_for(point_xy, sgn: float, extra_gap: float = 0.0) -> float:
+    """Angle of the arm on side ``sgn`` whose inner face is FACE_CLEARANCE +
+    ``extra_gap`` from a barrel centred at ``point_xy`` (clamped to the travel)."""
+    rx, ry = float(point_xy[0]) - PIVOT_X, float(point_xy[1]) - sgn * PIVOT_Y
+    dist = max(math.hypot(rx, ry), 1e-6)
+    d = BODY_RADIUS + FACE_CLEARANCE + extra_gap + ARM_HALF_WIDTH
+    a = math.atan2(sgn * ry, rx) + math.asin(min(1.0, d / dist))
+    return min(ARM_OPEN, max(ARM_MIN, a))
+
+
 class CatchTower:
     def __init__(self) -> None:
-        self.angle = ARM_OPEN          # arm swing from the +x direction (mirrored for the -y arm)
-        self.rate = 0.0
+        self.angles = [ARM_OPEN, ARM_OPEN]   # arm swing from the +x direction (mirrored for the -y arm): [+y arm, -y arm]
+        self.rates = [0.0, 0.0]
         self.mode = "OPEN"             # OPEN | READY | CLOSING | CLOSED
         self.sink = 0.0                # carriage travel (down) on its shock absorbers
         self.sink_rate = 0.0
         self.load = 0.0                # vertical load on the arms (N)
         self.events: list[str] = []
         self._settle = 0.0
+        self._close_xy = np.zeros(2)
         self._face_hit = False
         self.secured = False           # arms closed round the barrel (told to the booster)
+
+    @property
+    def angle(self) -> float:
+        return 0.5 * (self.angles[0] + self.angles[1])
+
+    @angle.setter
+    def angle(self, a: float) -> None:
+        self.angles = [a, a]
 
     # ------------------------------------------------------------ geometry
     @property
@@ -149,8 +172,7 @@ class CatchTower:
     def arms(self):
         """For each arm: (pivot, along-arm unit vector, inward unit normal)."""
         out = []
-        for sgn in (1.0, -1.0):
-            a = self.angle
+        for sgn, a in zip((1.0, -1.0), self.angles):
             d = np.array([math.cos(a), sgn * math.sin(a), 0.0])
             n = np.array([math.sin(a), -sgn * math.cos(a), 0.0])
             out.append((np.array([PIVOT_X, sgn * PIVOT_Y, 0.0]), d, n))
@@ -169,6 +191,18 @@ class CatchTower:
             return None
         return veh.pos + ax * t
 
+    def _aim_point(self, veh):
+        """Where the barrel is (and will be, AIM_LEAD ahead) at arm height: the
+        body axis extended to that height; the base point if the body is flat."""
+        z = self.arm_top - 0.5 * ARM_DEPTH
+        ax = veh.axis
+        if ax[2] > 0.3:
+            t = min(80.0, max(-80.0, (z - float(veh.pos[2])) / float(ax[2])))
+            b = veh.pos + ax * t
+        else:
+            b = veh.pos
+        return b[:2] + veh.vel[:2] * AIM_LEAD
+
     def face_gaps(self, veh):
         """Barrel-to-face gap of each arm at arm height (inf if not alongside)."""
         b = self._axis_at(veh, self.arm_top - 0.5 * ARM_DEPTH)
@@ -185,41 +219,59 @@ class CatchTower:
 
     # ------------------------------------------------------------ control
     def update(self, dt: float, veh) -> None:
-        """Arm controller (the tower's own, not the booster's)."""
+        """Arm controller (the tower's own, not the booster's).
+
+        The arms are steered one by one: they follow the barrel with a
+        stand-off gap while it descends between them, and close onto its
+        actual position (not onto a fixed axis) when it is over the arms."""
         if veh.state not in ("FLYING", "CAUGHT"):
-            self.rate = 0.0
+            self.rates = [0.0, 0.0]
             return
         h = self._collar_height(veh)
-        b = self._axis_at(veh, self.arm_top)
-        xy = veh.pos[:2] if b is None else b[:2]
+        xy = self._aim_point(veh)
         r = float(np.linalg.norm(xy))
         if self.mode == "OPEN" and h < READY_HEIGHT and r < READY_RADIUS and veh.vel[2] < 0.0:
             self.mode = "READY"
             self.events.append("ARMS READY")
         if self.mode == "READY":
             sink = max(0.3, -float(veh.vel[2]))
-            in_window = abs(float(xy[0])) < CAPTURE_ALONG and abs(float(xy[1])) < CAPTURE_ACROSS
+            here = veh.pos[:2] if veh.axis[2] <= 0.3 else self._aim_point(veh) - veh.vel[:2] * AIM_LEAD
+            in_window = CAPTURE_ALONG[0] < float(here[0]) < CAPTURE_ALONG[1] and abs(float(here[1])) < CAPTURE_ACROSS
             steady = math.hypot(float(veh.vel[0]), float(veh.vel[1])) < CLOSE_SIDE_SPEED
             if in_window and steady and -0.3 < h < max(CLOSE_HEIGHT, sink * CLOSE_LEAD_TIME):
                 self.mode = "CLOSING"
                 self.events.append("ARMS CLOSING")
-        target = {"OPEN": ARM_OPEN, "READY": ARM_READY}.get(self.mode, ARM_CLOSED)
-        if self.mode in ("OPEN", "READY"):
-            step = float(np.clip(target - self.angle, -READY_RATE * dt, READY_RATE * dt))
-        else:
-            # Fast until close to the barrel, then slow (the arms only touch it).
-            gap = min(self.face_gaps(veh))
-            lever = max(2.0, math.hypot(float(xy[0]) - PIVOT_X, abs(float(xy[1])) - PIVOT_Y))
-            rate = ARM_FAST_RATE if gap > ARM_SLOW_GAP else ARM_SLOW_SPEED / lever
-            if gap <= 0.02:
-                rate = 0.0
-            step = max(-rate * dt, target - self.angle)
-            if self.mode == "CLOSING" and target - self.angle >= -1e-4:
+                self._close_xy = np.array(here, float)       # the arms close on where it is now: they do not chase it
+        gaps = self.face_gaps(veh)
+        done = []
+        touching = False
+        for k, sgn in enumerate((1.0, -1.0)):
+            if self.mode == "OPEN":
+                target, rate = ARM_OPEN, READY_RATE
+            elif self.mode == "READY":
+                target, rate = arm_angle_for(xy, sgn, STANDOFF), READY_RATE
+            else:
+                target = arm_angle_for(self._close_xy, sgn)
+                # Fast until close to the barrel, then slow (the arms only touch it).
+                lever = max(2.0, math.hypot(float(xy[0]) - PIVOT_X, abs(float(xy[1])) - PIVOT_Y))
+                rate = ARM_FAST_RATE if gaps[k] > ARM_SLOW_GAP else ARM_SLOW_SPEED / lever
+                if gaps[k] <= 0.02:
+                    rate = 0.0 if target - self.angles[k] < 0.0 else READY_RATE   # touching: stay (or follow away)
+            err = target - self.angles[k]
+            step = float(np.clip(err, -rate * dt, rate * dt))
+            self.rates[k] = step / dt if dt > 0 else 0.0
+            self.angles[k] += step
+            done.append(gaps[k] <= FACE_CLEARANCE + 0.03)   # the face is against the barrel
+            touching = touching or gaps[k] <= 0.02
+        if self.mode == "CLOSING":
+            self.secured = all(done) or touching       # as soon as an arm lays on the barrel it is held
+            if self.secured and all(abs(self.angles[k] - arm_angle_for(self._close_xy, sgn)) < 2e-3 for k, sgn in enumerate((1.0, -1.0))):
                 self.mode = "CLOSED"
-            # closed, or stopped against the barrel
-            self.secured = self.mode == "CLOSED" or (self.mode == "CLOSING" and rate == 0.0)
-        self.rate = step / dt if dt > 0 else 0.0
-        self.angle += step
+            elif not self.secured and r > ABORT_RADIUS and min(gaps) > 0.3:
+                self.mode = "READY"            # the booster drifted out of reach: open up and wait for it
+                self.events.append("ARMS OPEN")
+        elif self.mode != "CLOSED":
+            self.secured = False
 
     # ------------------------------------------------------------ contact
     def contact(self, veh, R, com, dt, m):
@@ -266,7 +318,7 @@ class CatchTower:
         # Arm faces against the barrel (they centre it while closing).
         b = self._axis_at(veh, top - 0.5 * ARM_DEPTH)
         if b is not None and self.mode in ("CLOSING", "CLOSED"):
-            for sgn, (p, d, n) in zip((1.0, -1.0), arms):
+            for sgn, (p, d, n), a_k, rate_k in zip((1.0, -1.0), arms, self.angles, self.rates):
                 rel = b - p
                 s = float(rel @ d)
                 pen = ARM_HALF_WIDTH + BODY_RADIUS - float(rel @ n)
@@ -274,7 +326,7 @@ class CatchTower:
                     continue
                 r = b - com
                 v = veh.vel + cross3(omega_w, r)
-                v_arm = self.rate * s * np.array([-math.sin(self.angle), sgn * math.cos(self.angle), 0.0])
+                v_arm = rate_k * s * np.array([-math.sin(a_k), sgn * math.cos(a_k), 0.0])
                 vn = float((v - v_arm) @ n)            # > 0: barrel moving away from the face
                 if veh.state == "FLYING" and not self._face_hit and -vn > ARM_IMPACT_SPEED:
                     veh._crash("ARM COLLISION")
@@ -336,10 +388,10 @@ class CatchTower:
         self.events.append("CATCH CONTACT")
 
     def _check_caught(self, veh, dt):
-        if veh.state != "FLYING" or veh.catch_contact < 2:
+        if veh.state != "FLYING":
             self._settle = 0.0
             return
-        if (vnorm(veh.vel) < 0.25 and vnorm(veh.omega) < 0.06 and veh.throttle < 0.05
+        if (veh.catch_contact >= 2 and vnorm(veh.vel) < 0.25 and vnorm(veh.omega) < 0.06 and veh.throttle < 0.05
                 and abs(self.sink_rate) < 0.1):
             self._settle += dt
             if self._settle > SETTLE_TIME:
@@ -348,10 +400,10 @@ class CatchTower:
                 veh.omega[:] = 0.0
                 self.sink_rate = 0.0
         else:
-            self._settle = 0.0
+            self._settle = max(0.0, self._settle - 2.0 * dt)       # a contact point flickering does not restart the count
 
     def snapshot(self) -> dict:
-        return {"arm": round(math.degrees(self.angle), 3), "sink": round(self.sink, 4), "mode": self.mode,
+        return {"arm": round(math.degrees(self.angle), 3), "arms": [round(math.degrees(a), 3) for a in self.angles], "sink": round(self.sink, 4), "mode": self.mode,
                 "load": round(self.load, 1),
                 "geom": {"tower_x": TOWER_X, "tower_half_y": TOWER_HALF_Y, "tower_top": TOWER_TOP, "arm_top": ARM_TOP,
                          "arm_depth": ARM_DEPTH, "arm_half_width": ARM_HALF_WIDTH, "arm_length": ARM_LENGTH,

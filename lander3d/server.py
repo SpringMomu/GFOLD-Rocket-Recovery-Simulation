@@ -76,7 +76,7 @@ def snapshot(sim: Sim3D) -> dict:
             "gimbal": _vec(np.degrees(v.gimbal)), "gimbal_limit": math.degrees(s.gimbal_limit), "rcs": _vec(v.rcs),
             "legs": round(v.legs, 3), "legs_cmd": v.controls.legs_down, "feet": v.feet_contact, "catch": v.catch_contact,
             "fins": {"defl": [round(float(math.degrees(x)), 2) for x in v.fin_defl], "deploy": round(float(v.fins_deploy), 3)},
-            "fuel": {"lox": round(v.lox, 1), "rp1": round(v.rp1, 1), "lox_cap": s.lox_capacity, "rp1_cap": s.rp1_capacity,
+            "fuel": {"lox": round(v.lox, 1), "rp1": round(v.rp1, 1), "lox_cap": round(v.loaded * s.lox_capacity / s.propellant_capacity, 1), "rp1_cap": round(v.loaded * s.rp1_capacity / s.propellant_capacity, 1),
                      "mass": round(m, 1), "dry": s.dry_mass, "mdot": round(mdot, 2), "isp": round(float(v.last.get("isp", s.isp_sl)), 1),
                      "dv": round(v.delta_v_remaining(p), 1), "burn_left": None if not math.isfinite(burn_left) else round(burn_left, 1),
                      "thrust": round(thrust, 1), "twr": round(thrust / (m * G0), 3), "com_z": round(zc, 3)},

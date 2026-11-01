@@ -193,7 +193,8 @@ class Autopilot3D:
     # upright over the last TRIM_FADE metres).
     trim_max_deg = 12.0
     trim_filter = 0.5             # s
-    hold_bias_filter = 1.0        # s (_update_hold_bias)
+    catch_hold_kv = 1.0           # 1/s, velocity loop of the catch hold (the attitude lags: a stiffer loop rings)
+    hold_bias_filter = 8.0        # s (_update_hold_bias)
     aoa_moment_margin = 0.8       # share of the gimbal's moment the aerodynamic moment may take (_aoa_table)
     aoa_refresh = 2.0             # s between recomputations of the angle-of-attack table
     q_filter = 1.0                # s, smoothing of the dynamic pressure for that limit
@@ -1050,7 +1051,7 @@ class Autopilot3D:
         v_ref = np.zeros(2)
         if en > 1e-6:
             v_ref = e / en * min(0.375 * en, math.sqrt(math.tan(tilt) * G0 * en))
-        a_xy = k_xy * (1.6 * (v_ref - v[:2]) + 0.1 * self._hold_i)
+        a_xy = k_xy * (self.catch_hold_kv * (v_ref - v[:2]) + 0.1 * self._hold_i)
         a_z = G0 + 1.2 * (self._hold_h - r[2]) + 2.0 * (vz_ref - v[2])
         self.phase = "CATCH HOLD"
         self.time_to_go = max(0.0, float(r[2]) / self.catch_settle_speed) if settle else math.nan
