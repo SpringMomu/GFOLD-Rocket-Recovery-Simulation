@@ -223,13 +223,14 @@ export class Scene {
     if (depth) gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depth, 0);
     return f;
   }
-  _ensureTargets(W, H) {
-    if (this.targets && this.targets.W === W && this.targets.H === H) return;
+  _ensureTargets(W, H, key = "targets") {
+    const cur = this[key];
+    if (cur && cur.W === W && cur.H === H) return;
     const gl = this.gl;
-    if (this.targets) {
-      const o = this.targets;
-      [o.colorTex, o.depthTex, ...o.bloom.map((b) => b.tex)].forEach((t) => gl.deleteTexture(t));
-      [o.msFbo, o.resolveFbo, o.transFbo, ...o.bloom.map((b) => b.fbo)].forEach((f) => gl.deleteFramebuffer(f));
+    if (cur) {
+      const o = cur;
+      [o.colorTex, o.depthTex, o.outTex, ...o.bloom.map((b) => b.tex)].filter(Boolean).forEach((t) => gl.deleteTexture(t));
+      [o.msFbo, o.resolveFbo, o.transFbo, o.outFbo, ...o.bloom.map((b) => b.fbo)].filter(Boolean).forEach((f) => gl.deleteFramebuffer(f));
       [o.msColor, o.msDepth].forEach((r) => gl.deleteRenderbuffer(r));
     }
     const ifmt = this.hdr ? gl.RGBA16F : gl.RGBA8, type = this.hdr ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
@@ -256,8 +257,11 @@ export class Scene {
       bloom.push({ tex, fbo: this._fbo(tex, null), w, h });
       if (w <= 4 || h <= 4) break;
     }
+    // The camera-panel view is composited into an 8-bit texture that is read back.
+    let outTex = null, outFbo = null;
+    if (key === "pipTargets") { outTex = this._texture(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR); outFbo = this._fbo(outTex, null); }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    this.targets = { W, H, msColor, msDepth, msFbo, colorTex, depthTex, resolveFbo, transFbo, bloom };
+    this[key] = { W, H, msColor, msDepth, msFbo, colorTex, depthTex, resolveFbo, transFbo, bloom, outTex, outFbo, pixels: key === "pipTargets" ? new Uint8Array(W * H * 4) : null };
   }
 
   _initParticles(max) {
@@ -704,10 +708,22 @@ export class Scene {
   // ---------------------------------------------------------------- render
   render(cam, st, fx, opts) {
     const gl = this.gl;
-    this.resize();
-    const W = this.canvas.width, H = this.canvas.height;
-    this._ensureTargets(W, H);
+    // opts.pip = {w, h}: a second, small view (the camera panel).  Drawn after
+    // the main view, it reuses its shadow map and returns the RGBA pixels.
+    const pip = opts && opts.pip;
+    let W, H;
+    const mainState = pip ? { targets: this.targets, vp: this.vp, proj: this.proj, viewM: this.viewM, W: this.W, H: this.H, invVP: this.invVP, outFbo: this.outFbo } : null;
+    if (pip) {
+      W = pip.w; H = pip.h;
+      this._ensureTargets(W, H, "pipTargets");
+      this.targets = this.pipTargets;
+    } else {
+      this.resize();
+      W = this.canvas.width; H = this.canvas.height;
+      this._ensureTargets(W, H);
+    }
     const T = this.targets;
+    this.finalFbo = pip ? T.outFbo : null;
     const proj = M4.perspective(cam.fov, W / H, 0.3, FAR);
     const view = M4.lookAt(cam.eye, cam.at, cam.up || [0, 0, 1]);
     const vp = M4.mul(proj, view);
@@ -719,24 +735,28 @@ export class Scene {
     const P = fx.plume || plumeParams(st, this.time);
     const Lt = this._lights(P);
 
-    // ---- shadow pass (sun ortho around the booster)
-    const focus = [st.pos[0], st.pos[1], Math.max(0, Math.min(st.pos[2], 60))];
-    const sunEye = V.add(focus, V.mul(this.sun, 400));
-    const sview = M4.lookAt(sunEye, focus, [0, 0, 1]);
-    const sproj = M4.ortho(-45, 45, -45, 45, 250, 560);
-    const svp = M4.mul(sproj, sview);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.shadowFbo);
-    gl.viewport(0, 0, this.shadowSize, this.shadowSize);
-    gl.clear(gl.DEPTH_BUFFER_BIT);
-    gl.enable(gl.DEPTH_TEST);
-    gl.disable(gl.BLEND);
-    gl.useProgram(this.progDepth.program);
-    gl.uniformMatrix4fv(this.progDepth.u.u_vp, false, svp);
-    if (st.pos[2] < 400) for (const [mesh, , m] of parts) { gl.uniformMatrix4fv(this.progDepth.u.u_model, false, m); drawMesh(gl, mesh); }
-    gl.uniformMatrix4fv(this.progDepth.u.u_model, false, M4.ident());
-    for (const p of this.padProps) drawMesh(gl, p.mesh);
+    // ---- shadow pass (sun ortho around the booster); the camera panel view reuses the main view's map
     const towerParts = this.towerParts(st);
-    for (const [mesh, , m] of towerParts) { gl.uniformMatrix4fv(this.progDepth.u.u_model, false, m); drawMesh(gl, mesh); }
+    let svp = this.svp;
+    if (!pip) {
+      const focus = [st.pos[0], st.pos[1], Math.max(0, Math.min(st.pos[2], 60))];
+      const sunEye = V.add(focus, V.mul(this.sun, 400));
+      const sview = M4.lookAt(sunEye, focus, [0, 0, 1]);
+      const sproj = M4.ortho(-45, 45, -45, 45, 250, 560);
+      svp = M4.mul(sproj, sview);
+      this.svp = svp;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.shadowFbo);
+      gl.viewport(0, 0, this.shadowSize, this.shadowSize);
+      gl.clear(gl.DEPTH_BUFFER_BIT);
+      gl.enable(gl.DEPTH_TEST);
+      gl.disable(gl.BLEND);
+      gl.useProgram(this.progDepth.program);
+      gl.uniformMatrix4fv(this.progDepth.u.u_vp, false, svp);
+      if (st.pos[2] < 400) for (const [mesh, , m] of parts) { gl.uniformMatrix4fv(this.progDepth.u.u_model, false, m); drawMesh(gl, mesh); }
+      gl.uniformMatrix4fv(this.progDepth.u.u_model, false, M4.ident());
+      for (const p of this.padProps) drawMesh(gl, p.mesh);
+      for (const [mesh, , m] of towerParts) { gl.uniformMatrix4fv(this.progDepth.u.u_model, false, m); drawMesh(gl, mesh); }
+    }
 
     // ---- opaque HDR pass (MSAA)
     gl.bindFramebuffer(gl.FRAMEBUFFER, T.msFbo);
@@ -863,6 +883,15 @@ export class Scene {
     this._post();
     gl.depthMask(true);
     gl.enable(gl.DEPTH_TEST);
+    if (pip) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, T.outFbo);
+      gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, T.pixels);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      Object.assign(this, mainState);
+      this.finalFbo = null;
+      return T.pixels;
+    }
+    return null;
   }
 
   _fullscreen() { this.gl.bindVertexArray(this.emptyVao); this.gl.drawArrays(this.gl.TRIANGLES, 0, 3); }
@@ -970,7 +999,7 @@ export class Scene {
     }
     gl.disable(gl.BLEND);
     // composite
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.finalFbo || null);
     gl.viewport(0, 0, T.W, T.H);
     const pc = this.progComp;
     gl.useProgram(pc.program);

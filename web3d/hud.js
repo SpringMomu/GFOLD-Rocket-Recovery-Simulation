@@ -136,7 +136,7 @@ export class HUD {
     // Phones start with only the flight data strip and the touch pad open.
     this.phone = window.matchMedia("(max-width: 760px), (max-height: 520px)").matches;
     const DEFAULT_FOLDED = this.phone
-      ? ["ap", "res", "aero", "tunnelPanel", "events", "propPanel", "scope", "cluster", "toolbar", "solverPanel"]
+      ? ["ap", "res", "aero", "tunnelPanel", "events", "propPanel", "scope", "cluster", "toolbar", "solverPanel", "camPanel"]
       : ["toolbar", "solverPanel"];
     const panels = [...document.querySelectorAll(".panel")].filter((el) => el.id && el.id !== "help");
     this.panels = panels;

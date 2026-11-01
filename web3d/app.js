@@ -38,7 +38,7 @@ let latest = null;
 let online = true;
 const CLEAN = /[?&]clean/.test(location.search);
 const view = { flowMode: 0, volField: 1, cam: 0, cfdCoef: null, cfdSps: 0, flowTime: 0, showTraj: false };
-const CAM_NAMES = ["环绕", "着陆台", "侧视", "箭身"];
+const CAM_NAMES = ["环绕", "着陆台", "侧视", "箭身（裙部）", "箭身（栅格舵）"];
 const VOL_NAMES = ["染料", "涡量", "速度"];
 const VOL_TO_TUNNEL = ["dye", "vort", "speed"];
 
@@ -176,6 +176,68 @@ function toast(msg) {
   toastEl.textContent = msg; toastEl.style.display = "block"; toastUntil = performance.now() + 1800;
 }
 
+// ------------------------------------------------------------------ body-mounted cameras
+// Both cameras are rigidly fixed in the body frame: they can neither move nor
+// turn relative to the booster, they only ride with it.
+//  skirt: on a short boom at the skirt (3.4 m out on the -x side, 1.5 m above
+//         the base), looking down the vehicle and 16.5 deg inwards: the engine
+//         bell, the flame streaming away, the legs and the ground.  (From the
+//         hull itself the bell is hidden behind the cylinder.)  Image "up" =
+//         away from the axis.
+//  fin:   above the grid fins, on a boom 2.5 m above them (z = 19.3 m) and 3.9 m
+//         out at the 45 deg azimuth between two fins, looking down at the ring
+//         of fins (z = 16.8 m, r = 2.2 m) so that the panels, their hinges and
+//         their deflection are in view.  Image "up" = towards the nose.
+function bodyCam(st, which) {
+  let eyeB, look, upB, fov;
+  if (which === "fin") {
+    const u = Math.SQRT1_2, r = 3.9;
+    eyeB = [u * r, u * r, 19.3];
+    look = V.norm([u * 1.9 - eyeB[0], u * 1.9 - eyeB[1], 15.6 - eyeB[2]]);
+    upB = V.norm(V.sub([0, 0, 1], V.mul(look, look[2])));
+    fov = 1.3;
+  } else {
+    const tilt = 16.5 * Math.PI / 180;
+    eyeB = [-3.4, 0, 1.5];
+    look = [Math.sin(tilt), 0, -Math.cos(tilt)];
+    upB = [-Math.cos(tilt), 0, -Math.sin(tilt)];
+    fov = 1.4;
+  }
+  const eye = V.add(st.pos, rot(st.q, eyeB));
+  return { eye, at: V.add(eye, V.mul(rot(st.q, look), 40)), up: rot(st.q, upB), fov };
+}
+
+// Camera panel: the chosen body camera in a small window next to the main
+// view, so the third-person camera and the onboard picture can be watched
+// together.  It is a second (small) render pass, only while the panel is open.
+const PIP_W = 480, PIP_H = 270;
+const pipCanvas = document.getElementById("camView");
+const pipCtx = pipCanvas.getContext("2d");
+const pipImg = pipCtx.createImageData(PIP_W, PIP_H);
+const PIP_KEY = "booster3d.pipcam.v1";
+let pipCam = "fin";
+try { const v = localStorage.getItem(PIP_KEY); if (v === "fin" || v === "skirt") pipCam = v; } catch (e) { /* private mode */ }
+const PIP_NAMES = { fin: "栅格舵", skirt: "裙部 / 发动机" };
+function setPipCam(c) {
+  pipCam = c;
+  try { localStorage.setItem(PIP_KEY, c); } catch (e) { /* private mode */ }
+  document.getElementById("camTag").textContent = PIP_NAMES[c];
+  for (const b of document.querySelectorAll("#camSel button")) b.classList.toggle("on", b.dataset.c === c);
+}
+for (const b of document.querySelectorAll("#camSel button")) b.addEventListener("click", () => setPipCam(b.dataset.c));
+setPipCam(pipCam);
+let pipFrame = 0;
+function drawPip(st, fx) {
+  if (hud.isFolded("camPanel") || (++pipFrame & 1)) return;      // 30 Hz is plenty for a window this small
+  const bc = bodyCam(st, pipCam);
+  const px = scene.render({ eye: bc.eye, at: bc.at, up: bc.up, fov: bc.fov, dist: 20 }, st,
+    { rcs: fx.rcs, particles: fx.particles, plume: fx.plume, lines: lineBuf.subarray(0, 0) }, { pip: { w: PIP_W, h: PIP_H } });
+  if (!px) return;
+  const src = new Uint32Array(px.buffer), dst = new Uint32Array(pipImg.data.buffer);
+  for (let y = 0; y < PIP_H; y++) dst.set(src.subarray((PIP_H - 1 - y) * PIP_W, (PIP_H - y) * PIP_W), y * PIP_W);   // GL rows run bottom-up
+  pipCtx.putImageData(pipImg, 0, 0);
+}
+
 // ------------------------------------------------------------------ camera
 const cam = { yaw: -2.25, pitch: 0.18, dist: 70, fov: 0.9, eye: [0, 0, 0], at: [0, 0, 0], up: [0, 0, 1], smoothAt: null, auto: true };
 // Mouse or one finger drags the orbit, two fingers pinch the distance,
@@ -226,18 +288,9 @@ function updateCamera(st, dt) {
     cam.dist += (want - cam.dist) * (1 - Math.exp(-dt * 1.5));
   }
   let fov = 0.9, eye, up = [0, 0, 1];
-  if (view.cam === 3) {
-    // Body camera: fixed in the body frame on a short boom at the skirt (3.4 m
-    // out on the -x side, 1.5 m above the base), looking down the vehicle and
-    // 16 deg inwards: the engine bell, the flame streaming away, the legs and
-    // the ground come into view.  (From the hull itself the bell is hidden
-    // behind the cylinder.)  It turns with the booster; image "up" = away
-    // from the axis.
-    const tilt = 16.5 * Math.PI / 180;
-    eye = V.add(st.pos, rot(st.q, [-3.4, 0, 1.5]));
-    const look = rot(st.q, [Math.sin(tilt), 0, -Math.cos(tilt)]);
-    cam.eye = eye; cam.at = V.add(eye, V.mul(look, 40)); cam.fov = 1.4;
-    cam.up = rot(st.q, [-Math.cos(tilt), 0, -Math.sin(tilt)]);
+  if (view.cam >= 3) {
+    const bc = bodyCam(st, view.cam === 3 ? "skirt" : "fin");
+    cam.eye = bc.eye; cam.at = bc.at; cam.up = bc.up; cam.fov = bc.fov;
     return;
   }
   if (view.cam === 1) {
@@ -608,7 +661,8 @@ function frame(now) {
     if (fluidOn && view.flowMode > 0) {
       fx.fluid = fluid; fx.fluidMode = view.volField; fx.fluidVolume = true;
     }
-    scene.render({ eye: cam.eye, at: cam.at, fov: cam.fov, dist: camDist(st.pos) }, stR, fx, view);
+    scene.render({ eye: cam.eye, at: cam.at, up: cam.up, fov: cam.fov, dist: camDist(st.pos) }, stR, fx, view);
+    drawPip(stR, fx);
     hud.update(latest ? Object.assign({}, latest, { pos: st.pos, vel: st.vel, q: st.q, alt: st.alt }) : st, view);
     if (frameNo % 6 === 0) controls.update(latest, view);
   }
