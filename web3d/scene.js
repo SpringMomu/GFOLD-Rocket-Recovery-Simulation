@@ -914,7 +914,7 @@ export class Scene {
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     const I = 0.7 + 0.3 * P.thr;
     // [radius scale, length scale, colour, opacity]: soft shells, denser towards the core
-    const layers = [[1.25, 1.0, [3.2, 1.15, 0.2], 0.75], [0.8, 0.78, [4.6, 3.0, 0.75], 0.85], [0.42, 0.5, [5.2, 4.8, 3.4], 0.95]];
+    const layers = [[1.3, 1.0, [3.2, 1.15, 0.2], 0.8], [0.95, 0.8, [4.6, 3.0, 0.75], 0.75], [0.55, 0.55, [5.2, 4.8, 3.4], 0.8]];
     for (const [rs, ls, col, al] of layers) {
       gl.uniform1f(pp.u.u_A, al);
       gl.uniform1f(pp.u.u_len, P.flameLen * flick * ls);

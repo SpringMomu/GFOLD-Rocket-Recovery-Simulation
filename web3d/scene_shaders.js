@@ -378,7 +378,7 @@ void main() {
   float wS = exp2(texelFetch(u_depth, ivec2(gl_FragCoord.xy), 0).r * u_logFar) - 1.0;
   if (v_w > wS) discard;
   float f = abs(dot(normalize(v_n), normalize(u_cam - v_world)));       // 1 facing the eye, 0 at the silhouette
-  float a = u_A * smoothstep(0.0, 0.8, f) * (1.0 - smoothstep(0.5, 1.0, v_s));
+  float a = u_A * pow(smoothstep(0.0, 1.0, f), 1.6) * (1.0 - smoothstep(0.25, 1.0, v_s));   // soft: the shell fades out well before its silhouette
   o = vec4(u_col * u_I * a, a);
 }`;
 
@@ -420,7 +420,9 @@ void main() {
     float lit = dot(v_uv, sd) > -0.15 * max(length(sd), 0.05) ? 1.0 : 0.7;
     float rim = r2 > 0.78 ? 0.82 : 1.0;
     vec3 c = v_col.rgb * (SUN_E * 0.36 * lit + hemiAmb(0.5) * 1.0 + v_plume * 0.12) * rim;
-    o = vec4(c * v_col.a, v_col.a);
+    float qa = floor(v_col.a * 5.0 + 0.5) / 5.0;             // stepped opacity: no soft fade, the edge stays hard
+    if (qa <= 0.0) discard;
+    o = vec4(c * qa, qa);
     return;
   }
   if (v_ex.w < -0.5) {                     // spark / ember: hot point, additive

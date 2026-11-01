@@ -199,7 +199,7 @@ class Autopilot3D:
     # lander3d/settings.py; the defaults are the original behaviour):
     wind_plan_gain = 1.0          # wind the planner's predictions assume, x the extrapolated measured wind
     aero_pred = 2                 # aerodynamics in the plan: 0 none, 1 drag at the reference attitude, 2 + lift linearisation
-    boostback_wind = False        # False: the boost-back / hop is aimed and judged in still air (wind ignored)
+    boostback_wind = True         # True: the boost-back / hop is aimed and judged with the wind; False: in still air (wind ignored)
     trim_gain = 1.0               # share of the wind trim (lean into the wind) used by the tilt cone and the tracker
     shear_fit = True              # fit the shear strength from the winds measured on the way down (else k = 1)
     # Wind trim: the sideways thrust acceleration that cancels the aerodynamic
