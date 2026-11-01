@@ -161,13 +161,18 @@ export class Scene {
     this.progDepth = createProgram(gl, S.DEPTH_VS, S.DEPTH_FS);
     this.progPoint = createProgram(gl, S.POINT_VS, S.POINT_FS);
     this.progLine = createProgram(gl, S.LINE_VS, S.LINE_FS);
-    this.progPlume = createProgram(gl, S.FS_VS, S.PLUME_FS);
+    this.progFlame = createProgram(gl, S.FLAME_VS, S.FLAME_FS);
     this.progPart = createProgram(gl, S.PART_VS, S.PART_FS);
     this.progDown = createProgram(gl, S.FS_VS, S.DOWN_FS);
     this.progUp = createProgram(gl, S.FS_VS, S.UP_FS);
     this.progComp = createProgram(gl, S.FS_VS, S.COMPOSITE_FS);
     this.progCopy = createProgram(gl, S.FS_VS, S.COPY_FS);
     this.progRcs = createProgram(gl, S.RCS_VS, S.RCS_FS);
+    // Flame: one teardrop (unit length, unit radius at its widest), scaled per layer.
+    const fp = [];
+    for (let i = 0; i <= 16; i++) { const t = i / 16; fp.push([t < 0.12 ? 0.88 + 0.12 * (t / 0.12) : Math.pow((1 - t) / 0.88, 0.8), t]); }
+    const fl = lathe(fp, 24);
+    this.meshFlame = createMesh(gl, fl.d, fl.idx);
     const rc = frustum(1, 1, 0, 1, 20, false);
     this.meshRcsJet = createMesh(gl, rc.d, rc.idx);
     const t = polarGrid(230, 200, 3.0, 1.0415);
@@ -223,8 +228,8 @@ export class Scene {
     const gl = this.gl;
     if (this.targets) {
       const o = this.targets;
-      [o.colorTex, o.depthTex, o.plumeTex, ...o.bloom.map((b) => b.tex)].forEach((t) => gl.deleteTexture(t));
-      [o.msFbo, o.resolveFbo, o.transFbo, o.plumeFbo, ...o.bloom.map((b) => b.fbo)].forEach((f) => gl.deleteFramebuffer(f));
+      [o.colorTex, o.depthTex, ...o.bloom.map((b) => b.tex)].forEach((t) => gl.deleteTexture(t));
+      [o.msFbo, o.resolveFbo, o.transFbo, ...o.bloom.map((b) => b.fbo)].forEach((f) => gl.deleteFramebuffer(f));
       [o.msColor, o.msDepth].forEach((r) => gl.deleteRenderbuffer(r));
     }
     const ifmt = this.hdr ? gl.RGBA16F : gl.RGBA8, type = this.hdr ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
@@ -251,11 +256,8 @@ export class Scene {
       bloom.push({ tex, fbo: this._fbo(tex, null), w, h });
       if (w <= 4 || h <= 4) break;
     }
-    const PW = Math.max(1, W >> 1), PH = Math.max(1, H >> 1);
-    const plumeTex = this._texture(PW, PH, ifmt, gl.RGBA, type, gl.LINEAR);
-    const plumeFbo = this._fbo(plumeTex, null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    this.targets = { W, H, PW, PH, msColor, msDepth, msFbo, colorTex, depthTex, resolveFbo, transFbo, plumeTex, plumeFbo, bloom };
+    this.targets = { W, H, msColor, msDepth, msFbo, colorTex, depthTex, resolveFbo, transFbo, bloom };
   }
 
   _initParticles(max) {
@@ -707,7 +709,7 @@ export class Scene {
     this._ensureTargets(W, H);
     const T = this.targets;
     const proj = M4.perspective(cam.fov, W / H, 0.3, FAR);
-    const view = M4.lookAt(cam.eye, cam.at, [0, 0, 1]);
+    const view = M4.lookAt(cam.eye, cam.at, cam.up || [0, 0, 1]);
     const vp = M4.mul(proj, view);
     this.vp = vp; this.proj = proj; this.viewM = view; this.W = W; this.H = H;
     this.invVP = M4.invert(vp); this.logFC = LOG_FC;
@@ -852,7 +854,7 @@ export class Scene {
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, pa.data, 0, Math.min(pa.n, this.partMax) * 12);
     }
     if (pa && pa.nFar > 0) this._drawParticles(0, pa.nFar, partCtx);
-    if (P.on) this._drawPlume(P, cam, camF);
+    if (P.on) this._drawPlume(P);
     if (pa && pa.n > pa.nFar) this._drawParticles(pa.nFar, Math.min(pa.n, this.partMax) - pa.nFar, partCtx);
     if (fx.rcs && fx.rcs.length) this._drawRcs(fx.rcs, cam);
 
@@ -865,75 +867,31 @@ export class Scene {
 
   _fullscreen() { this.gl.bindVertexArray(this.emptyVao); this.gl.drawArrays(this.gl.TRIANGLES, 0, 3); }
 
-  _drawPlume(P, cam, camF) {
-    const gl = this.gl, T = this.targets, pp = this.progPlume;
-    // Scissor to the projected bounds of the jet and the wall jet.
-    const pts = [];
-    const Rb = P.jetR(Math.min(P.len * 1.25, P.hdist)) * 2.2 + 1.5;
-    for (let i = 0; i <= 4; i++) {
-      const s = Math.min(P.len * 1.25, P.hdist + 1) * i / 4;
-      const c = V.add(P.exit, V.mul(P.axis, s));
-      for (const o of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) pts.push(V.add(c, V.mul(o, Rb + V.len(P.bend) * s * s)));
-    }
-    if (P.hit && P.heat > 0.002) {
-      const R = P.Rw * 2.6 + 2, Hh = 0.3 * P.Rj + 0.26 * P.Rw + 3;
-      for (let k = 0; k < 8; k++) { const a = k * Math.PI / 4; for (const z of [0, Hh]) pts.push([P.hit[0] + Math.cos(a) * R, P.hit[1] + Math.sin(a) * R, z]); }
-    }
-    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, behind = false;
-    for (const p of pts) {
-      const v = this.vp;
-      const x = v[0] * p[0] + v[4] * p[1] + v[8] * p[2] + v[12], y = v[1] * p[0] + v[5] * p[1] + v[9] * p[2] + v[13], w = v[3] * p[0] + v[7] * p[1] + v[11] * p[2] + v[15];
-      if (w <= 0.1) { behind = true; break; }
-      const sx = (x / w * 0.5 + 0.5) * T.W, sy = (y / w * 0.5 + 0.5) * T.H;
-      x0 = Math.min(x0, sx); x1 = Math.max(x1, sx); y0 = Math.min(y0, sy); y1 = Math.max(y1, sy);
-    }
-    if (behind) { x0 = 0; y0 = 0; x1 = T.W; y1 = T.H; }
-    x0 = Math.max(0, Math.floor(x0 / 2) - 2); y0 = Math.max(0, Math.floor(y0 / 2) - 2);
-    x1 = Math.min(T.PW, Math.ceil(x1 / 2) + 2); y1 = Math.min(T.PH, Math.ceil(y1 / 2) + 2);
-    if (x1 <= x0 || y1 <= y0) return;
-    // Ray-march at half resolution, then composite.
-    gl.bindFramebuffer(gl.FRAMEBUFFER, T.plumeFbo);
-    gl.viewport(0, 0, T.PW, T.PH);
-    gl.disable(gl.BLEND);
-    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); gl.clearColor(0, 0, 0, 1);
-    gl.enable(gl.SCISSOR_TEST);
-    gl.scissor(x0, y0, x1 - x0, y1 - y0);
+  // Simple game-style flame: three flat-coloured teardrops along the exhaust
+  // axis (outer orange, yellow, white core), opaque, no spreading.
+  _drawPlume(P) {
+    const gl = this.gl, T = this.targets, pp = this.progFlame;
+    const z = P.axis, ang = Math.acos(Math.max(-1, Math.min(1, z[2]))), ax = V.cross([0, 0, 1], z);
+    const m = M4.mul(M4.translate(P.exit), V.len(ax) > 1e-6 ? M4.rotAxis(ax, ang) : (z[2] < 0 ? M4.rotAxis([1, 0, 0], Math.PI) : M4.ident()));
+    const t = this.time;
+    const flick = 1 + 0.06 * Math.sin(t * 52) + 0.04 * Math.sin(t * 91 + 1.3);
     gl.useProgram(pp.program);
-    gl.uniformMatrix4fv(pp.u.u_invVP, false, this.invVP);
-    gl.uniform3fv(pp.u.u_cam, cam.eye);
-    gl.uniform3fv(pp.u.u_fwd, camF);
-    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, T.depthTex); gl.uniform1i(pp.u.u_depth, 3);
+    gl.uniformMatrix4fv(pp.u.u_vp, false, this.vp);
+    gl.uniformMatrix4fv(pp.u.u_model, false, m);
     gl.uniform1f(pp.u.u_logFar, Math.log2(FAR + 1));
-    gl.uniform3fv(pp.u.u_exit, P.exit);
-    gl.uniform3fv(pp.u.u_axis, P.axis);
-    gl.uniform3fv(pp.u.u_bend, P.bend);
-    gl.uniform1f(pp.u.u_len, P.len);
-    gl.uniform1f(pp.u.u_re, EXIT_R);
-    gl.uniform1f(pp.u.u_spread, P.spread);
-    gl.uniform1f(pp.u.u_bulge, P.bulge);
-    gl.uniform1f(pp.u.u_time, this.time % 1000);
-    gl.uniform1f(pp.u.u_I, P.intensity);
-    gl.uniform1f(pp.u.u_dia, P.diamonds);
-    gl.uniform1f(pp.u.u_lambda, P.lambda);
-    gl.uniform1f(pp.u.u_pamb, P.pamb);
-    gl.uniform1f(pp.u.u_hdist, P.hdist);
-    gl.uniform1f(pp.u.u_Rj, P.Rj || 1);
-    gl.uniform1f(pp.u.u_Rw, P.Rw || 1);
-    gl.uniform1f(pp.u.u_wall, P.hit ? P.heat * P.intensity : 0);
-    gl.uniform1f(pp.u.u_blast, P.blast);
-    gl.uniform3fv(pp.u.u_hit, P.hit || [0, 0, -1e4]);
-    if (pp.u.u_gg) gl.uniform3fv(pp.u.u_gg, P.gg || P.exit);
-    gl.uniform1f(pp.u.u_dscale, T.W / T.PW);
-    this._fullscreen();
-    gl.disable(gl.SCISSOR_TEST);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, T.transFbo);
-    gl.viewport(0, 0, T.W, T.H);
-    gl.enable(gl.BLEND);
+    gl.uniform1f(pp.u.u_time, t % 1000);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, T.depthTex); gl.uniform1i(pp.u.u_depth, 3);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    gl.useProgram(this.progCopy.program);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, T.plumeTex);
-    gl.uniform1i(this.progCopy.u.u_src, 0);
-    this._fullscreen();
+    const I = 0.7 + 0.3 * P.thr;
+    const layers = [[1.0, 1.0, [3.2, 1.15, 0.2]], [0.62, 0.74, [4.6, 3.0, 0.75]], [0.32, 0.46, [5.2, 4.8, 3.4]]];
+    for (const [rs, ls, col] of layers) {
+      gl.uniform1f(pp.u.u_len, P.flameLen * flick * ls);
+      gl.uniform1f(pp.u.u_rad, EXIT_R * 1.75 * (0.85 + 0.15 * P.thr) * rs);
+      gl.uniform1f(pp.u.u_seed, rs * 7.0);
+      gl.uniform3fv(pp.u.u_col, col);
+      gl.uniform1f(pp.u.u_I, I);
+      drawMesh(gl, this.meshFlame);
+    }
     gl.activeTexture(gl.TEXTURE0);
   }
 

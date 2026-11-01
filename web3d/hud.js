@@ -281,20 +281,16 @@ export class HUD {
     $("apMode").textContent = st.autopilot ? "G-FOLD 3D" : "手动";
     $("solver").textContent = ZH.backend(st.solver.backend);
     $("solStat").textContent = ZH.solverStatus(st.solver.status) + (st.solver.locked ? " · 着陆燃烧中" : "");
-    // Planner trouble, on screen: no solution at all (flying on the last
-    // plan), or a plan that does not reach the gate (searching again).
+    // Planner trouble, on screen: no solution at all (flying on the last plan).
     const alert = st.solver.alert;
     const warn = $("solverWarn");
     if (alert && alert[0] === "fail") {
       warn.className = "fail"; warn.style.display = "block";
       warn.textContent = `⚠ 规划无解（${ZH.solverStatus(alert[1])}）· 沿用上一条规划`;
-    } else if (alert && alert[0] === "miss") {
-      warn.className = "miss"; warn.style.display = "block";
-      warn.textContent = "⚠ 规划到不了目标 · 正在重新搜索触地时间与路线";
     } else {
       warn.style.display = "none";
     }
-    $("solStat").style.color = alert ? (alert[0] === "fail" ? "#ff5a4e" : "#ffb347") : "";
+    $("solStat").style.color = alert ? "#ff5a4e" : "";
     $("solves").textContent = st.solver.solves;
     $("margin").textContent = (st.solver.margin * 100).toFixed(0) + " %";
     $("cmdThr").textContent = st.cmd_throttle === null ? "--" : (st.cmd_throttle * 100).toFixed(0) + " %";

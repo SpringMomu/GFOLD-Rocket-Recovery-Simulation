@@ -199,6 +199,7 @@ class Autopilot3D:
     # lander3d/settings.py; the defaults are the original behaviour):
     wind_plan_gain = 1.0          # wind the planner's predictions assume, x the extrapolated measured wind
     aero_pred = 2                 # aerodynamics in the plan: 0 none, 1 drag at the reference attitude, 2 + lift linearisation
+    boostback_wind = False        # False: the boost-back / hop is aimed and judged in still air (wind ignored)
     trim_gain = 1.0               # share of the wind trim (lean into the wind) used by the tilt cone and the tracker
     shear_fit = True              # fit the shear strength from the winds measured on the way down (else k = 1)
     # Wind trim: the sideways thrust acceleration that cancels the aerodynamic
@@ -532,6 +533,8 @@ class Autopilot3D:
         self._bb_reserve = 0.0
         self._ign_state = None
         self._burn_miss_now = np.zeros(2)
+        self._bb_impact = None
+        self._bb_impact_next = 0.0
         self._brake_time = 0.0
         self.impact = None
         self.ignition_in = math.inf
@@ -1065,15 +1068,18 @@ class Autopilot3D:
             ign = float(np.interp(t_burn, [2.0, 5.0, 8.0], [self.ignition_short, self.ignition_mid, ign]))
         return ign
 
-    def _ballistic(self, veh, r, v, m, wind_now, dt=0.25, t_max=240.0, stop_on_ignition=True):
-        """Drag-aware coast prediction. Returns (points, impact_xy, t_impact, t_ignition, burn_time)."""
+    def _ballistic(self, veh, r, v, m, wind_now, dt=0.25, t_max=240.0, stop_on_ignition=True, blind=False):
+        """Drag-aware coast prediction. Returns (points, impact_xy, t_impact, t_ignition, burn_time).
+
+        ``blind``: in still air, and only the impact (no glide-target state)."""
         pts = [r.copy()]
         p, u = r.copy(), v.copy()
         t = 0.0
         t_ign, t_burn = math.inf, math.inf
         while t < t_max:
             rho, _, _, a = atmosphere(max(0.0, p[2]))
-            f = self.aero.quick_force(u - self._wind(p[2]), None, rho, a, 0.0) if self.aero is not None else np.zeros(3)
+            wv = np.zeros(3) if blind else self._wind(p[2])
+            f = self.aero.quick_force(u - wv, None, rho, a, 0.0) if self.aero is not None else np.zeros(3)
             if stop_on_ignition and not math.isfinite(t_ign):
                 frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m))
                 if frac >= self._ignition_threshold(tb, bd):
@@ -1088,6 +1094,8 @@ class Autopilot3D:
             if p[2] <= 0.0:
                 break
         impact = p[:2].copy()
+        if blind:
+            return pts, impact, t, t_ign, t_burn
         # State at the predicted ignition (or at the impact): the glide target.
         self._ign_state = (t_ign, ign_p, ign_v, t_burn) if math.isfinite(t_ign) else (t, p.copy(), u.copy(), 0.0)
         self._burn_miss_now, self._brake_time = (self._burn_miss(veh, ign_p, ign_v, m, wind_now) if math.isfinite(t_ign)
@@ -1170,9 +1178,8 @@ class Autopilot3D:
                 self.plan = None
 
     def solver_alert(self):
-        """For the display: None, or (kind, status) -- 'fail' when the last
-        re-plans found no solution (shown for 2 s), 'miss' when the plan in
-        hand does not reach the gate."""
+        """For the display: None, or ('fail', status) when the last re-plans
+        found no solution (shown for 2 s)."""
         if not self.burn_locked or self._holding:
             # holding at the gate (or after the burn) nothing is planned:
             # the plan in hand is stale and says nothing
@@ -1183,16 +1190,8 @@ class Autopilot3D:
             return None
         if self.solver_fail is not None and self.elapsed - self.solver_fail[0] < 2.0:
             return ("fail", self.solver_fail[1])
-        p = self.plan
-        if p is not None and self.elapsed - p.created_at < 1.5 and (
-                p.terminal_position_error >= 1.0 or p.terminal_velocity_error >= 0.8
-                or p.keep_out_violation >= 0.5 or p.ground_violation >= 0.5):
-            # really short of the gate, or only through an obstacle / the
-            # ground.  A plan that gets there leaning past the soft angle-of-
-            # attack limit is re-searched (reaches_pad) but is not "cannot
-            # reach": in a strong wind aloft that happens for a few seconds
-            # after ignition while the linearisation settles.
-            return ("miss", self.last_status)
+        # A plan that does not reach the gate is simply re-searched (reaches_pad); it
+        # is no alert -- only a missing solution is shown.
         return None
 
     def _commit(self, plan):
@@ -1877,7 +1876,16 @@ class Autopilot3D:
         miss = float(np.linalg.norm(self.impact))
 
         # ---- boost-back: put the booster over the pad at ignition.
-        airspeed = float(np.linalg.norm(v - wind_now))
+        # Aimed and judged in still air (``boostback_wind``): the speed is the
+        # ground speed and the miss is the drag-only impact without wind.  The
+        # glide and the landing burn take the wind out afterwards.
+        wind_bb = wind_now if self.boostback_wind else np.zeros(3)
+        if not self.boostback_wind and float(np.linalg.norm(wind_now)) > 0.05 and self.aero is not None:
+            if self.elapsed >= self._bb_impact_next or self._bb_impact is None:
+                self._bb_impact = self._ballistic(veh, r, v, m, wind_now, stop_on_ignition=False, blind=True)[1]
+                self._bb_impact_next = self.elapsed + self.coast_predict_period
+            miss = float(np.linalg.norm(self._bb_impact))
+        airspeed = float(np.linalg.norm(v - wind_bb))
         drag_up = max(0.0, float(veh.last["aero"][2]) / m)
         frac, t_burn, burn_dir = self._burn_need(veh, r, v, m, drag_up)
         ignite_now = frac >= self._ignition_threshold(t_burn, burn_dir)
@@ -1922,7 +1930,7 @@ class Autopilot3D:
             d = None if dv is None or dvn <= 0.0 else dv / dvn
             braking = False
             if d is not None and airspeed > self.nose_first_speed:
-                u_air = (v - wind_now) / airspeed
+                u_air = (v - wind_bb) / airspeed
                 cos_f = float(np.dot(d, u_air))
                 cap = math.radians(self.nose_first_aoa_deg)
                 if cos_f > 0.0:
@@ -1996,15 +2004,17 @@ class Autopilot3D:
         self.cmd_axis = target
         self._attitude(veh, target, use_rcs=True)
 
-    def _coast(self, veh, r, v, m, wind_now, dt=0.25, t_max=200.0):
-        """Drag-aware coast to the predicted ignition: ``(t_ign, p_ign, v_ign, t_burn)``, or None."""
+    def _coast(self, veh, r, v, m, wind_now, dt=0.25, t_max=200.0, blind=False):
+        """Drag-aware coast to the predicted ignition: ``(t_ign, p_ign, v_ign, t_burn)``, or None
+        (``blind``: in still air)."""
         if self.aero is None:
             return None
         p, u = r.copy(), v.copy()
         t = 0.0
         while t < t_max and p[2] > 0.0:
             rho, _, _, a = atmosphere(max(0.0, p[2]))
-            f = self.aero.quick_force(u - self._wind(p[2]), None, rho, a, 0.0)
+            wv = np.zeros(3) if blind else self._wind(p[2])
+            f = self.aero.quick_force(u - wv, None, rho, a, 0.0)
             frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m))
             if frac >= self._ignition_threshold(tb, bd):
                 return t, p, u, tb
@@ -2013,7 +2023,7 @@ class Autopilot3D:
             t += dt
         return None
 
-    def _burn_miss(self, veh, p_ign, v_ign, m, wind_now, dt=0.2):
+    def _burn_miss(self, veh, p_ign, v_ign, m, wind_now, dt=0.2, blind=False):
         """Where a (nearly) upright landing burn lit at ``(p_ign, v_ign)`` ends.
 
         Returns ``(miss_xy, t_brake)``.  The burn brakes at constant
@@ -2027,7 +2037,9 @@ class Autopilot3D:
         at the pad: the burn then needs only a small, steady tilt -- at high
         dynamic pressure a tilted engines-first booster gets a body lift
         *against* its tilt, so a large sideways correction with the engine
-        is costly and fights itself."""
+        is costly and fights itself.
+
+        ``blind``: in still air (the boost-back), without the wind trim."""
         h0, vz0 = float(p_ign[2]) - self.gate_height, float(v_ign[2])
         a_v = max(0.5, (vz0 ** 2 - self.gate_speed ** 2) / (2.0 * max(1.0, h0)))
         # Braking time: the constant-deceleration profile sqrt(2 a_v h)
@@ -2048,7 +2060,8 @@ class Autopilot3D:
             a_h = np.zeros(2)
             if self.aero is not None:
                 rho, _, _, a = atmosphere(max(0.0, p[2]))
-                a_h = self.aero.quick_force(u - self._wind(p[2]), up, rho, a, 0.0)[:2] / m
+                wv = np.zeros(3) if blind else self._wind(p[2])
+                a_h = self.aero.quick_force(u - wv, up, rho, a, 0.0)[:2] / m
                 # The burn leans into the wind (the wind trim; the plan's
                 # sideways-effort cost does not charge thrust that only cancels
                 # drag), up to ``trim_max_deg`` of tilt of a thrust that carries
@@ -2061,7 +2074,7 @@ class Autopilot3D:
                 # never over the pad at ignition.
                 n_h = float(np.linalg.norm(a_h))
                 cap = self.trim_gain * math.tan(math.radians(self.trim_max_deg)) * (G0 + a_v)
-                if n_h > 1e-9:
+                if n_h > 1e-9 and not blind:
                     a_h *= max(0.0, n_h - cap) / n_h
             # steady thrust decel that stops the along-track drift by t_br
             # (drag does part of it)
@@ -2094,8 +2107,9 @@ class Autopilot3D:
         dv[2] = max(0.0, dv[2])
 
         def shoot(x):
-            res = self._coast(veh, r, v + x, m, wind_now)
-            return None if res is None else (self._burn_miss(veh, res[1], res[2], m, wind_now)[0], res)
+            blind = not self.boostback_wind
+            res = self._coast(veh, r, v + x, m, wind_now, blind=blind)
+            return None if res is None else (self._burn_miss(veh, res[1], res[2], m, wind_now, blind=blind)[0], res)
 
         out = shoot(dv)
         for _ in range(2):
