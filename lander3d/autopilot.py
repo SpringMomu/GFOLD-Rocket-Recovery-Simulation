@@ -7,8 +7,11 @@ allocation are in ``attitude.py``.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import math
+import threading
+import time
 
 import numpy as np
 
@@ -26,7 +29,7 @@ from .planner import (
     detour_paths,
     separating_planes,
 )
-from .vehicle import G0, atmosphere, fin_mix
+from .vehicle import G0, atmosphere, atmosphere_many, fin_mix
 
 # Landing-burn tilt budget vs height (m -> deg): upright at contact.  It is
 # measured from the wind trim (Autopilot3D._trim_xy: in a cross wind the
@@ -90,6 +93,17 @@ class Autopilot3D:
 
     burn_replan_period = 0.2
     coast_predict_period = 0.25
+    # Wall-clock budget of one re-plan (search included).  Over the pad the
+    # plans must keep up with the 5 Hz cadence: an out-of-reach problem costs
+    # a dozen extra solves, and without a cap the planner fell behind the
+    # vehicle exactly when the guidance was needed most.
+    plan_budget = 0.20            # s, a full-horizon re-plan
+    plan_budget_short = 0.12      # s, over the last 8 s before touchdown
+    plan_budget_search = 0.50     # s, a final-time / route search (at most every search_backoff)
+    plan_budget_ignition = 1.00   # s, the one-off ignition search (planner thread)
+    ign_prep_lead = 1.8           # s before ignition: search its plan on the planner thread
+    prep_period = 0.7             # s between ignition preparations
+    ign_defer_max = 1.2           # s: an immediate ignition may coast this long for its plan
     # Ignition threshold (thrust fraction a constant-deceleration burn started
     # now would need).  The later the ignition, the less gravity loss; the
     # threshold adapts to how much of the 0.85 plan budget the burn will
@@ -205,6 +219,19 @@ class Autopilot3D:
     def __init__(self, aero_model=None) -> None:
         self.planner = Planner3D()
         self.aero = aero_model
+        self.async_plan = False        # re-plans on a background thread (server / browser)
+        self._plan_cond = threading.Condition()
+        self._plan_job = None          # job waiting for the planning thread
+        self._plan_done = None         # finished job waiting to be committed
+        self._plan_thread = None
+        self._plan_closed = False
+        self._plan_gen = 0             # bumped on reset: results of older jobs are dropped
+        self.plan_errors = 0           # planning-thread exceptions (shown in the state)
+        self._ignition_searching = False   # the asynchronous ignition search is in flight
+        self._prep = None              # searched ignition plan (final time + route) for the predicted state
+        self._next_prep = 0.0
+        self._ignite_defer_until = None    # coasting a moment longer for the ignition plan
+        self._plan_deadline = math.inf  # wall-clock deadline of the re-plan in progress
         self.set_target()
         self.reset()
 
@@ -229,7 +256,233 @@ class Autopilot3D:
         self.obstacles = [KeepOutBox(np.asarray(c, float) - np.array([0.0, 0.0, z0]), np.asarray(ax, float), np.asarray(hf, float))
                           for c, ax, hf in obstacles]
 
+    # ------------------------------------------------- planning thread
+    def enable_async_planning(self) -> None:
+        """Run the re-plans on a background thread.
+
+        A re-plan is tens of milliseconds of matrix assembly plus the solver
+        (and ~0.4 s at a final-time search).  Done inside ``Sim3D.step`` it
+        stalls the whole state stream, so the web front end freezes on every
+        solve.  The thread works on a frozen copy of the autopilot and of the
+        vehicle; the sim thread commits the finished plan at its next step."""
+        if self._plan_thread is not None:
+            return
+        self._plan_closed = False
+        try:
+            thread = threading.Thread(target=self._plan_loop, name="autopilot-planner", daemon=True)
+            thread.start()
+        except Exception:      # no threads at all (Pyodide): plan synchronously
+            self.async_plan = False
+            self._plan_thread = None
+            return
+        self.async_plan = True
+        self._plan_thread = thread
+
+    def close_planning(self) -> None:
+        with self._plan_cond:
+            self._plan_closed = True
+            self._plan_job = None
+            self._plan_cond.notify_all()
+        thread, self._plan_thread = self._plan_thread, None
+        if thread is not None:
+            thread.join(timeout=1.0)
+        self.async_plan = False
+
+    def _plan_loop(self) -> None:
+        while True:
+            with self._plan_cond:
+                while self._plan_job is None and not self._plan_closed:
+                    self._plan_cond.wait(0.1)
+                if self._plan_closed:
+                    return
+                job, self._plan_job = self._plan_job, None
+            try:
+                result = self._run_plan_job(job)
+            except Exception:      # a failed plan must never stop the guidance
+                self.plan_errors += 1
+                result = None
+            if result is not None:
+                with self._plan_cond:
+                    self._plan_done = result
+
+    def _run_plan_job(self, job):
+        ap = job["autopilot"]
+        kind = job.get("kind", "replan")
+        if kind == "ignite":
+            self._run_ignition_search(ap, job)
+        elif kind == "prep":
+            # Before ignition: search the final time and the route for the
+            # *predicted* ignition state, so that at the switch there is no
+            # search left to run (a single solve from that plan's final time
+            # reaches the pad; the plan itself is not flown).
+            ap._plan_deadline = time.monotonic() + ap.plan_budget_search + 0.3
+            ap.plan = ap._search_time(job["vehicle"], job["wind"], job["t_guess"])
+        else:
+            ap._replan(job["vehicle"], job["wind"])
+        return {"gen": job["gen"], "kind": kind,
+                "plan": ap.plan, "touchdown_time": ap.touchdown_time,
+                "burn_fraction": ap.burn_fraction, "route": ap._route,
+                "next_search": ap._next_search, "search_fails": ap._search_fails,
+                "last_status": ap.planner.last_status, "solver_fail": ap.solver_fail}
+
+    @staticmethod
+    def _run_ignition_search(ap, job) -> None:
+        """The ignition search, on the planner thread: the same final-time
+        search and successive-convexification refines the synchronous path
+        runs in ``_ignite``, bounded by ``plan_budget_ignition``."""
+        veh, wind = job["vehicle"], job["wind"]
+        ap._plan_deadline = time.monotonic() + ap.plan_budget_ignition
+        plan = ap._search_time(veh, wind, job["t_est"])
+        if plan is None:
+            return
+        ap._commit(plan)
+        for _ in range(ap.ignition_refine):
+            p = ap._solver(veh, wind, ap.burn_fraction, ap._keep_out(veh))(ap.plan.t_f)
+            if p is None or not p.sane:
+                break
+            ap._commit(p)
+
+    def _frozen_vehicle(self, veh):
+        """Copy of the vehicle for the planning thread (the sim keeps stepping
+        the real one in place)."""
+        fv = copy.copy(veh)
+        fv.pos = np.array(veh.pos, float)
+        fv.vel = np.array(veh.vel, float)
+        fv.q = np.array(veh.q, float)
+        fv.omega = np.array(veh.omega, float)
+        fv.fin_defl = np.array(veh.fin_defl, float)
+        fv.last = dict(veh.last)
+        fv.controls = copy.copy(veh.controls)
+        return fv
+
+    def _plan_busy(self) -> bool:
+        with self._plan_cond:
+            return self._plan_job is not None
+
+    def _ignition_deferred(self) -> bool:
+        """Wait for the ignition preparation before switching to the burn.
+
+        An immediate ignition (low, slow, far off the pad) leaves no time to
+        prepare a plan, and lighting with nothing that reaches the pad drops
+        the guidance into the backup law for as long as the search takes --
+        the vehicle then flies a route the plan never assumed (scenario 10 hit
+        the tower that way).  Coasting a fraction of a second longer costs a
+        couple of metres of height; the deferral is bounded, then the burn
+        lights on the estimator's time regardless."""
+        if not (self.async_plan and self.planner.available):
+            return False
+        prep = self._prep
+        if prep is not None and prep["t_f"] and self.elapsed - prep["t"] <= self.ign_prep_lead:
+            return False
+        if self._ignite_defer_until is None:
+            self._ignite_defer_until = self.elapsed + self.ign_defer_max
+        return self.elapsed < self._ignite_defer_until
+
+    def _submit_prep(self, veh, wind_now) -> None:
+        """Search the ignition plan for the *predicted* ignition state while
+        the booster is still coasting.
+
+        A single solve from the state at ignition does not reach the pad in
+        the catch scenarios (the route over the tower only comes out of the
+        search), so without this the switch fell back to the plain brake law
+        for the second or so the search took.  Only the searched final time,
+        route and thrust ceiling are reused: at ignition the plan is solved
+        again from the state the booster is really in."""
+        ign = self._ign_state
+        if ign is None or self._plan_busy() or self.elapsed < self._next_prep:
+            return
+        t_ign, p_ign, v_ign, t_burn = ign
+        if p_ign is None or not (math.isfinite(t_ign) and t_ign > 0.0):
+            return
+        self._next_prep = self.elapsed + self.prep_period
+        fv = self._frozen_vehicle(veh)
+        fv.pos = np.array([p_ign[0], p_ign[1], p_ign[2] + fv.rest_height + self.h_off])
+        fv.vel = np.array(v_ign, float)
+        ap = copy.copy(self)
+        ap.aero = copy.copy(self.aero) if self.aero is not None else None
+        ap.plan = None
+        ap._route = None
+        ap._trim_xy = np.array(self._trim_xy, float)
+        ap._wind_ref = (np.array(self._wind_ref[0], float), float(self._wind_ref[1]))
+        job = {"gen": self._plan_gen, "kind": "prep",
+               "t_guess": max(1.5, 1.05 * t_burn) + 2.0,
+               "autopilot": ap, "vehicle": fv, "wind": np.array(wind_now, float)}
+        with self._plan_cond:
+            self._plan_job = job
+            self._plan_cond.notify()
+
+    def _out_of_time(self) -> bool:
+        """Whether the re-plan in progress has spent its wall-clock budget."""
+        return time.monotonic() > self._plan_deadline
+
+    def _submit_plan(self, veh, wind_now) -> None:
+        ap = copy.copy(self)          # shallow: _replan only assigns these attributes
+        ap.aero = copy.copy(self.aero) if self.aero is not None else None
+        ap.plan = self.plan
+        ap._route = self._route
+        ap._trim_xy = np.array(self._trim_xy, float)
+        ap._wind_ref = (np.array(self._wind_ref[0], float), float(self._wind_ref[1]))
+        job = {"gen": self._plan_gen, "autopilot": ap, "vehicle": self._frozen_vehicle(veh),
+               "wind": np.array(wind_now, float)}
+        with self._plan_cond:
+            self._plan_job = job
+            self._plan_cond.notify()
+
+    def _apply_plan_result(self) -> bool:
+        """Commit a finished background plan; ``False`` when there is none."""
+        with self._plan_cond:
+            result, self._plan_done = self._plan_done, None
+        if result is None or result["gen"] != self._plan_gen:
+            return False
+        if result.get("kind") == "prep":
+            # an ignition preparation: keep the searched final time and route
+            # (the plan itself was solved for a predicted state -- the switch
+            # re-solves it from the state the booster is really in)
+            self._prep = {"t": self.elapsed,
+                          "t_f": None if result["plan"] is None else float(result["plan"].t_f),
+                          "route": result["route"], "burn_fraction": result["burn_fraction"]}
+            return False
+        if not self.burn_locked:
+            return False
+        if result.get("kind") == "ignite":
+            # The ignition search ran while the booster flew the interim plan,
+            # so its own trajectory started a few tenths of a second ago and
+            # committing it would jump the reference forward by that much.
+            # Only its final time, route and thrust ceiling are adopted: the
+            # next re-plan (right now) rebuilds the plan from the live state
+            # at that final time.
+            self._ignition_searching = False
+            if result["plan"] is None:
+                return False
+            self.touchdown_time = self.elapsed + result["plan"].t_f
+            self.burn_fraction = result["burn_fraction"]
+            self._route = result["route"]
+            self.next_replan = self.elapsed
+            self.last_status = result["last_status"]
+            return True
+        if result["plan"] is not None and result["plan"].created_at < self.elapsed - 2.0:
+            return False                       # far too old to be worth flying
+        self.plan = result["plan"]
+        self.touchdown_time = result["touchdown_time"]
+        self.burn_fraction = result["burn_fraction"]
+        self._route = result["route"]
+        self._next_search = result["next_search"]
+        self._search_fails = result["search_fails"]
+        self.last_status = result["last_status"]
+        self.solver_fail = result["solver_fail"]
+        return True
+
     def reset(self) -> None:
+        self._plan_gen += 1
+        self.plan_errors = 0
+        self._ignition_searching = False
+        self._prep = None
+        self._next_prep = 0.0
+        self._ignite_defer_until = None
+        self._plan_deadline = math.inf
+        with self._plan_cond:
+            self._plan_job = None
+            self._plan_done = None
         self.elapsed = 0.0
         self.plan: Plan3D | None = None
         self.next_replan = 0.0
@@ -246,6 +499,7 @@ class Autopilot3D:
         self._trim_xy = np.zeros(2)
         self._aoa_cache = (-1e9, Q_AOA_BUDGET)
         self._trim_cache = (-1e9, None)
+        self._trim_table = None
         self._trim_fn = None
         self._lift_gain = 1.0         # measured / modelled lift of the booster (_update_lift_gain)
         self._lift_num = 0.0
@@ -307,6 +561,147 @@ class Autopilot3D:
         return float(veh.altitude) - self.h_off
 
     def _drag_model(self, veh, wind_now, t_guess):
+        """Aerodynamics along the previous plan (or a decelerating guess).
+
+        Returns ``(d0, G)``: d0 is the drag acceleration with the booster
+        aligned with the flow; ``G @ u`` adds the body/grid-fin normal force
+        produced by tilting the thrust vector (and the vehicle) by
+        ``u_perp / sigma_ref`` against the flow.  For an engines-first
+        booster this force points opposite to the tilt, which is why a plan
+        that ignored it would overshoot laterally at high dynamic pressure.
+
+        All knots are evaluated in one batch (atmosphere, wind profile and
+        aerodynamic model are vectorised): the per-node Python loop used to
+        be most of the matrix-assembly time.  ``_drag_model_scalar`` is the
+        reference implementation it must agree with.
+        """
+        prev = self._ref_plan()
+        now = self.elapsed
+        r0, v0, m0 = self._state(veh)
+        legs = max(veh.legs, 1.0 if veh.controls.legs_down else 0.0)
+        s = veh.spec
+        sig_now = max(3.0, veh.throttle * s.thrust_sl / m0)
+        trim = self._lift_trim_many(veh)
+
+        def model(times):
+            times = np.atleast_1d(np.asarray(times, float))
+            n = times.size
+            t_end = float(times[-1]) + (0.5 * float(times[1] - times[0]) if n > 1 else 0.0)
+            t0 = now - prev.created_at if prev is not None else 0.0
+            span = max(0.0, prev.t_f - t0) if prev is not None else 0.0
+            out = np.zeros((n, 3))
+            G = np.zeros((n, 3, 3))
+            qd = np.zeros(n)
+            wd = np.zeros((n, 3))
+            dq = np.zeros(n)
+            if self.aero is None:
+                return out, G, qd, wd, dq
+            # ---- state along the reference
+            h = np.empty(n)
+            v = np.empty((n, 3))
+            m = np.empty(n)
+            sig = np.empty(n)
+            u_ref = np.zeros((n, 3))
+            has_ref = np.zeros(n, bool)
+            guess = (times < 0.3) if prev is not None else np.ones(n, bool)
+            if np.any(guess):
+                tg = times[guess]
+                T = max(t_guess, 0.5)
+                f = np.maximum(0.0, 1.0 - tg / T)
+                tt = np.minimum(tg, T)
+                h[guess] = np.maximum(self.gate_height, r0[2] + v0[2] * (tt - 0.5 * tt * tt / T))
+                v[guess] = v0 * f[:, None]
+                m[guess] = m0
+                sig[guess] = max(sig_now, 0.6 * s.thrust_sl / m0)
+                if veh.throttle > 0.05:
+                    u_ref[guess] = veh.last["thrust"] / m0
+                    has_ref[guess] = True
+            rest = ~guess
+            if np.any(rest):
+                tau = t0 + span * times[rest] / max(t_end, 1e-9)
+                pos, vel, acc = prev.sample_many(tau)
+                h[rest] = pos[:, 2]
+                v[rest] = vel
+                k = np.minimum((np.maximum(tau, 0.0) / prev.dt).astype(np.int64), prev.knots)
+                m[rest] = np.exp(prev.z[k])
+                kk = np.minimum((np.maximum(tau, 0.0) / prev.dt).astype(np.int64), prev.knots - 1)
+                fr = (np.maximum(tau, 0.0) - kk * prev.dt) / prev.dt
+                sig_lin = (1.0 - fr) * prev.sigma[kk] + fr * prev.sigma[kk + 1]
+                sig[rest] = np.maximum(3.0, np.where(tau >= prev.t_f, prev.sigma[-1], sig_lin))
+                u_ref[rest] = acc
+                has_ref[rest] = True
+            # ---- atmosphere, wind and the dynamic pressure at each knot
+            rho, _, _, a_s = atmosphere_many(np.maximum(0.0, h + self.h_off))
+            vr = v - self._wind_plan_many(h)
+            sp = np.sqrt(np.sum(vr * vr, axis=1))
+            qd = 0.5 * rho * sp * sp
+            rho_p, _, _, _ = atmosphere_many(np.maximum(0.0, h + 5.0 + self.h_off))
+            rho_m, _, _, _ = atmosphere_many(np.maximum(0.0, h - 5.0 + self.h_off))
+            vp = v - self._wind_plan_many(h + 5.0)
+            vm = v - self._wind_plan_many(h - 5.0)
+            dq = (0.5 * rho_p * np.sum(vp * vp, axis=1) - 0.5 * rho_m * np.sum(vm * vm, axis=1)) / 10.0
+            live = sp >= 3.0
+            u = vr / np.maximum(sp, 1e-9)[:, None]
+            wd[live] = -u[live]
+            if self.aero_pred <= 0 or not np.any(live):
+                return out, G, qd, wd, dq
+            base = -u
+            # Linearise around the reference attitude (successive
+            # linearisation: each replan uses the previous plan's tilt).
+            d_ref = u_ref / np.maximum(np.sqrt(np.sum(u_ref * u_ref, axis=1)), 1e-9)[:, None]
+            tilt = d_ref - base * np.sum(d_ref * base, axis=1)[:, None]
+            broadside = has_ref & (np.sqrt(np.sum(u_ref * u_ref, axis=1)) > 2.0) & (np.sum(d_ref * base, axis=1) < 0.2)
+            # Flying (nearly) across the flow (a low divert): the body is
+            # broadside and its drag is large -- take the force at that
+            # attitude, without a lift gradient.
+            tilt[broadside] = 0.0
+            axis0 = base + tilt
+            axis0 /= np.maximum(np.sqrt(np.sum(axis0 * axis0, axis=1)), 1e-9)[:, None]
+            f0 = self.aero.quick_force_many(vr, axis0, rho, a_s, legs, trim=trim)
+            out = f0 / m[:, None]
+            if self.aero_pred == 1:
+                out[~live] = 0.0
+                return out, G, qd, wd, dq
+            if np.any(broadside):
+                fb = self.aero.quick_force_many(vr, d_ref, rho, a_s, legs, trim=trim)
+                out[broadside] = fb[broadside] / m[broadside, None]
+            grad = ~broadside & live
+            if np.any(grad):
+                e1 = np.cross(u, np.where((np.abs(u[:, 2]) < 0.9)[:, None],
+                                          np.array([0.0, 0.0, 1.0]), np.array([1.0, 0.0, 0.0])))
+                e1 /= np.maximum(np.sqrt(np.sum(e1 * e1, axis=1)), 1e-9)[:, None]
+                e2 = np.cross(u, e1)
+                d = math.radians(2.0)
+                ax1 = axis0 + d * e1
+                ax1 /= np.maximum(np.sqrt(np.sum(ax1 * ax1, axis=1)), 1e-9)[:, None]
+                ax2 = axis0 + d * e2
+                ax2 /= np.maximum(np.sqrt(np.sum(ax2 * ax2, axis=1)), 1e-9)[:, None]
+                f1 = self.aero.quick_force_many(vr[grad], ax1[grad], rho[grad], a_s[grad], legs, trim=trim)
+                f2 = self.aero.quick_force_many(vr[grad], ax2[grad], rho[grad], a_s[grad], legs, trim=trim)
+                mg = m[grad, None]
+                g1 = (f1 - f0[grad]) / d / mg
+                g2 = (f2 - f0[grad]) / d / mg
+                # Keep the net effect of a tilt in the thrust direction
+                # (limits over-reliance on a local linearisation).
+                cap = self.lift_gradient_cap * sig[grad]
+                n1 = np.sqrt(np.sum(g1 * g1, axis=1))
+                n2 = np.sqrt(np.sum(g2 * g2, axis=1))
+                g1 *= np.minimum(1.0, cap / np.maximum(n1, 1e-12))[:, None]
+                g2 *= np.minimum(1.0, cap / np.maximum(n2, 1e-12))[:, None]
+                s_g = sig[grad, None]
+                Gi = (np.einsum("ni,nj->nij", g1, e1[grad]) + np.einsum("ni,nj->nij", g2, e2[grad])) / s_g[:, :, None]
+                out_g = f0[grad] / mg
+                tilted = np.any(tilt[grad] != 0.0, axis=1)
+                if np.any(tilted):
+                    out_g[tilted] -= np.einsum("nij,nj->ni", Gi[tilted], u_ref[grad][tilted])
+                out[grad] = out_g
+                G[grad] = Gi
+            out[~live] = 0.0
+            return out, G, qd, wd, dq
+
+        return model
+
+    def _drag_model_scalar(self, veh, wind_now, t_guess):
         """Aerodynamics along the previous plan (or a decelerating guess).
 
         Returns ``(d0, G)``: d0 is the drag acceleration with the booster
@@ -440,12 +835,13 @@ class Autopilot3D:
                 boxes, self._state(veh)[0], np.zeros(3), z_min=self._z_ground + 1.0)
 
         def planes(t_knots):
+            t_knots = np.asarray(t_knots, float)
             t_end = max(float(t_knots[-1]), 1e-6)
             if prev is not None:
                 # the previous path stretched over this horizon (see _drag_model)
                 t0 = now - prev.created_at
                 span = max(0.0, prev.t_f - t0)
-                pts = [prev.sample(t0 + span * float(t) / t_end)[0] for t in t_knots]
+                pts = list(prev.sample_many(t0 + span * t_knots / t_end)[0])
             else:
                 pts = along_path(path, [float(t) / t_end for t in t_knots])
             return separating_planes(boxes, pts, target=np.zeros(3))
@@ -460,12 +856,13 @@ class Autopilot3D:
         h0 = float(self._state(veh)[0][2])
 
         def heights(t_knots):
+            t_knots = np.asarray(t_knots, float)
             t_end = max(float(t_knots[-1]), 1e-6)
             if prev is None:
-                return [h0 + (self.gate_height - h0) * float(t) / t_end for t in t_knots]
+                return list(h0 + (self.gate_height - h0) * t_knots / t_end)
             t0 = now - prev.created_at
             span = max(0.0, prev.t_f - t0)
-            return [float(prev.sample(t0 + span * float(t) / t_end)[0][2]) for t in t_knots]
+            return list(prev.sample_many(t0 + span * t_knots / t_end)[0][:, 2])
 
         return heights
 
@@ -478,17 +875,15 @@ class Autopilot3D:
         axis = np.asarray(veh.axis, float)
 
         def dirs(t_knots):
+            tk = np.asarray(t_knots, float)
             if prev is None:
-                return np.tile(axis, (len(t_knots), 1))
-            t_end = max(float(t_knots[-1]), 1e-6)
+                return np.tile(axis, (tk.size, 1))
+            t_end = max(float(tk[-1]), 1e-6)
             t0 = now - prev.created_at
             span = max(0.0, prev.t_f - t0)
-            out = []
-            for t in t_knots:
-                u = np.asarray(prev.sample(t0 + span * float(t) / t_end)[2], float)
-                n = float(np.linalg.norm(u))
-                out.append(u / n if n > 1e-6 else axis)
-            return np.asarray(out)
+            acc = prev.sample_many(t0 + span * tk / t_end)[2]
+            n = np.sqrt(np.sum(acc * acc, axis=1))
+            return np.where((n > 1e-6)[:, None], acc / np.maximum(n, 1e-9)[:, None], axis)
 
         return dirs
 
@@ -515,9 +910,10 @@ class Autopilot3D:
         base = self._config(veh, frac, keep_out)
 
         def solve(t_f):
-            if not t_f > 0.6:
+            if not t_f > 0.6 or self._out_of_time():
                 return None
-            return self.planner.solve(r, v, m, t_f, dataclasses.replace(base, drag_model=self._drag_model(veh, wind_now, t_f)))
+            return self.planner.solve(r, v, m, t_f, dataclasses.replace(base, drag_model=self._drag_model(veh, wind_now, t_f)),
+                                      retry=not self._out_of_time())
 
         return solve
 
@@ -542,10 +938,21 @@ class Autopilot3D:
         shape = float(self._profile(z + self.h_off, k) / self._profile(z_now, k))
         return w * min(6.0, shape)
 
+    def _wind_many(self, z):
+        """Vectorised :meth:`_wind` over an array of heights."""
+        w, z_now = self._wind_ref
+        k = self.wind_shear_est
+        shape = self._profile(np.asarray(z, float) + self.h_off, k) / self._profile(z_now, k)
+        return w * np.minimum(6.0, shape)[:, None]
+
     def _wind_plan(self, z):
         """The wind the planner's predictions assume at height ``z``: the
         extrapolated measured wind times ``wind_plan_gain`` (a setting)."""
         return self._wind(z) * self.wind_plan_gain
+
+    def _wind_plan_many(self, z):
+        """Vectorised :meth:`_wind_plan` over an array of heights."""
+        return self._wind_many(z) * self.wind_plan_gain
 
     def _update_trim(self, veh, wind_now, dt):
         """Filtered wind trim (sideways thrust acceleration that holds the
@@ -704,8 +1111,15 @@ class Autopilot3D:
         is (smooth tracking) unless the cost J = propellant + time_weight t_f
         is lower a step earlier or later; a plan that misses the gate gets a
         full search of the final time (and the route).  The optimiser alone
-        decides how the booster gets there."""
+        decides how the booster gets there.
+
+        A re-plan is bounded by ``plan_budget``: a search over the final time
+        is a dozen solves, and when the pad is out of reach every replan would
+        spend them, so the planner fell seconds behind the vehicle and the
+        booster flew a stale plan into the ground.  Over budget the search
+        stops and keeps the best plan it has (the caller still commits it)."""
         t_go = self.touchdown_time - self.elapsed
+        self._plan_deadline = time.monotonic() + (self.plan_budget_short if t_go < 8.0 else self.plan_budget)
         solve = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))
         if self.plan is not None and not self.plan.sane:
             self.plan = None            # a runaway plan is no plan: fly the fallback law until a real one is found
@@ -715,6 +1129,12 @@ class Autopilot3D:
         lost = plan is None or plan.terminal_position_error > 10.0
         if self.elapsed >= self._next_search and (t_go > self.retime_freeze or lost):
             if plan is None or not plan.reaches_pad:
+                # A search is a dozen solves (route candidates + golden
+                # section): give it its own budget -- cut in the middle it
+                # returns a plan that still misses the pad, and the guidance
+                # then keeps missing it (the catch scenarios must go over the
+                # tower, which the search is what discovers).
+                self._plan_deadline = max(self._plan_deadline, time.monotonic() + self.plan_budget_search)
                 best = self._search_time(veh, wind_now, t_go)
                 self._search_fails = 0 if best is not None and best.reaches_pad else min(self._search_fails + 1, 2)
                 if best is not None and (plan is None or best.objective < plan.objective):
@@ -722,6 +1142,8 @@ class Autopilot3D:
             else:
                 d = max(0.4, self.retime_step * t_go)
                 for t in (t_go - d, t_go + d):
+                    if self._out_of_time():
+                        break
                     p = solve(t)
                     if p is not None and p.reaches_pad and p.objective < plan.objective:
                         plan = p
@@ -738,7 +1160,11 @@ class Autopilot3D:
             # air: the endless hover) or has gone stale (a plan the vehicle
             # cannot follow, and nothing else solves): then the fallback law
             # brings it down
-            self.solver_fail = (self.elapsed, self.planner.last_status)
+            if self.touchdown_time - self.elapsed > 1.0:
+                # (in the last second there is nothing left to plan: the plan
+                # has ended as far as the solver is concerned, that is not a
+                # solver failure to show)
+                self.solver_fail = (self.elapsed, self.planner.last_status)
             if self.plan is not None and (self.touchdown_time - self.elapsed <= 0.6
                                           or self.elapsed - self.plan.created_at > self.plan_stale_after):
                 self.plan = None
@@ -750,6 +1176,10 @@ class Autopilot3D:
         if not self.burn_locked or self._holding:
             # holding at the gate (or after the burn) nothing is planned:
             # the plan in hand is stale and says nothing
+            return None
+        if self._ignition_searching:
+            # the ignition search is still running: there is no plan yet by
+            # design, that is not a solver failure
             return None
         if self.solver_fail is not None and self.elapsed - self.solver_fail[0] < 2.0:
             return ("fail", self.solver_fail[1])
@@ -789,6 +1219,8 @@ class Autopilot3D:
             lo = min(lo, 0.6 * hi)
         best = None
         for frac in dict.fromkeys((self.burn_fraction, 0.97)):
+            if self._out_of_time() and best is not None:
+                break                   # the budget: keep what the search has
             keep_out = self._keep_out(veh, self._routes(veh, wind_now, frac, 0.5 * (lo + hi)))
             p = golden_section_search(self._solver(veh, wind_now, frac, keep_out), lo, hi, self.time_search_evals)
             if p is not None and (best is None or p.objective < best.objective):
@@ -797,7 +1229,7 @@ class Autopilot3D:
                     self.burn_fraction = max(self.burn_fraction, frac)
             if best is not None and best.reaches_pad:
                 break
-        if best is not None and self._ref_plan() is None:
+        if best is not None and self._ref_plan() is None and not self._out_of_time():
             # Found about a straight descent, not about a plan: in a strong
             # wind that reference hovers in the flow and flatters the plan
             # (it "reaches" the pad where the plan itself would not).  Check
@@ -819,6 +1251,8 @@ class Autopilot3D:
         p = plan
         try:
             for _ in range(self.ignition_refine):
+                if self._out_of_time():
+                    return plan
                 p.created_at = self.elapsed             # (it is the reference: samples run from now)
                 self.plan = p
                 q = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))(p.t_f)
@@ -846,6 +1280,8 @@ class Autopilot3D:
         paths = detour_paths(self.obstacles, self._state(veh)[0], np.zeros(3), z_min=self._z_ground + 1.0)
         best = None
         for path in paths:
+            if self._out_of_time() and best is not None:
+                break
             p = self._solver(veh, wind_now, frac, self._keep_out(veh, path))(t_f)
             if p is not None and (best is None or p.objective < best[0]):
                 best = (p.objective, path)
@@ -866,11 +1302,8 @@ class Autopilot3D:
             return
         start = max(0.0, self.elapsed - p.created_at)
         n = max(2, min(200, int(max(0.0, p.t_f - start) / 0.1) + 2))
-        pts = []
-        for t in np.linspace(start, p.t_f, n):
-            pos, _, _ = p.sample(float(t))
-            pts.append((float(pos[0]), float(pos[1]), float(max(0.0, pos[2])) + self.h_off))
-        self.predicted_points = pts
+        pos, _, _ = p.sample_many(np.linspace(start, p.t_f, n))
+        self.predicted_points = [(float(x), float(y), float(max(0.0, z)) + self.h_off) for x, y, z in pos]
 
     # ------------------------------------------------------------ command
     def command(self, veh, wind_now, dt):
@@ -919,6 +1352,13 @@ class Autopilot3D:
             self._q_filt += (float(veh.last.get("q", 0.0)) - self._q_filt) * min(1.0, dt / self.q_filter)
 
         if not self.burn_locked:
+            if self.async_plan:
+                # pick up a finished ignition preparation, and start one when
+                # the ignition is coming up (the search then costs the switch
+                # nothing)
+                self._apply_plan_result()
+                if self.ignition_in <= self.ign_prep_lead:
+                    self._submit_prep(veh, wind_now)
             self._pre_ignition(veh, r, v, m, wind_now)
             return
 
@@ -943,7 +1383,18 @@ class Autopilot3D:
             self._catch_hold(veh, r, v, dt)
             return
         stranded = t_go <= 0.6 and (h > 20.0 or float(np.linalg.norm(r[:2])) > 15.0)
-        if self.replan_enabled and self.planner.available and self.elapsed >= self.next_replan and (t_go > 0.6 or stranded):
+        if self.async_plan:
+            # The solve runs on the planner thread: this step only commits a
+            # finished plan (and hands over a new one), it never waits for one.
+            if self._apply_plan_result():
+                self._publish()
+                t_go = self.touchdown_time - self.elapsed
+            if (not self._plan_busy() and self.replan_enabled and self.planner.available
+                    and self.elapsed >= self.next_replan and (t_go > 0.6 or stranded)):
+                self._submit_plan(veh, wind_now)
+                self.next_replan = self.elapsed + float(np.interp(max(t_go, 0.0), [8.0, 30.0],
+                                                                  [self.burn_replan_period, 0.6]))
+        elif self.replan_enabled and self.planner.available and self.elapsed >= self.next_replan and (t_go > 0.6 or stranded):
             self._replan(veh, wind_now)
             self._publish()
             t_go = self.touchdown_time - self.elapsed
@@ -1192,6 +1643,7 @@ class Autopilot3D:
         if last is not None:
             self.aero.last = last
         kappas, b_refs = np.asarray(kappas), np.asarray(b_refs)
+        self._trim_table = (angles, kappas, b_refs, q_ref)
 
         def kappa(theta, q):
             th = math.degrees(theta)
@@ -1200,6 +1652,21 @@ class Autopilot3D:
             return (1.0 + fade * (float(np.interp(th, angles, kappas)) - 1.0)) * self._lift_gain
 
         self._trim_cache = (self.elapsed, kappa)
+        return kappa
+
+    def _lift_trim_many(self, veh):
+        """Vectorised :meth:`_lift_trim` (``theta`` and ``q`` arrays)."""
+        trim = self._lift_trim(veh)
+        if trim is None:
+            return None
+        angles, kappas, b_refs, q_ref = self._trim_table
+
+        def kappa(theta, q):
+            th = np.degrees(np.asarray(theta, float))
+            b = np.interp(th, angles, b_refs) * np.asarray(q, float) / q_ref
+            fade = np.clip((b - FIN_MIN_EFF) / FIN_MIN_EFF, 0.0, 1.0)
+            return (1.0 + fade * (np.interp(th, angles, kappas) - 1.0)) * self._lift_gain
+
         return kappa
 
     def _update_lift_gain(self, veh, wind_now):
@@ -1496,7 +1963,7 @@ class Autopilot3D:
         # and let the landing burn fly it.
         divert_now = (not self._boostback_done and r[2] < self.boostback_min_alt and airspeed < 100.0
                       and miss > max(150.0, 0.5 * r[2]))
-        if ignite_now or divert_now:
+        if (ignite_now or divert_now) and not self._ignition_deferred():
             if not math.isfinite(t_burn):
                 # not falling yet: fall time plus the sideways transfer
                 h, vz = max(0.0, float(r[2])), float(v[2])
@@ -1731,26 +2198,71 @@ class Autopilot3D:
         # the predictor's burn time only seeds the search of the final time
         t_est = max(1.5, 1.05 * t_burn) + 2.0
         self.touchdown_time = self.elapsed + t_est
-        plan = self._search_time(veh, wind_now, t_est) if self.planner.available else None
-        if plan is not None:
-            self._commit(plan)
-            # The search linearised drag and angle of attack about a straight
-            # descent (there was no plan yet) -- in a strong wind aloft that
-            # reference hovers in a 30-40 m/s flow, and the plan breaks the
-            # angle-of-attack cone along a path it will not fly.  Two passes
-            # about the plan itself (successive convexification) before it is
-            # flown.
-            for _ in range(self.ignition_refine):
-                p = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))(self.plan.t_f)
-                if p is None or not p.sane:
-                    break
-                self._commit(p)
+        if self.async_plan and self.planner.available:
+            # Coast -> burn used to freeze the whole state stream for 0.3-0.6 s
+            # while the final-time search ran.  Now the search is done during
+            # the coast for the predicted ignition state (``_submit_prep``) and
+            # only its final time and route are reused: one solve from the
+            # state the booster is really in puts a plan in hand before the
+            # engine lights, so the burn starts planned instead of dropping
+            # into the plain brake law for a second.
+            plan = None
+            prep = self._prep
+            if prep is not None and prep["t_f"] and self.elapsed - prep["t"] <= self.ign_prep_lead + 1.0:
+                self._route = prep["route"]
+                self.burn_fraction = prep["burn_fraction"]
+                plan = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))(prep["t_f"])
+                if plan is not None and not plan.sane:
+                    plan = None             # a runaway plan is no plan (see the project rules)
+            if plan is None:
+                plan = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))(t_est)
+                if plan is not None and not plan.sane:
+                    plan = None
+            if plan is not None:
+                self._commit(plan)
+            else:
+                # no usable preparation: light on the estimator's time and let
+                # the search fill in the plan, refines included, off-thread
+                self._ignition_searching = True
+                self._submit_search(veh, wind_now, t_est)
+        else:
+            plan = self._search_time(veh, wind_now, t_est) if self.planner.available else None
+            if plan is not None:
+                self._commit(plan)
+                # The search linearised drag and angle of attack about a straight
+                # descent (there was no plan yet) -- in a strong wind aloft that
+                # reference hovers in a 30-40 m/s flow, and the plan breaks the
+                # angle-of-attack cone along a path it will not fly.  Two passes
+                # about the plan itself (successive convexification) before it is
+                # flown.
+                for _ in range(self.ignition_refine):
+                    p = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))(self.plan.t_f)
+                    if p is None or not p.sane:
+                        break
+                    self._commit(p)
         self._next_search = self.elapsed + self.search_backoff
         self._publish()
         self.next_replan = self.elapsed + self.burn_replan_period
+        self._prep = None
+        self._ignite_defer_until = None
         self.phase = "LANDING BURN"
         self._mark()
         veh.controls.throttle = self.minimum_throttle
+
+    def _submit_search(self, veh, wind_now, t_est) -> None:
+        """Hand the ignition search (final time + refinements) to the planner
+        thread; ``_run_plan_job`` commits the result when it is done."""
+        ap = copy.copy(self)
+        ap.aero = copy.copy(self.aero) if self.aero is not None else None
+        ap.plan = None                  # the search is linearised about a straight descent, as at ignition
+        ap._route = None
+        ap._trim_xy = np.array(self._trim_xy, float)
+        ap._wind_ref = (np.array(self._wind_ref[0], float), float(self._wind_ref[1]))
+        job = {"gen": self._plan_gen, "kind": "ignite", "t_est": float(t_est),
+               "autopilot": ap, "vehicle": self._frozen_vehicle(veh), "wind": np.array(wind_now, float)}
+        with self._plan_cond:
+            self._plan_job = job
+            self._plan_cond.notify()
 
     def _mark(self):
         if self.phase in ("COAST", "BOOSTBACK", "LANDING BURN", "LANDED") and self.phase not in self.visited:

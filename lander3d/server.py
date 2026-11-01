@@ -66,6 +66,7 @@ def snapshot(sim: Sim3D) -> dict:
             "autopilot": sim.autopilot_on, "sas": sim.sas, "paused": sim.paused, "warp": sim.time_warp,
             "phase": ap.phase if sim.autopilot_on else "MANUAL", "visited": ap.visited, "tgo": None if not math.isfinite(ap.time_to_go) else round(ap.time_to_go, 2),
             "solver": {"status": ap.last_status, "backend": ap.planner.backend, "solves": ap.planner.solve_count,
+                       "async": ap.async_plan, "plan_errors": ap.plan_errors,
                        "margin": round(1.0 - ap.burn_fraction, 3), "locked": ap.burn_locked,
                        "relax": ap.relax if ap.burn_locked else 0,
                        "alert": list(ap.solver_alert()) if sim.autopilot_on and ap.solver_alert() else None},
@@ -163,7 +164,7 @@ def make_handler(sim: Sim3D):
 
 
 def serve(port: int, open_browser: bool) -> None:
-    sim = Sim3D(cfd=True, scenario=8, wind_on=False)      # scenario 9, no wind
+    sim = Sim3D(cfd=True, scenario=8, wind_on=False, async_plan=True)      # scenario 9, no wind
     Runner(sim).thread.start()
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(sim))
     url = f"http://127.0.0.1:{port}/"

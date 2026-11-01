@@ -307,6 +307,10 @@ class Plan3D:
     ground_violation: float = 0.0     # m below the ground
     limit_violation: float = 0.0      # m/s^2 outside the tilt cone / slew rate / first-knot thrust (now)
     created_at: float = 0.0
+    # A plan lit from the state at ignition before the final-time search has
+    # finished: it is flown for a moment rather than falling back to the plain
+    # brake law, but it is never the reference the next plan is built about.
+    provisional: bool = False
 
     @property
     def knots(self) -> int:
@@ -353,6 +357,29 @@ class Plan3D:
         pos = self.r[k] + self.v[k] * t + 0.5 * u0 * t * t + du * t ** 3 / 6.0 + 0.5 * (d + g) * t * t
         vel = self.v[k] + u0 * t + 0.5 * du * t * t + (d + g) * t
         return pos, vel, u0 + du * t
+
+    def sample_many(self, taus):
+        """Batch version of :meth:`sample`: returns ``(pos, vel, acc)`` arrays
+        ``(n, 3)`` for an array of times (same piecewise segments)."""
+        taus = np.atleast_1d(np.asarray(taus, float))
+        g = np.array([0.0, 0.0, -G0])
+        k = np.minimum((np.maximum(taus, 0.0) / self.dt).astype(np.int64), self.knots - 1)
+        t = np.maximum(taus, 0.0) - k * self.dt
+        u0, u1 = self.u[k], self.u[k + 1]
+        du = (u1 - u0) / self.dt
+        d = self.drag[k]
+        t2 = t * t
+        pos = (self.r[k] + self.v[k] * t[:, None] + 0.5 * u0 * t2[:, None] + du * t2[:, None] * t[:, None] / 6.0
+               + 0.5 * (d + g) * t2[:, None])
+        vel = self.v[k] + u0 * t[:, None] + 0.5 * du * t2[:, None] + (d + g) * t[:, None]
+        acc = u0 + du * t[:, None]
+        past = taus >= self.t_f
+        if np.any(past):
+            tp = (taus - self.t_f)[:, None]
+            pos = np.where(past[:, None], self.r[-1] + self.v[-1] * tp, pos)
+            vel = np.where(past[:, None], self.v[-1], vel)
+            acc = np.where(past[:, None], -(g + self.drag[-1]), acc)
+        return pos, vel, acc
 
     def sigma_at(self, tau: float) -> float:
         if tau >= self.t_f:
@@ -747,15 +774,17 @@ class Planner3D:
                       NX=NX, G=Gm)
         return P, q, A, b_vec, n_zero, n_nonneg, soc_dims, layout, drag, const
 
-    def solve(self, r0, v0, m0, t_f, cfg: PlanConfig3D) -> Plan3D | None:
+    def solve(self, r0, v0, m0, t_f, cfg: PlanConfig3D, retry: bool = True) -> Plan3D | None:
         if not self.available or not (t_f > 0.3):
             return None
         P, q, A, b, nz, nn, socs, L, drag, const = self.build(r0, v0, m0, t_f, cfg)
         x, status = self.solver.solve(P, q, A, b, nz, nn, socs, max_iter=self.max_iter)
-        if x is None and status not in ("no-solver",):
+        if x is None and status not in ("no-solver",) and retry:
             # The problem is always feasible (every state-tied limit is
             # elastic), so a failure is numerical -- the iteration cap or no
             # progress on a badly scaled step: once more with more room.
+            # ``retry=False`` when the re-plan is out of its time budget (see
+            # Autopilot3D.plan_budget): a second attempt costs as much again.
             x, status = self.solver.solve(P, q, A, b, nz, nn, socs, max_iter=max(400, self.max_iter))
         self.last_status = status
         if x is None:

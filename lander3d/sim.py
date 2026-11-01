@@ -46,14 +46,19 @@ SCENARIOS = [
 
 
 class Sim3D:
-    def __init__(self, cfd: bool = True, scenario: int = 3, wind_on: bool = True) -> None:
+    def __init__(self, cfd: bool = True, scenario: int = 3, wind_on: bool = True,
+                 async_plan: bool = False) -> None:
         """``scenario`` is the one loaded at start, ``wind_on`` whether the wind
         blows at start (the headless regressions keep the defaults; the server
-        and the browser simulator start in scenario 9 without wind)."""
+        and the browser simulator start in scenario 9 without wind).
+        ``async_plan`` re-plans on a background thread (server / browser); the
+        headless regression keeps the synchronous path, which is repeatable."""
         self.vehicle = Vehicle()
         self.aero = AeroModel(self.vehicle.spec)
         self.wind = Wind(enabled=wind_on)
         self.autopilot = Autopilot3D(self.aero)
+        if async_plan:
+            self.autopilot.enable_async_planning()
         self.solver_cfg = settings.defaults()      # guidance settings (the front end's solver panel)
         settings.apply(self.autopilot, self.solver_cfg)
         self.cfd = ExternalCFD() if cfd else None

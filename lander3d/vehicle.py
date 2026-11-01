@@ -129,6 +129,19 @@ def atmosphere(h: float):
     return rho, p, T, math.sqrt(1.4 * 287.05 * T)
 
 
+def atmosphere_many(h):
+    """Vectorised :func:`atmosphere`: the same ISA layers for an array of heights."""
+    h = np.maximum(np.asarray(h, float), 0.0)
+    T = np.where(h < 11_000.0, 288.15 - 0.0065 * h,
+                 np.where(h < 25_000.0, 216.65, 216.65 + 0.003 * (h - 25_000.0)))
+    p = np.where(h < 11_000.0, 101_325.0 * (T / 288.15) ** 5.25588,
+                 np.where(h < 25_000.0, 22_632.1 * np.exp(-0.000157688 * (h - 11_000.0)),
+                          np.where(h < 47_000.0, 2_488.6 * (T / 216.65) ** -11.388,
+                                   2_488.6 * np.exp(-(h - 25_000.0) / 7_000.0))))
+    rho = p / (287.05 * T)
+    return rho, p, T, np.sqrt(1.4 * 287.05 * T)
+
+
 class Wind:
     """Wind with a log-law shear profile, gusts, and a direction and speed that
     wander slowly inside set ranges.

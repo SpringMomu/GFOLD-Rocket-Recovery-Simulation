@@ -55,6 +55,26 @@ def fin_mach_factor(mach: float) -> float:
     return 1.0 - 0.35 * math.exp(-((mach - 1.05) / 0.22) ** 2)
 
 
+def _transonic_many(mach, low: float, peak: float, high: float):
+    """Vectorised :func:`_transonic` (same piecewise curve)."""
+    m = np.asarray(mach, float)
+    mid = np.clip((m - 0.8) / 0.3, 0.0, 1.0)
+    rise = low + (peak - low) * mid * mid * (3.0 - 2.0 * mid)
+    fall = high + (peak - high) * np.exp(-(np.maximum(m, 1.1) - 1.1) / 0.6)
+    return np.where(m < 0.8, low, np.where(m < 1.1, rise, fall))
+
+
+def fin_normal_coeff_many(alpha, cn_alpha: float):
+    """Vectorised :func:`fin_normal_coeff`."""
+    a = np.asarray(alpha, float)
+    return cn_alpha * np.sin(a) * np.cos(a)
+
+
+def fin_mach_factor_many(mach):
+    """Vectorised :func:`fin_mach_factor`."""
+    return 1.0 - 0.35 * np.exp(-((np.asarray(mach, float) - 1.05) / 0.22) ** 2)
+
+
 def grid_fin_forces(spec, R, zc, omega_b, v_rel_w, rho, a_snd, defl, deploy):
     """Force and moment of the four grid fins.
 
@@ -193,6 +213,54 @@ class AeroModel:
         f += f_n + f_drag
         f += -u * q * 4.0 * legs * 0.9
         return f
+
+    def quick_force_many(self, v_rel, axis, rho, a_snd, legs=0.0, fins=1.0, trim=None):
+        """Vectorised :meth:`quick_force` over the leading axis (no CFD blend).
+
+        ``v_rel`` and ``axis`` are ``(n, 3)``; ``rho`` / ``a_snd`` are scalars
+        or ``(n,)``; ``legs`` and ``fins`` are scalars.  ``trim`` is a
+        vectorised ``kappa(theta, q)``.  Returns the forces ``(n, 3)``."""
+        s = self.spec
+        vr = np.asarray(v_rel, float).reshape(-1, 3)
+        ax = np.broadcast_to(np.asarray(axis, float), vr.shape)
+        n = vr.shape[0]
+        rho = np.broadcast_to(np.asarray(rho, float), (n,))
+        a_snd = np.asarray(a_snd, float) * np.ones(n)
+        speed = np.sqrt(np.sum(vr * vr, axis=1))
+        live = (speed >= 0.3) & (rho > 0.0)
+        if not np.any(live):
+            return np.zeros((n, 3))
+        sl = np.where(live, speed, 1.0)
+        u = vr / sl[:, None]
+        c = np.sum(u * ax, axis=1)
+        alpha = np.arccos(np.minimum(1.0, np.abs(c)))
+        mach = sl / np.maximum(a_snd, 1e-9)
+        q = 0.5 * rho * sl * sl
+        a_ref = math.pi * (s.diameter / 2) ** 2
+        a_plan = s.length * s.diameter
+        ca0 = np.where(c < 0.0, _transonic_many(mach, 0.95, 1.45, 1.10),
+                       _transonic_many(mach, 0.62, 1.05, 0.85))
+        sa, cabs = np.sin(alpha), np.abs(np.cos(alpha))
+        pg = 1.0 / np.sqrt(np.maximum(0.2, 1.0 - np.minimum(mach, 0.85) ** 2))
+        cn_pot = 2.0 * sa * cabs * pg * 0.5
+        cdc = _transonic_many(mach, 1.2, 1.75, 1.45)
+        cn_visc = 0.62 * cdc * (a_plan / a_ref) * sa * sa
+        ca = ca0 * cabs * cabs
+        perp = u - c[:, None] * ax
+        pn = np.sqrt(np.sum(perp * perp, axis=1))
+        pn_safe = np.maximum(pn, 1e-12)
+        f = -np.copysign(1.0, c)[:, None] * (q * a_ref * ca)[:, None] * ax
+        f_n = np.where((pn > 1e-6)[:, None], -(perp / pn_safe[:, None]) * (q * a_ref * (cn_pot + cn_visc))[:, None], 0.0)
+        if fins > 0.01:
+            S = s.fin_area * fins
+            f_n = f_n - (perp / pn_safe[:, None]) * (q * 4.0 * S * fin_mach_factor_many(mach)
+                                                     * fin_normal_coeff_many(alpha, s.fin_cn_alpha))[:, None]
+            f = f - u * (q * 4.0 * S * s.fin_cd0)[:, None]
+        if trim is not None:
+            theta = np.arccos(np.clip(-c, -1.0, 1.0))
+            f_n = f_n * trim(theta, q)[:, None]
+        f = f + f_n - u * (q * 4.0 * float(legs) * 0.9)[:, None]
+        return np.where(live[:, None], f, 0.0)
 
     def __call__(self, vehicle, v_rel, rho, a_snd, com_world):
         s = self.spec
