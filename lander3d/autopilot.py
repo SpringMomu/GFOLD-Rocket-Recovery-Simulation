@@ -186,8 +186,9 @@ class Autopilot3D:
     lift_trim = True              # the planner and the glide use the lift of the booster as the attitude loop trims it
     lineup_q_max = 1500.0         # Pa: above this dynamic pressure the glide goes on until ignition (no line-up)
     brake_floor = True            # a plan that is not being renewed, and the plan-less law, never command less vertical thrust than stopping the fall takes
-    ground_legs_time = 5.0        # s to the ground (at the present sink) at which a given-up catch puts the legs out
-    ground_legs_height = 60.0     # m, or this height
+    ground_legs_time = 3.0        # s to the ground (at the present sink) at which a given-up catch puts the legs out (the legs take 2 s) ...
+    ground_legs_alt = 200.0       # ... below this height, or below ground_legs_height whatever the sink
+    ground_legs_height = 80.0
     catch_far_distance = 25.0     # m from the catch axis beyond which a catch with a stale plan puts the legs out
     brake_floor_age = 1.0         # s without a new plan after which the one in hand is held to that floor
     brake_margin = 1.1            # the floor asks this much more deceleration than the bare stopping need
@@ -1474,18 +1475,24 @@ class Autopilot3D:
         self._mark()
         self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 and (self.plan is not None or accel[2] > 0.7 * g) else None, center=center)
 
+    def _given_up_catch(self, r) -> bool:
+        """A tower catch with the booster nowhere near the tower any more
+        (``catch_far_distance`` from the catch axis): with no plan to get
+        back it comes down on the ground, not on the arms."""
+        return (not self.use_legs) and float(np.linalg.norm(r[:2])) > self.catch_far_distance
+
     def _commit_to_ground(self, veh, r, v) -> bool:
-        """A tower catch that has been given up: the booster is nowhere near
-        the tower any more (``catch_far_distance``), has no plan to get back
-        with, and is about to reach the ground (``ground_legs_time`` s at the
-        present sink, or ``ground_legs_height``) -- then the legs come out so
-        that it lands instead of hitting the ground on its hull.  Not before:
-        the legs cannot be folded again, and with them out a catch is gone."""
-        if self.use_legs or float(np.linalg.norm(r[:2])) <= self.catch_far_distance:
+        """Put the legs out for a given-up catch (``_given_up_catch``) that is
+        about to reach the ground -- below ``ground_legs_height``, or within
+        ``ground_legs_time`` s of it at the present sink (low enough to count,
+        ``ground_legs_alt``).  Not before: the legs cannot be folded again,
+        and with them out a catch is gone."""
+        if not self._given_up_catch(r):
             return False
         alt = float(veh.altitude)
-        t_ground = alt / max(5.0, -float(v[2]))
-        return alt < self.ground_legs_height or t_ground < self.ground_legs_time
+        if alt < self.ground_legs_height:
+            return True
+        return alt < self.ground_legs_alt and alt / max(5.0, -float(v[2])) < self.ground_legs_time
 
     def _braking_floor(self, veh, r, v, m, accel):
         """The vertical thrust acceleration of the command, raised to what it
@@ -1503,10 +1510,14 @@ class Autopilot3D:
         if not self.brake_floor:
             return accel
         vz = float(v[2])
-        h_eff = float(r[2]) - self.gate_height - 0.3 * max(0.0, -vz)       # spool-up margin
-        if vz > -(self.gate_speed + 0.5) or h_eff < 0.3:
+        if self._given_up_catch(r):
+            h_stop, v_gate = float(veh.altitude), 2.0          # down to the ground, on the legs
+        else:
+            h_stop, v_gate = float(r[2]) - self.gate_height, self.gate_speed
+        h_eff = h_stop - 0.3 * max(0.0, -vz)                    # spool-up margin
+        if vz > -(v_gate + 0.5) or h_eff < 0.3:
             return accel
-        a_v = (vz * vz - self.gate_speed ** 2) / (2.0 * max(h_eff, 0.5))
+        a_v = (vz * vz - v_gate ** 2) / (2.0 * max(h_eff, 0.5))
         aero = veh.last.get("aero")
         drag_up = max(0.0, float(aero[2]) / m) if aero is not None else 0.0
         need = self.brake_margin * a_v + G0 - drag_up
