@@ -20,28 +20,27 @@ from .vehicle import Vehicle, Wind, quat_from_axis_angle
 
 PHYSICS_DT = 1.0 / 240.0
 MAX_STEPS_PER_CALL = 2400
-PAD_PROPELLANT = 30_000.0   # kg: the load of a hop from the pad (one engine lifts it; a full stage needs nine)
 LOGGED_PHASES = ("COAST", "BOOSTBACK", "LANDING BURN", "CATCH HOLD")
 
 SCENARIOS = [
-    {"name": "HOVER-SLAM 100 m", "pos": (0, 0, 100), "vel": (0, 0, 0), "tilt": 0.0, "prop": 3500},
-    {"name": "2000 m / +30 m/s UP", "pos": (0, 0, 2000), "vel": (0, 0, 30), "tilt": 0.0, "prop": 6000},
-    {"name": "2000 m / -30 m/s DOWN", "pos": (0, 0, 2000), "vel": (0, 0, -30), "tilt": 0.0, "prop": 6000},
-    {"name": "BOOSTBACK +1000 m / 100 m/s", "pos": (1000, 300, 2000), "vel": (100, -20, 0), "tilt": 10.0, "prop": 10000,
+    {"name": "HOVER-SLAM 100 m", "pos": (0, 0, 100), "vel": (0, 0, 0), "tilt": 0.0, "prop": 2500},
+    {"name": "2000 m / +30 m/s UP", "pos": (0, 0, 2000), "vel": (0, 0, 30), "tilt": 0.0, "prop": 4000},
+    {"name": "2000 m / -30 m/s DOWN", "pos": (0, 0, 2000), "vel": (0, 0, -30), "tilt": 0.0, "prop": 4000},
+    {"name": "BOOSTBACK +1000 m / 100 m/s", "pos": (1000, 300, 2000), "vel": (100, -20, 0), "tilt": 10.0, "prop": 5500,
      "fins_stowed": True},
-    {"name": "DIVERT -1000 m / 3-D", "pos": (-1000, 600, 2000), "vel": (100, -40, 0), "tilt": 10.0, "prop": 10000,
+    {"name": "DIVERT -1000 m / 3-D", "pos": (-1000, 600, 2000), "vel": (100, -40, 0), "tilt": 10.0, "prop": 5500,
      "fins_stowed": True},
-    {"name": "ENTRY 12 km / 280 m/s", "pos": (1800, -1100, 12000), "vel": (-88, 54, -260), "tilt": 8.0, "prop": 12000},
+    {"name": "ENTRY 12 km / 280 m/s", "pos": (1800, -1100, 12000), "vel": (-88, 54, -260), "tilt": 8.0, "prop": 6000},
     # Tower catches: the burn ends with the catch collar on the chopstick arms.
-    {"name": "TOWER CATCH 2000 m", "pos": (40, -30, 2000), "vel": (0, 0, -30), "tilt": 0.0, "prop": 6000,
+    {"name": "TOWER CATCH 2000 m", "pos": (40, -30, 2000), "vel": (0, 0, -30), "tilt": 0.0, "prop": 4000,
      "catch": True},
-    {"name": "TOWER CATCH BOOSTBACK", "pos": (1000, 300, 2000), "vel": (100, -20, 0), "tilt": 10.0, "prop": 10000,
+    {"name": "TOWER CATCH BOOSTBACK", "pos": (1000, 300, 2000), "vel": (100, -20, 0), "tilt": 10.0, "prop": 5500,
      "fins_stowed": True, "catch": True},
-    {"name": "TOWER CATCH ENTRY 12 km", "pos": (1800, -1100, 12000), "vel": (-88, 54, -260), "tilt": 8.0, "prop": 12000,
+    {"name": "TOWER CATCH ENTRY 12 km", "pos": (1800, -1100, 12000), "vel": (-88, 54, -260), "tilt": 8.0, "prop": 6000,
      "catch": True},
     # Low behind the tower: the straight way to the arms goes through it, the
     # plan goes over it (keep-out constraints).
-    {"name": "TOWER CATCH OVER TOWER", "pos": (-150, 0, 100), "vel": (0, 0, -5), "tilt": 0.0, "prop": 6000,
+    {"name": "TOWER CATCH OVER TOWER", "pos": (-150, 0, 100), "vel": (0, 0, -5), "tilt": 0.0, "prop": 4000,
      "catch": True},
 ]
 
@@ -103,7 +102,7 @@ class Sim3D:
 
     def reset_to_pad(self) -> None:
         with self.lock:
-            self.vehicle.reset(on_pad=True, propellant=PAD_PROPELLANT)
+            self.vehicle.reset(on_pad=True)
             self._set_tower(None)
             self.autopilot.reset()
             self.autopilot_on = False

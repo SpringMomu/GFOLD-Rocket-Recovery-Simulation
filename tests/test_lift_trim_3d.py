@@ -62,7 +62,7 @@ def test_the_trimmed_model_is_closer_to_the_flown_lift_than_zero_deflection():
             err0.append(float(np.linalg.norm(actual - f0)))
             err1.append(float(np.linalg.norm(actual - f1)))
     assert len(err0) >= 4
-    assert np.mean(err1) < 0.7 * np.mean(err0), (np.mean(err0), np.mean(err1))
+    assert np.mean(err1) < 0.5 * np.mean(err0), (np.mean(err0), np.mean(err1))
 
 
 def test_the_lift_gain_is_calibrated_in_flight_and_stays_bounded():

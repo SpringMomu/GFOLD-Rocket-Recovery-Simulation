@@ -238,23 +238,12 @@ class Wind:
 # ------------------------------------------------------------------ vehicle
 @dataclass
 class VehicleSpec:
-    """Falcon 9 Block 5 first stage (public data).
-
-    41.2 m tall, 3.66 m in diameter, ~22.2 t empty (legs and grid fins
-    included), ~411 t of propellant (LOX 287.4 t, RP-1 123.5 t, mass ratio
-    2.33).  Nine Merlin 1D, 845 kN each at sea level (Isp 282 s, vacuum
-    311 s).  The model flies on **one** engine
-    -- the landing configuration (the boost-back and entry burns of the real
-    stage use three); ``thrust_sl`` is that one engine.  Legs span about 17 m
-    when deployed, four titanium grid fins sit under the interstage."""
-
-    length: float = 41.2
-    diameter: float = 3.66
-    dry_mass: float = 22_200.0
-    lox_capacity: float = 287_400.0
-    rp1_capacity: float = 123_500.0
-    thrust_sl: float = 845_000.0
-    throttle_min: float = 0.20       # lowest throttle once lit (deep throttle: the stage can hover; the real Merlin 1D stops at ~40 %)
+    length: float = 18.0
+    diameter: float = 3.0
+    dry_mass: float = 8_000.0
+    lox_capacity: float = 8_630.0
+    rp1_capacity: float = 3_370.0
+    thrust_sl: float = 360_000.0
     isp_sl: float = 282.0
     isp_vac: float = 311.0
     throttle_rate: float = 1.2       # full range per second
@@ -262,10 +251,8 @@ class VehicleSpec:
     gimbal_rate: float = math.radians(30.0)
     gimbal_z: float = 0.3            # pivot height above the base
     nozzle_exit_z: float = -1.6
-    # Cold-gas thrusters at the top (N2): about the same angular acceleration
-    # as before the Falcon 9 data (the stage is ~16x the moment of inertia).
-    rcs_torque: tuple = (900_000.0, 900_000.0, 60_000.0)  # pitch(x), yaw(y), roll(z) N*m
-    rcs_z: float = 39.5
+    rcs_torque: tuple = (60_000.0, 60_000.0, 22_000.0)  # pitch(x), yaw(y), roll(z) N*m
+    rcs_z: float = 17.2
     # Grid fins: four lattice panels at the top of the booster (azimuths
     # 0/90/180/270 deg in the body frame), each hinged about its radial
     # axis.  The flow passes through the cells; deflecting a panel turns
@@ -273,7 +260,7 @@ class VehicleSpec:
     # tangential direction (and a moment about the centre of mass).  See
     # aero.grid_fin_forces.
     fin_azimuth_deg: tuple = (0.0, 90.0, 180.0, 270.0)
-    fin_area: float = 2.4            # panel area (2.0 m span x 1.2 m)
+    fin_area: float = 1.62           # panel area (1.35 m span x 1.2 m)
     # Normal-force slope per cell-wall set (1/rad, on the panel's frontal
     # area).  A lattice fin has many lifting cell walls behind its frontal
     # area: wind-tunnel data give ~0.05/deg (~3/rad) subsonic on that area
@@ -281,19 +268,18 @@ class VehicleSpec:
     # fin_normal_coeff = cn_alpha sin a cos a it peaks at 1.5 at 45 deg.
     fin_cn_alpha: float = 3.0
     fin_cd0: float = 0.30            # panel drag (on fin_area)
-    fin_r_cp: float = 2.5            # radial position of the panel centre
+    fin_r_cp: float = 2.17           # radial position of the panel centre
     fin_max_defl: float = math.radians(20.0)
     fin_rate: float = math.radians(40.0)   # deflection rate limit (rad/s)
     fin_deploy_time: float = 1.5
-    tank_bottom: float = 3.5
-    tank_top: float = 36.0
-    dry_com_z: float = 15.0
-    leg_hinge_r: float = 1.83
-    leg_hinge_z: float = 5.5
-    leg_length: float = 11.0
+    tank_bottom: float = 2.0
+    tank_top: float = 15.5
+    dry_com_z: float = 7.0
+    leg_hinge_r: float = 1.55
+    leg_hinge_z: float = 3.2
+    leg_length: float = 6.2
     leg_deploy_time: float = 2.0
-    leg_area: float = 7.0            # drag area of the four deployed legs (m^2, times Cd 0.9)
-    grid_fin_z: float = 38.0
+    grid_fin_z: float = 16.8
 
     @property
     def propellant_capacity(self) -> float:
@@ -334,7 +320,6 @@ class Vehicle:
         self.q = np.array([1.0, 0.0, 0.0, 0.0]) if attitude is None else np.array(attitude, float)
         self.omega = np.zeros(3)  # body rates (rad/s)
         prop = s.propellant_capacity if propellant is None else max(0.0, min(s.propellant_capacity, propellant))
-        self.loaded = prop               # propellant at the start (the gauges are relative to it)
         ratio = s.lox_capacity / s.propellant_capacity
         self.lox = prop * ratio
         self.rp1 = prop * (1.0 - ratio)
@@ -453,9 +438,7 @@ class Vehicle:
         self.time += dt
 
         # Actuators with finite rates.
-        # (an engine that is on cannot be throttled below its minimum)
-        cmd_throttle = c.throttle if c.throttle < 0.02 else max(c.throttle, s.throttle_min)
-        self.throttle += max(-s.throttle_rate * dt, min(s.throttle_rate * dt, cmd_throttle - self.throttle))
+        self.throttle += max(-s.throttle_rate * dt, min(s.throttle_rate * dt, c.throttle - self.throttle))
         self.throttle = min(1.0, max(0.0, self.throttle))
         if self.propellant <= 0.0:
             self.throttle = 0.0
@@ -566,9 +549,9 @@ class Vehicle:
         force = np.zeros(3)
         torque_b = np.zeros(3)
         self.feet_contact = 0
-        if self.pos[2] > self.spec.length + 10.0:
+        if self.pos[2] > 40.0:
             return force, torque_b
-        k, c_d, mu = 7.0e6, 3.6e5, 0.7
+        k, c_d, mu = 3.0e6, 1.6e5, 0.7
         omega_w = R @ self.omega
         feet = self.leg_foot_body(self.legs) if self.legs > 0.02 else []
         points = [(p, True) for p in feet] + [(p, False) for p in self.hull_points_body()]
@@ -594,7 +577,7 @@ class Vehicle:
             vt_n = vnorm(vt)
             ft = np.zeros(3)
             if vt_n > 1e-6:
-                ft = -vt / vt_n * min(mu * fn, 3.4e4 * vt_n)  # gain bounded for dt stability (yaw eff. mass)
+                ft = -vt / vt_n * min(mu * fn, 1.5e4 * vt_n)  # gain bounded for dt stability (yaw eff. mass)
             f = np.array([0.0, 0.0, fn]) + ft
             force += f
             torque_b += R.T @ cross3(r, f)

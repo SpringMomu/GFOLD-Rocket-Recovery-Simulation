@@ -38,18 +38,18 @@ from .vehicle import cross3, vnorm
 # --- geometry (m) ---------------------------------------------------------
 TOWER_X = (-15.0, -9.0)        # tower footprint (x), |y| <= TOWER_HALF_Y
 TOWER_HALF_Y = 3.0
-TOWER_TOP = 66.0
-ARM_TOP = 42.0                 # arm top surface when unloaded
+TOWER_TOP = 48.0
+ARM_TOP = 30.0                 # arm top surface when unloaded
 ARM_DEPTH = 1.6                # arm height (top surface down to its bottom)
 ARM_HALF_WIDTH = 0.5
 ARM_LENGTH = 10.5
 PIVOT_X, PIVOT_Y = -9.0, 3.0   # arm pivots at the tower's front corners (y = +/-PIVOT_Y)
 MOUNT_RADIUS = 6.0             # launch mount table under the catch point
-MOUNT_TOP = 4.5
-CATCH_COLLAR_Z = 30.0          # body height of the catch collar (above the centre of mass, below the grid fins at 38)
-CATCH_COLLAR_R = 2.45          # collar contact radius (hardpoints stick out 0.6 m)
+MOUNT_TOP = 8.0
+CATCH_COLLAR_Z = 15.0          # body height of the catch collar (below the grid fins at 16.8)
+CATCH_COLLAR_R = 2.1           # collar contact radius (hardpoints stick out 0.6 m)
 COLLAR_POINTS = 16
-BODY_RADIUS = 1.83
+BODY_RADIUS = 1.5
 FACE_CLEARANCE = 0.1           # closed arm face to barrel
 
 ARM_OPEN = math.radians(40.0)
@@ -80,8 +80,8 @@ FACE_K, FACE_C, FACE_FORCE_MAX = 4.0e5, 4.0e4, 6.0e4
 ARM_IMPACT_SPEED = 3.0         # m/s at the face: faster is a collision
 # Keep-out boxes for the planner: margin beyond the barrel (sideways) and
 # beyond the base/top of the booster (vertically).
-KEEP_OUT_MARGIN = 3.0
-KEEP_OUT_MARGIN_Z = 4.0
+KEEP_OUT_MARGIN = 2.0
+KEEP_OUT_MARGIN_Z = 1.5
 SETTLE_TIME = 0.8
 
 

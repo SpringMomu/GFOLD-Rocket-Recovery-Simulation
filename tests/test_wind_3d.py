@@ -203,7 +203,7 @@ def test_catch_hold_bias_includes_what_the_model_misses():
     # attitude), the wind pushes east at 0.75 m/s^2
     veh.last["thrust"] = np.array([-0.45, 0.0, 9.8]) * m
     veh.last["aero"] = np.array([0.75, 0.0, 0.0]) * m
-    for _ in range(20000):
+    for _ in range(2000):
         ap._update_hold_bias(veh, 1.0 / 240.0)
     assert np.allclose(ap._hold_bias, [-1.0, 0.0], atol=1e-3)
 
