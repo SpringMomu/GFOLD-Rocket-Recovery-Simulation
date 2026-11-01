@@ -1270,7 +1270,11 @@ class Autopilot3D:
             # has already turned the booster round (engines-first: the stable
             # attitude, from which the thrust cannot be pointed along the
             # motion again -- it would wait at zero throttle), the
-            # engines-first coast and the landing burn take over.  A hop also
+            # engines-first coast and the landing burn take over.  "Back" is
+            # against the motion through the air: in a wind the ground speed
+            # passes through zero while the flow still comes the other way,
+            # and the sign of the ground speed would end the boost-back
+            # there (with the pad still ~1.5 km off in 15 m/s).  A hop also
             # ends once the change wanted points against the flow (braking):
             # it starts slow, so there is no retrograde phase to fly.
             d = None if dv is None or dvn <= 0.0 else dv / dvn
@@ -1280,7 +1284,7 @@ class Autopilot3D:
                 cos_f = float(np.dot(d, u_air))
                 cap = math.radians(self.nose_first_aoa_deg)
                 if cos_f > 0.0:
-                    if float(np.dot(dv[:2], v[:2])) < 0.0 or float(np.dot(veh.axis, u_air)) < 0.0:
+                    if float(np.dot(dv[:2], u_air[:2])) < 0.0 or float(np.dot(veh.axis, u_air)) < 0.0:
                         braking = True
                     elif cos_f < math.cos(cap):
                         side = d - u_air * cos_f
@@ -1376,7 +1380,8 @@ class Autopilot3D:
         sideways speed, by then: over the braking time the horizontal speed
         is bled off at the smallest steady rate (the rest is done by the
         drag of the upright body), so the booster drifts about
-        ``v_ign t_brake / 2``.  The glide and the boost-back aim this point
+        ``v_ign t_brake / 2``; the drag of a cross wind is leaned against, up
+        to the wind trim's tilt.  The glide and the boost-back aim this point
         at the pad: the burn then needs only a small, steady tilt -- at high
         dynamic pressure a tilted engines-first booster gets a body lift
         *against* its tilt, so a large sideways correction with the engine
@@ -1402,8 +1407,22 @@ class Autopilot3D:
             if self.aero is not None:
                 rho, _, _, a = atmosphere(max(0.0, p[2]))
                 a_h = self.aero.quick_force(u - self._wind(p[2]), up, rho, a, 0.0)[:2] / m
+                # The burn leans into the wind (the wind trim; the plan's
+                # sideways-effort cost does not charge thrust that only cancels
+                # drag), up to ``trim_max_deg`` of tilt of a thrust that carries
+                # g + a_v vertically: only the drag beyond that drifts the
+                # booster.  Without this the boost-back aims far upwind of the
+                # pad to make up the whole drift of the burn (1-6 m/s^2 of
+                # drag in 12-30 m/s of wind over ~25 s: hundreds of metres) --
+                # in a strong wind it chases a velocity change that is not
+                # needed (-580 m/s instead of -170 m/s), and the booster is
+                # never over the pad at ignition.
+                n_h = float(np.linalg.norm(a_h))
+                cap = self.trim_gain * math.tan(math.radians(self.trim_max_deg)) * (G0 + a_v)
+                if n_h > 1e-9:
+                    a_h *= max(0.0, n_h - cap) / n_h
             # steady thrust decel that stops the along-track drift by t_br
-            # (drag does part of it); a cross wind is not fought with tilt
+            # (drag does part of it)
             a_h -= e0 * max(0.0, float(np.dot(u[:2], e0))) / max(dt, t_br - t)
             u[:2] += a_h * dt
             u[2] += a_v * dt
