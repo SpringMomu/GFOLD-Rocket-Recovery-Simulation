@@ -66,6 +66,8 @@ export function event(e) {
   if (e === "ARMS CLOSING") return "筷子臂合拢";
   if (e === "CATCH CONTACT") return "挂点落上筷子臂，发动机关机";
   if (e === "WIND OFF") return "风场断开";
+  if (e === "SOLVER CFG") return "求解器设置已更新";
+  if (e === "SOLVER CFG DEFAULT") return "求解器设置恢复默认";
   if ((m = e.match(/^WIND CFG (\d+)-(\d+) ([\d.]+)-([\d.]+) ([\d.]+)$/))) {
     const dir = m[1] === m[2] ? `来向 ${m[1]}°` : `来向 ${m[1]}°→${m[2]}°`;
     const spd = m[3] === m[4] ? `${m[3]} m/s` : `${m[3]}–${m[4]} m/s`;

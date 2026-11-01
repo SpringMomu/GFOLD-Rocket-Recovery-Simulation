@@ -384,6 +384,11 @@ class Planner3D:
     keep_out_weight = 2000.0       # per m inside an obstacle's half-space (per s)
     ground_weight = 2000.0         # per m below the ground (per s)
     elastic_weight = 1.0e4         # per m/s^2 outside a state-tied limit (tilt cone, slew, first knot)
+    # Share of the predicted aerodynamic force that the sideways-effort cost
+    # nets off (1: holding still against a cross wind is free, 0: the cost is
+    # on the thrust alone).  Front-end option (lander3d/settings.py).
+    lateral_aero_share = 1.0
+    max_iter = 100                 # interior-point iteration cap (settings)
 
     def __init__(self) -> None:
         self.solve_count = 0
@@ -673,7 +678,7 @@ class Planner3D:
         lam = self.lateral_accel_weight
         for k in range(N + 1):
             q[U(k, 3)] += w[k]
-            d_k = drag[min(k, N - 1)]
+            d_k = drag[min(k, N - 1)] * self.lateral_aero_share
             for c_ in (0, 1):
                 # lam |u_c + d_c|^2: the net sideways acceleration
                 add_p(U(k, c_), U(k, c_), 2 * lam * w[k])
@@ -735,12 +740,12 @@ class Planner3D:
         if not self.available or not (t_f > 0.3):
             return None
         P, q, A, b, nz, nn, socs, L, drag, const = self.build(r0, v0, m0, t_f, cfg)
-        x, status = self.solver.solve(P, q, A, b, nz, nn, socs)
+        x, status = self.solver.solve(P, q, A, b, nz, nn, socs, max_iter=self.max_iter)
         if x is None and status not in ("no-solver",):
             # The problem is always feasible (every state-tied limit is
             # elastic), so a failure is numerical -- the iteration cap or no
             # progress on a badly scaled step: once more with more room.
-            x, status = self.solver.solve(P, q, A, b, nz, nn, socs, max_iter=400)
+            x, status = self.solver.solve(P, q, A, b, nz, nn, socs, max_iter=max(400, self.max_iter))
         self.last_status = status
         if x is None:
             return None

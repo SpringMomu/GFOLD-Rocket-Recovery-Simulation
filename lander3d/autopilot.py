@@ -170,6 +170,12 @@ class Autopilot3D:
     wind_sample_period = 0.25     # s
     wind_memory = 60.0            # s, e-folding age of the samples
     wind_shear_prior_weight = 0.003   # (shapes of nearby k differ little: a stronger prior hides real shear)
+    # Wind-resistance options of the plan (front-end solver panel, see
+    # lander3d/settings.py; the defaults are the original behaviour):
+    wind_plan_gain = 1.0          # wind the planner's predictions assume, x the extrapolated measured wind
+    aero_pred = 2                 # aerodynamics in the plan: 0 none, 1 drag at the reference attitude, 2 + lift linearisation
+    trim_gain = 1.0               # share of the wind trim (lean into the wind) used by the tilt cone and the tracker
+    shear_fit = True              # fit the shear strength from the winds measured on the way down (else k = 1)
     # Wind trim: the sideways thrust acceleration that cancels the aerodynamic
     # force on the upright booster (lean into the wind).  The tracker's tilt
     # budget and the planner's tilt cone are both centred on it (fading to
@@ -331,7 +337,7 @@ class Autopilot3D:
                     sig = max(3.0, prev.sigma_at(tau))
                     u_ref = acc
                 rho, _, _, a = atmosphere(max(0.0, h + self.h_off))
-                vr = v - self._wind(h)          # the wind where the plan will be, not the wind here
+                vr = v - self._wind_plan(h)     # the wind where the plan will be, not the wind here
                 sp = float(np.linalg.norm(vr))
                 qd[i] = 0.5 * rho * sp * sp
                 # lower down the wind is weaker (and the air a little denser):
@@ -339,12 +345,14 @@ class Autopilot3D:
                 qs = []
                 for dh in (5.0, -5.0):
                     rho_d = atmosphere(max(0.0, h + dh + self.h_off))[0]
-                    qs.append(0.5 * rho_d * float(np.linalg.norm(v - self._wind(h + dh))) ** 2)
+                    qs.append(0.5 * rho_d * float(np.linalg.norm(v - self._wind_plan(h + dh))) ** 2)
                 dq[i] = (qs[0] - qs[1]) / 10.0
                 if sp < 3.0:
                     continue
                 u = vr / sp
                 wd[i] = -u
+                if self.aero_pred <= 0:
+                    continue                # (the angle-of-attack cap above still sees the flow)
                 base = -u
                 # Linearise around the reference attitude (successive
                 # linearisation: each replan uses the previous plan's tilt).
@@ -366,6 +374,9 @@ class Autopilot3D:
                     out[i] = self.aero.quick_force(vr, broadside, rho, a, legs) / m
                     continue
                 f0 = self.aero.quick_force(vr, axis0, rho, a, legs)
+                if self.aero_pred == 1:
+                    out[i] = f0 / m         # drag at the reference attitude, no lift gradient
+                    continue
                 e1 = np.cross(u, [0.0, 0.0, 1.0] if abs(u[2]) < 0.9 else [1.0, 0.0, 0.0])
                 e1 /= np.linalg.norm(e1)
                 e2 = np.cross(u, e1)
@@ -507,6 +518,11 @@ class Autopilot3D:
         shape = float(self._profile(z + self.h_off, k) / self._profile(z_now, k))
         return w * min(6.0, shape)
 
+    def _wind_plan(self, z):
+        """The wind the planner's predictions assume at height ``z``: the
+        extrapolated measured wind times ``wind_plan_gain`` (a setting)."""
+        return self._wind(z) * self.wind_plan_gain
+
     def _update_trim(self, veh, wind_now, dt):
         """Filtered wind trim (sideways thrust acceleration that holds the
         upright booster against the aerodynamic force on it)."""
@@ -519,6 +535,7 @@ class Autopilot3D:
         n = float(np.linalg.norm(target))
         if n > cap:
             target *= cap / n
+        target = target * self.trim_gain
         self._trim_xy += (target - self._trim_xy) * min(1.0, dt / self.trim_filter)
 
     def _update_hold_bias(self, veh, dt):
@@ -552,11 +569,11 @@ class Autopilot3D:
             return np.zeros(2)
         z = self.gate_height + 2.0
         rho, _, _, a_s = atmosphere(max(0.0, z + self.h_off))
-        vr = np.array([0.0, 0.0, -self.gate_speed]) - self._wind(z)
+        vr = np.array([0.0, 0.0, -self.gate_speed]) - self._wind_plan(z)
         t = -self.aero.quick_force(vr, np.array([0.0, 0.0, 1.0]), rho, a_s, 1.0)[:2] / veh.mass
         cap = math.tan(math.radians(self.trim_max_deg)) * G0
         n = float(np.linalg.norm(t))
-        return t * (cap / n) if n > cap else t
+        return (t * (cap / n) if n > cap else t) * self.trim_gain
 
     def _update_wind_profile(self, veh, wind_now):
         """Record the measured wind and refit the shear strength (every 1 s)."""
@@ -566,6 +583,9 @@ class Autopilot3D:
             cut = self.elapsed - 3.0 * self.wind_memory
             while self._wind_samples and self._wind_samples[0][0] < cut:
                 self._wind_samples.pop(0)
+        if not self.shear_fit:
+            self.wind_shear_est = 1.0
+            return
         if self.elapsed < self._next_shear_fit or len(self._wind_samples) < 8:
             return
         self._next_shear_fit = self.elapsed + 1.0

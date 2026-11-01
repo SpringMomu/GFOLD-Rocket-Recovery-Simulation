@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import settings
 from .sim import SCENARIOS, Sim3D
 from .vehicle import G0, atmosphere
 
@@ -85,6 +86,7 @@ def snapshot(sim: Sim3D) -> dict:
                      "force": _vec(a.get("force", np.zeros(3))), "tail_first": bool(a.get("tail_first", True)),
                      "rho": round(rho, 4), "cfd_forces": sim.aero.cfd_forces},
             "wind": _vec(wind), "wind_on": sim.wind.enabled, "wind_cfg": sim.wind.config(),
+            "solver_cfg": dict(sim.solver_cfg), "solver_opts": settings.options_snapshot(),
             "plan": [_vec(pt) for pt in plan], "trail": [_vec(pt) for pt in trail],
             "touchdown": v.touchdown, "tower": None if sim.tower is None else sim.tower.snapshot(), "events": [[round(t, 1), e] for t, e in sim.events[-6:]],
             "cfd": None if cfd is None else {"fresh": cfd.fresh},
