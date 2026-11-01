@@ -186,7 +186,7 @@ class Autopilot3D:
     lift_trim = True              # the planner and the glide use the lift of the booster as the attitude loop trims it
     lineup_q_max = 1500.0         # Pa: above this dynamic pressure the glide goes on until ignition (no line-up)
     brake_floor = True            # a plan that is not being renewed, and the plan-less law, never command less vertical thrust than stopping the fall takes
-    ground_legs_height = 30.0     # m: a given-up catch puts the legs out below this height (the feet go down first)
+    ground_legs_height = 18.0     # m: a given-up catch puts the legs out below this height -- well under the arm tops (30 m), where a catch can still be made (the feet go down first)
     catch_far_distance = 25.0     # m from the catch axis beyond which a catch with a stale plan puts the legs out
     brake_floor_age = 1.0         # s without a new plan after which the one in hand is held to that floor
     brake_margin = 1.1            # the floor asks this much more deceleration than the bare stopping need
