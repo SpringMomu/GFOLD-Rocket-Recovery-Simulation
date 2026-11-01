@@ -38,7 +38,7 @@ let latest = null;
 let online = true;
 const CLEAN = /[?&]clean/.test(location.search);
 const view = { flowMode: 0, volField: 1, cam: 0, cfdCoef: null, cfdSps: 0, flowTime: 0, showTraj: false };
-const CAM_NAMES = ["环绕", "着陆台", "侧视"];
+const CAM_NAMES = ["环绕", "着陆台", "侧视", "箭身"];
 const VOL_NAMES = ["染料", "涡量", "速度"];
 const VOL_TO_TUNNEL = ["dye", "vort", "speed"];
 
@@ -140,7 +140,7 @@ function command(k) {
   else if (k === "f") { view.flowMode = 1 - view.flowMode; toast(view.flowMode ? "主视图气流：" + VOL_NAMES[view.volField] : "主视图气流已关闭，流场计算与风洞截面照常"); }
   else if (k === "k") { view.showTraj = !view.showTraj; toast(view.showTraj ? "实际轨迹与预测轨迹：显示" : "实际轨迹与预测轨迹：隐藏"); }
   else if (k === "b") { view.volField = (view.volField + 1) % 3; hud.tunnel.setMode(VOL_TO_TUNNEL[view.volField]); toast("显示量：" + VOL_NAMES[view.volField]); }
-  else if (k === "v") { view.cam = (view.cam + 1) % 3; toast("相机：" + CAM_NAMES[view.cam]); }
+  else if (k === "v") { view.cam = (view.cam + 1) % CAM_NAMES.length; toast("相机：" + CAM_NAMES[view.cam]); }
   else if (k === "l") { hud.resetLayout(); toast("仪表布局、折叠状态与窗口大小已恢复默认"); }
   else if (k === "h") hud.toggleHelp();
   else if (k === "foldall") hud.foldAll();
@@ -177,7 +177,7 @@ function toast(msg) {
 }
 
 // ------------------------------------------------------------------ camera
-const cam = { yaw: -2.25, pitch: 0.18, dist: 70, fov: 0.9, eye: [0, 0, 0], at: [0, 0, 0], smoothAt: null, auto: true };
+const cam = { yaw: -2.25, pitch: 0.18, dist: 70, fov: 0.9, eye: [0, 0, 0], at: [0, 0, 0], up: [0, 0, 1], smoothAt: null, auto: true };
 // Mouse or one finger drags the orbit, two fingers pinch the distance,
 // wheel zooms, a double click / double tap restores the automatic distance.
 const ptrs = new Map();
@@ -225,7 +225,21 @@ function updateCamera(st, dt) {
     const want = st.state !== "FLYING" ? 58 : Math.max(48, Math.min(260, 42 + 0.35 * sp + 0.012 * st.alt));
     cam.dist += (want - cam.dist) * (1 - Math.exp(-dt * 1.5));
   }
-  let fov = 0.9, eye;
+  let fov = 0.9, eye, up = [0, 0, 1];
+  if (view.cam === 3) {
+    // Body camera: fixed in the body frame on a short boom at the skirt (3.4 m
+    // out on the -x side, 1.5 m above the base), looking down the vehicle and
+    // 16 deg inwards: the engine bell, the flame streaming away, the legs and
+    // the ground come into view.  (From the hull itself the bell is hidden
+    // behind the cylinder.)  It turns with the booster; image "up" = away
+    // from the axis.
+    const tilt = 16.5 * Math.PI / 180;
+    eye = V.add(st.pos, rot(st.q, [-3.4, 0, 1.5]));
+    const look = rot(st.q, [Math.sin(tilt), 0, -Math.cos(tilt)]);
+    cam.eye = eye; cam.at = V.add(eye, V.mul(look, 40)); cam.fov = 1.4;
+    cam.up = rot(st.q, [-Math.cos(tilt), 0, -Math.sin(tilt)]);
+    return;
+  }
   if (view.cam === 1) {
     // Pad camera: fixed on the ground, zooms onto the booster.
     eye = [-150, -210, 3.5];
@@ -240,7 +254,7 @@ function updateCamera(st, dt) {
     eye = V.add(center, [Math.cos(cam.yaw) * cp * cam.dist, Math.sin(cam.yaw) * cp * cam.dist, Math.sin(cam.pitch) * cam.dist]);
   }
   eye[2] = Math.max(eye[2], 2.2);
-  cam.eye = eye; cam.at = center; cam.fov = fov;
+  cam.eye = eye; cam.at = center; cam.fov = fov; cam.up = up;
 }
 function angDiff(a, b) { let d = a - b; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; }
 
@@ -251,6 +265,8 @@ function angDiff(a, b) { let d = a - b; while (d > Math.PI) d -= 2 * Math.PI; wh
 // cloud responds to throttle, height and gimbal instead of being scripted.
 const smoke = [];     // {p, v, age, life, size, kind, col, a0, seed, rot, rotV, heat, grow}
 const MAX_SMOKE = 1400;
+const MAX_DUST = 650, DUST_RATE = 260, DUST_TOP = 17, DUST_FULL = 15;   // pad dust: cap, puffs/s, onset heights [m]
+let dustCount = 0, dustAcc = 0;
 let lastSimT = null;
 let plumeNow = null;
 const rnd = (a = 1) => (Math.random() * 2 - 1) * a;
@@ -273,10 +289,28 @@ function spawnEffects(st, dt, P) {
     const pAmb = P.pamb;
     // Perpendicular basis around the jet.
     const u1 = V.norm(V.cross(ex, Math.abs(ex[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0])), u2 = V.cross(ex, u1);
-    // Pad interaction: dust/smoke clouds removed; only the hot embers remain.
+    // Exhaust blowing the pad: crisp dust puffs thrown radially outwards from
+    // the impingement point.  They start 17 m above the ground and are in full
+    // flow by 15 m; the count is capped so the cost stays small.
+    if (P.hit) {
+      const ramp = Math.max(0, Math.min(1, (DUST_TOP - P.hdist) / (DUST_TOP - DUST_FULL)));
+      if (ramp > 0 && dustCount < MAX_DUST) {
+        dustAcc += ramp * (0.85 + 0.15 * P.thr) * DUST_RATE * dt;   // big even at 20 % throttle
+        const n = Math.min(Math.floor(dustAcc), MAX_DUST - dustCount);
+        dustAcc -= Math.floor(dustAcc);
+        const w = st.wind || [0, 0, 0];
+        for (let i = 0; i < n; i++) {
+          const a = Math.random() * 6.283, c = Math.cos(a), sn = Math.sin(a);
+          const r0 = 0.6 * P.Rj + 1.0, spd = (14 + 30 * Math.random()) * (0.8 + 0.2 * P.thr);
+          const tone = 0.78 + 0.22 * Math.random();
+          addP({ p: [P.hit[0] + c * r0, P.hit[1] + sn * r0, 0.5], v: [c * spd + w[0] * 0.3, sn * spd + w[1] * 0.3, 0.6 + 1.6 * Math.random()],
+            life: 1.8 + 2.2 * Math.random(), size: 1.0 + 1.3 * Math.random(), kind: 5, col: [0.46 * tone, 0.42 * tone, 0.37 * tone], a0: 0.8, heat: 0, grow: 2.2 + 2.0 * Math.random() });
+        }
+      }
+    }
+    // Hot embers / grit ricocheting off the pad while the flame touches it.
     if (P.hit && P.blast > 0.01) {
       const hit = P.hit;
-      // Hot embers / grit ricocheting off the pad while the flame touches it.
       if (P.heat > 0.05) {
         const ne = Math.floor(18 * P.heat * dt * 60 * Math.random());
         for (let i = 0; i < ne; i++) {
@@ -344,10 +378,21 @@ function stepEffects(st, dt, P) {
   const wind = st.wind || [0, 0, 0];
   const jet = P && P.on;
   const U0 = jet ? 60 + 160 * P.thr : 0;                     // jet speed scale for forcing [m/s]
+  dustCount = 0;
   for (let i = smoke.length - 1; i >= 0; i--) {
     const s = smoke[i];
     s.age += dt;
     if (s.age > s.life) { smoke.splice(i, 1); continue; }
+    if (s.kind === 5) {                                        // pad dust: thrown outwards, slows, drifts with the wind
+      dustCount++;
+      const k = Math.exp(-1.1 * dt), kw = (1 - k) * 0.3;
+      s.v[0] = s.v[0] * k + wind[0] * kw; s.v[1] = s.v[1] * k + wind[1] * kw;
+      s.v[2] += (0.7 - s.v[2]) * (1 - Math.exp(-2 * dt));
+      s.p = V.add(s.p, V.mul(s.v, dt));
+      if (s.p[2] < 0.3 * s.size) s.p[2] = 0.3 * s.size;
+      s.size += s.grow * dt; s.grow *= Math.exp(-0.9 * dt);
+      continue;
+    }
     if (s.kind === 4) {                                        // embers: ballistic with light drag
       s.v[2] -= 9.81 * dt;
       for (let c = 0; c < 3; c++) s.v[c] *= Math.exp(-0.6 * dt);
@@ -405,7 +450,7 @@ function buildParticles(eye, P) {
   occGrid.clear();
   const cell = 5;
   const key = (p) => ((Math.floor(p[0] / cell) * 73856093) ^ (Math.floor(p[1] / cell) * 19349663) ^ (Math.floor(p[2] / cell) * 83492791));
-  for (const s of smoke) if (s.kind !== 4 && s.kind !== 2) { const k = key(s.p); occGrid.set(k, (occGrid.get(k) || 0) + s.a0 * Math.min(4, s.size)); }
+  for (const s of smoke) if (s.kind !== 4 && s.kind !== 2 && s.kind !== 5) { const k = key(s.p); occGrid.set(k, (occGrid.get(k) || 0) + s.a0 * Math.min(4, s.size)); }
   const order = new Array(n);
   for (let i = 0; i < n; i++) { const p = smoke[i].p; order[i] = [i, (p[0] - eye[0]) ** 2 + (p[1] - eye[1]) ** 2 + (p[2] - eye[2]) ** 2]; }
   order.sort((a, b) => b[1] - a[1]);
@@ -418,6 +463,7 @@ function buildParticles(eye, P) {
     let a;
     if (s.kind === 2) a = s.a0 * Math.pow(1 - life, 1.6);
     else if (s.kind === 4) a = s.a0;
+    else if (s.kind === 5) a = s.a0 * Math.min(1, (1 - life) / 0.4);
     else a = s.a0 * Math.min(1, s.age * 3) * Math.pow(1 - life, 1.3);
     if (s.kind === 1 && rocketAxis) {
       const q = V.sub(s.p, rocketAxis[0]), t = Math.max(0, Math.min(20, V.dot(q, rocketAxis[1])));
@@ -431,6 +477,7 @@ function buildParticles(eye, P) {
     partData[o + 4] = s.col[0]; partData[o + 5] = s.col[1]; partData[o + 6] = s.col[2]; partData[o + 7] = a;
     let emis = 0, open = 1;
     if (s.kind === 4) { emis = 6 * Math.pow(1 - life, 2); open = -1; }
+    else if (s.kind === 5) open = -2;                          // crisp flat-shaded puff
     else if (s.kind !== 2) {
       emis = s.kind === 0 ? 0.25 * Math.exp(-s.age * 3) : 0;
       open = Math.exp(-0.05 * ((occGrid.get(key(s.p)) || 0) - s.a0 * Math.min(4, s.size)));
@@ -483,7 +530,7 @@ function frame(now) {
   const st = interpState(now);
   if (st) {
     const simDt = lastSimT === null ? 0 : Math.max(0, Math.min(0.1, st.t - lastSimT));
-    if (lastSimT !== null && st.t < lastSimT - 0.5) { smoke.length = 0; cam.smoothAt = null; cam.auto = true; if (fluid) fluid.reset(); }
+    if (lastSimT !== null && st.t < lastSimT - 0.5) { smoke.length = 0; dustCount = 0; cam.smoothAt = null; cam.auto = true; if (fluid) fluid.reset(); }
     lastSimT = st.t;
     scene.resize();
     updateCamera(st, dt);

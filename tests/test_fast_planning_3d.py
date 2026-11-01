@@ -21,7 +21,7 @@ from lander3d.sim import Sim3D
 from lander3d.vehicle import VehicleSpec
 
 
-def _locked_sim(scenario: int, max_steps: int = 9000) -> Sim3D:
+def _locked_sim(scenario: int, max_steps: int = 14000) -> Sim3D:
     """A simulation that has just lit its landing burn."""
     sim = Sim3D(cfd=False, scenario=scenario, wind_on=True)
     for _ in range(max_steps):

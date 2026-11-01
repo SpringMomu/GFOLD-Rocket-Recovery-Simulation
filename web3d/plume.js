@@ -59,6 +59,8 @@ export function plumeParams(st, time = 0) {
     const hRef = 10 + 40 * thr;
     blast = thr * Math.min(1, Math.pow(hRef / Math.max(hRef, hdist), 2)) * Math.max(0, 1 - hdist / (6 * hRef));
   }
+  // Visible flame (game style): length follows the throttle, cut short by the ground.
+  const flameLen = Math.min((5 + 11 * thr) / (1 + counter / 400), hdist * 0.92);
   const Rw = Rj * 1.6 + 14 * heat + 3 * blast;
   const flick = 0.94 + 0.06 * Math.sin(time * 61.0) * Math.sin(time * 23.7 + 1.3);
   // Merlin gas-generator (turbopump) exhaust: a separate fuel-rich, sooty
@@ -66,7 +68,7 @@ export function plumeParams(st, time = 0) {
   // Falcon 9 plume.
   const gg = V.add(st.pos, rot(q, [0.62, 0.0, -1.3]));
   return {
-    on, thr, axis, exit, gg, pamb, len, spread, bulge, bend, jetR, hdist, hit, Rj, Rw, heat, blast,
+    on, thr, axis, exit, gg, flameLen, pamb, len, spread, bulge, bend, jetR, hdist, hit, Rj, Rw, heat, blast,
     intensity: on ? (0.35 + 0.65 * thr) * flick : 0,
     diamonds: Math.pow(pamb, 2.0) * (0.55 + 0.45 * thr),
     lambda: 1.3 * 2 * EXIT_R * Math.pow(1 / Math.max(0.05, pamb), 0.35),

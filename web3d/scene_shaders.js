@@ -352,161 +352,30 @@ export const FS_VS = `#version 300 es
 out vec2 v_uv;
 void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); v_uv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }`;
 
-// ------------------------------------------------------------------ volumetric plume
-export const PLUME_FS = `#version 300 es
+// ------------------------------------------------------------------ engine flame
+// Game-style flame: three nested flat-coloured teardrops (orange / yellow /
+// white core) drawn opaque and hard-edged.  No spreading, no noise, no
+// volumetrics -- just a length that follows the throttle and a flicker.
+export const FLAME_VS = `#version 300 es
 precision highp float;
-in vec2 v_uv; out vec4 o;
-uniform mat4 u_invVP; uniform vec3 u_cam; uniform vec3 u_fwd;
-uniform highp sampler2D u_depth; uniform float u_logFar;
-uniform vec3 u_exit, u_axis, u_bend;
-uniform float u_len, u_re, u_spread, u_bulge, u_time, u_I, u_dia, u_lambda, u_pamb;
-uniform float u_hdist, u_Rj, u_Rw, u_wall, u_blast;
-uniform vec3 u_hit; uniform float u_dscale;
-uniform vec3 u_gg;
-${NOISE3}
-float jetR(float s) { return u_re * (1.0 + u_bulge * (1.0 - exp(-s / (4.0 * u_re)))) + max(s, 0.0) * u_spread; }
-// Emission (rgb) and extinction (a) of the free jet at p.
-// Luminous RP-1/LOX flame colour: incandescent soot, white-yellow when hottest.
-// Merlin (RP-1/LOX, fuel-rich): a white-hot core at the nozzle, a bright
-// yellow-orange body, deep orange at the ragged edge -- not red.
-vec3 flameColor(float h) {
-  vec3 c = mix(vec3(0.70, 0.20, 0.03), vec3(1.0, 0.48, 0.08), smoothstep(0.0, 0.3, h));
-  c = mix(c, vec3(1.0, 0.74, 0.28), smoothstep(0.25, 0.6, h));
-  c = mix(c, vec3(1.0, 0.95, 0.84), smoothstep(0.55, 0.95, h));
-  return c;
-}
-vec4 freeJet(vec3 p) {
-  vec3 q = p - u_exit;
-  float s0 = dot(q, u_axis);
-  if (s0 < -0.3 || s0 > u_len * 1.3) return vec4(0.0);
-  vec3 qb = q - u_bend * s0 * s0;
-  float s = dot(qb, u_axis);
-  float r = length(qb - u_axis * s);
-  float R = jetR(s);
-  if (r > R * 1.7 + 0.3) return vec4(0.0);
-  float sn = max(s, 0.0) / u_len;
-  float tn = fbm3l(qb * 0.6 - u_axis * u_time * 28.0);
-  float tn2 = noise3(qb * 2.2 - u_axis * u_time * 60.0);
-  float wob = (tn - 0.5) * (0.2 + 0.9 * sn) + (tn2 - 0.5) * 0.22;
-  float rn = r / max(0.05, R * 1.2 * (1.0 + wob));
-  float body = smoothstep(1.0, 0.4, rn);                       // dense flame, ragged turbulent edge
-  float start = smoothstep(-0.15, 0.1, s);
-  float tip = smoothstep(1.05, 0.55, sn + (tn - 0.5) * 0.5 + (tn2 - 0.5) * 0.15);
-  float heat = body * (1.0 - 0.5 * sn) * tip * start;
-  float Lc = u_len * 0.25 + 1.2;
-  float coreR = u_re * 0.9 * clamp(1.0 - s / Lc, 0.0, 1.0);
-  float core = smoothstep(coreR + 0.06, coreR * 0.3, r) * start;
-  float ph = fract(s / u_lambda);
-  float cellDecay = exp(-s / (Lc * 0.7)) * start;
-  float rd = u_re * 0.8 * (0.15 + 0.85 * abs(ph - 0.5) * 2.0) * clamp(1.0 - s / (Lc * 1.3), 0.0, 1.0);
-  float shock = u_dia * (smoothstep(rd + 0.04, rd * 0.3, r) * 0.7 + exp(-pow((ph - 0.58) / 0.06, 2.0)) * smoothstep(u_re * 0.6, 0.0, r) * 1.4) * cellDecay;
-  float gcut = smoothstep(0.0, 0.3 * u_Rj + 0.3, p.z);
-  float after = 0.3 + 0.7 * u_pamb;
-  float h = clamp(heat * 0.72 + core * 0.7 + shock * 0.5, 0.0, 1.0);
-  // Bright, almost white first metres of the jet (the Merlin "flame cone").
-  float cone = smoothstep(u_re * 1.6, u_re * 0.4, r) * exp(-max(s, 0.0) / (1.5 + 0.12 * u_len)) * start;
-  h = clamp(h + cone * 0.5, 0.0, 1.0);
-  vec3 em = (flameColor(h) * heat * after * 13.0 + flameColor(0.8 + 0.2 * core) * (core * 24.0 + shock * 30.0)
-             + vec3(1.0, 0.93, 0.8) * cone * 30.0) * u_I * gcut;
-  float ext = (heat * 1.8 + core * 1.5) * u_I * gcut;
-  // Soot: RP-1 burns fuel-rich; in dense air the turbulent outer shear layer
-  // carries dark smoke streaks that grow downstream (dark, not luminous).
-  float sootN = fbm3l(qb * 0.9 - u_axis * u_time * 20.0 + 7.0);
-  float shell = smoothstep(0.6, 0.9, rn) * smoothstep(1.2, 0.95, rn);
-  float soot = shell * smoothstep(0.25, 0.8, sn) * smoothstep(0.55, 0.75, sootN) * u_pamb * start;
-  em *= 1.0 - 0.3 * soot;
-  ext += soot * 0.45 * u_I * gcut;
-  // Gas-generator exhaust beside the engine: a thin, dark, lazily burning stream.
-  vec3 qg = p - u_gg;
-  float sg = dot(qg, u_axis);
-  if (sg > -0.2 && sg < u_len * 0.9) {
-    float rg = length(qg - u_axis * sg);
-    float Rg = 0.14 + 0.07 * max(sg, 0.0);
-    float gn = fbm3l(qg * 1.6 - u_axis * u_time * 16.0 + 3.0);
-    float gd = smoothstep(Rg * (1.2 + 0.6 * gn), Rg * 0.3, rg) * smoothstep(-0.2, 0.3, sg) * smoothstep(u_len * 0.9, u_len * 0.3, sg);
-    float glow = exp(-max(sg, 0.0) / 2.5);
-    em += vec3(1.0, 0.42, 0.08) * gd * glow * 5.0 * u_I * gcut;
-    ext += gd * (0.5 + 1.2 * u_pamb) * (0.4 + 0.6 * gn) * u_I * gcut;
-  }
-  return vec4(em, ext);
-}
-// Flame turned by the pad: a flat turbulent fire sheet spreading radially.
-vec4 wallJet(vec3 p) {
-  vec2 dxy = p.xy - u_hit.xy; float rho = length(dxy); float zg = p.z;
-  if (zg < 0.0 || rho > u_Rw * 1.8 + 1.0) return vec4(0.0);
-  vec2 dir = rho > 1e-3 ? dxy / rho : vec2(0.0);
-  vec3 wp = vec3((dxy - dir * u_time * 24.0) * 0.5, zg * 1.3 - u_time * 2.0);
-  float wn = fbm3l(wp), wn2 = noise3(wp * 2.4 + 11.0);
-  float delta = 0.35 * u_Rj + 0.07 * rho + 0.35;
-  float prof = smoothstep(1.0, 0.25, zg / (delta * (0.6 + 0.9 * wn)));
-  float rr = rho / max(0.5, u_Rw * (0.65 + 0.55 * wn + 0.2 * wn2));
-  float radial = smoothstep(1.0, 0.35, rr);
-  float stag = exp(-pow(rho / (u_Rj * 1.2 + 0.2), 2.0)) * smoothstep(1.0, 0.2, zg / (0.7 * u_Rj + 0.5));
-  float w = u_wall * (prof * radial * (1.0 - 0.45 * rr) + stag * 1.2);
-  float h = clamp(w * 0.85 + stag * 0.3, 0.0, 1.0);
-  vec3 em = flameColor(h) * w * 11.0 + flameColor(0.9) * stag * u_wall * 14.0;
-  return vec4(em, w * 1.6);
-}
-vec2 rayCyl(vec3 ro, vec3 rd, vec3 a, vec3 ax, float R, float L) {
-  // intersection of ray with finite cylinder [a, a+ax*L], radius R
-  vec3 oc = ro - a;
-  float card = dot(ax, rd), caoc = dot(ax, oc);
-  float A = 1.0 - card * card, B = dot(oc, rd) - caoc * card, C = dot(oc, oc) - caoc * caoc - R * R;
-  float t0 = -1e9, t1 = 1e9;
-  if (A > 1e-6) {
-    float h = B * B - A * C; if (h < 0.0) return vec2(1.0, -1.0);
-    h = sqrt(h); t0 = (-B - h) / A; t1 = (-B + h) / A;
-  } else if (C > 0.0) return vec2(1.0, -1.0);
-  // slab along the axis
-  if (abs(card) > 1e-6) {
-    float s0 = (0.0 - caoc) / card, s1 = (L - caoc) / card;
-    t0 = max(t0, min(s0, s1)); t1 = min(t1, max(s0, s1));
-  } else if (caoc < 0.0 || caoc > L) return vec2(1.0, -1.0);
-  return vec2(t0, t1);
-}
-float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+layout(location=0) in vec3 a_pos; layout(location=1) in vec3 a_nrm;
+uniform mat4 u_vp, u_model; uniform float u_len, u_rad, u_time, u_seed;
+out float v_w; out float v_s;
 void main() {
-  vec4 pw = u_invVP * vec4(v_uv * 2.0 - 1.0, 1.0, 1.0);
-  vec3 rd = normalize(pw.xyz / pw.w - u_cam);
-  ivec2 dp = ivec2(gl_FragCoord.xy * u_dscale);
-  float dS = max(max(texelFetch(u_depth, dp, 0).r, texelFetch(u_depth, dp + ivec2(1, 0), 0).r), max(texelFetch(u_depth, dp + ivec2(0, 1), 0).r, texelFetch(u_depth, dp + ivec2(1, 1), 0).r));
-  float wS = exp2(dS * u_logFar) - 1.0;
-  float tScene = wS / max(1e-4, dot(rd, u_fwd));
-  float jit = ign(gl_FragCoord.xy);
-  vec3 acc = vec3(0.0); float trans = 1.0;
-  // free jet
-  float Lb = min(u_len * 1.25, u_hdist + u_Rj + 1.0);
-  float bendMax = length(u_bend) * Lb * Lb;
-  vec2 t = rayCyl(u_cam, rd, u_exit, u_axis, jetR(Lb) * 2.2 + 0.5 + bendMax, Lb + 0.3);
-  t.x = max(t.x, 0.0); t.y = min(t.y, tScene);
-  if (t.y > t.x) {
-    const int N = 36;
-    float dt = (t.y - t.x) / float(N);
-    for (int i = 0; i < N; i++) {
-      vec3 p = u_cam + rd * (t.x + (float(i) + jit) * dt);
-      vec4 e = freeJet(p);
-      acc += e.rgb * trans * dt;
-      trans *= exp(-e.a * dt);
-    }
-  }
-  // wall jet
-  if (u_wall > 0.002) {
-    float H = 0.3 * u_Rj + 0.1 * u_Rw * 2.6 + 3.0;
-    vec2 tw = rayCyl(u_cam, rd, vec3(u_hit.xy, 0.0), vec3(0.0, 0.0, 1.0), u_Rw * 2.6 + 2.0, H);
-    tw.x = max(tw.x, 0.0); tw.y = min(tw.y, tScene);
-    if (tw.y > tw.x) {
-      const int M = 22;
-      float dt = (tw.y - tw.x) / float(M);
-      for (int i = 0; i < M; i++) {
-        vec3 p = u_cam + rd * (tw.x + (float(i) + jit) * dt);
-        vec4 e = wallJet(p);
-        acc += e.rgb * trans * dt;
-        trans *= exp(-e.a * dt);
-      }
-    }
-  }
-  float a = 1.0 - trans;
-  o = vec4(acc, a);
+  float s = a_pos.z;                                   // 0 at the nozzle exit, 1 at the tip
+  float wob = 1.0 + 0.07 * sin(u_time * 47.0 + s * 9.0 + u_seed) * smoothstep(0.1, 0.8, s);
+  vec4 w = u_model * vec4(a_pos.xy * u_rad * wob, s * u_len, 1.0);
+  v_s = s;
+  gl_Position = u_vp * w; v_w = gl_Position.w;
+}`;
+export const FLAME_FS = `#version 300 es
+precision highp float;
+in float v_w; in float v_s; out vec4 o;
+uniform highp sampler2D u_depth; uniform float u_logFar; uniform vec3 u_col; uniform float u_I;
+void main() {
+  float wS = exp2(texelFetch(u_depth, ivec2(gl_FragCoord.xy), 0).r * u_logFar) - 1.0;
+  if (v_w > wS) discard;
+  o = vec4(u_col * u_I, 1.0);
 }`;
 
 // ------------------------------------------------------------------ smoke / dust / sparks (instanced billboards)
@@ -541,6 +410,15 @@ void main() {
   float r2 = dot(v_uv, v_uv); if (r2 > 1.0) discard;
   float dS = texelFetch(u_depth, ivec2(gl_FragCoord.xy), 0).r;
   float wS = exp2(dS * u_logFar) - 1.0;
+  if (v_ex.w < -1.5) {                     // pad dust: crisp flat-shaded disc, hard edge, two-tone
+    if (v_w > wS + 0.3 * v_size) discard;
+    vec2 sd = vec2(dot(u_sun, u_camR), dot(u_sun, u_camU));
+    float lit = dot(v_uv, sd) > -0.15 * max(length(sd), 0.05) ? 1.0 : 0.7;
+    float rim = r2 > 0.78 ? 0.82 : 1.0;
+    vec3 c = v_col.rgb * (SUN_E * 0.36 * lit + hemiAmb(0.5) * 1.0 + v_plume * 0.12) * rim;
+    o = vec4(c * v_col.a, v_col.a);
+    return;
+  }
   if (v_ex.w < -0.5) {                     // spark / ember: hot point, additive
     float g = exp(-r2 * 5.0);
     float vis = step(v_w, wS + 0.2);
