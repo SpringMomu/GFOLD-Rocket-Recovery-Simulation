@@ -401,10 +401,14 @@ function spawnEffects(st, dt, P) {
       trailAcc -= Math.floor(trailAcc);
       const thin = 0.35 + 0.65 * P.pamb;
       for (let i = 0; i < n; i++) {
-        const f = Math.random() * dt, t = Math.min(0.5 + 2.5 * Math.random(), 0.8 * P.hdist);
+        // Leaves the nozzle along the exhaust axis (so it follows the gimbal),
+        // fast, and streams out past the flame tip before it slows down.
+        const f = Math.random() * dt;
         const base = V.sub(P.exit, V.mul(st.vel, f));
-        addP({ p: V.add(V.add(base, V.mul(ex, t)), [rnd(0.25), rnd(0.25), rnd(0.25)]), v: V.add(V.mul(ex, 6 + 6 * Math.random()), [rnd(1.2), rnd(1.2), rnd(1.2)]),
-          life: 2.5 + 2.5 * Math.random(), size: 0.5 + 0.4 * Math.random(), kind: 6, col: [0.8, 0.8, 0.82], a0: 0.5 * thin, heat: 0, grow: 0.7 + 0.5 * Math.random() });
+        const spd = 38 + 30 * Math.random();
+        addP({ p: V.add(V.add(base, V.mul(ex, 0.3 + 1.2 * Math.random())), [rnd(0.2), rnd(0.2), rnd(0.2)]),
+          v: V.add(V.add(V.mul(ex, spd), V.mul(st.vel, 0.5)), [rnd(1.5), rnd(1.5), rnd(1.5)]),
+          life: 1.6 + 1.6 * Math.random(), size: 0.6 + 0.5 * Math.random(), kind: 6, col: [0.82, 0.82, 0.85], a0: 0.62 * thin, heat: 0, grow: 1.2 + 0.9 * Math.random() });
       }
     }
     // Hot embers / grit ricocheting off the pad while the flame touches it.
@@ -494,11 +498,11 @@ function stepEffects(st, dt, P) {
     }
     if (s.kind === 6) {                                        // exhaust trail: the jet speed dies away, then it hangs in the air
       trailCount++;
-      const k = Math.exp(-1.6 * dt), kw = (1 - k);
+      const k = Math.exp(-1.1 * dt), kw = (1 - k);
       for (let c = 0; c < 3; c++) s.v[c] = s.v[c] * k + wind[c] * kw;
       s.p = V.add(s.p, V.mul(s.v, dt));
       if (s.p[2] < 0.3 * s.size) s.p[2] = 0.3 * s.size;
-      s.size += s.grow * dt; s.grow *= Math.exp(-0.5 * dt);
+      s.size += s.grow * dt; s.grow *= Math.exp(-0.8 * dt);
       continue;
     }
     if (s.kind === 4) {                                        // embers: ballistic with light drag
@@ -577,8 +581,9 @@ function buildParticles(eye, P) {
       if (P && P.on && P.hit) { const d = Math.hypot(s.p[0] - P.hit[0], s.p[1] - P.hit[1]), R = 4 + 0.25 * Math.min(P.hdist, 30); a *= Math.max(0, Math.min(1, (d - R) / (0.6 * R))); }
     } else if (s.kind === 6) {
       a = s.a0 * Math.min(1, s.age * 4) * (1 - life);
-      // below the nozzle, in the jet: blown away like the dust, so the ground under the engine stays visible
-      if (P && P.on && P.hit && s.p[2] < P.exit[2] - 0.3) { const d = Math.hypot(s.p[0] - P.hit[0], s.p[1] - P.hit[1]), R = 4 + 0.25 * Math.min(P.hdist, 30); a *= Math.max(0, Math.min(1, (d - R) / (0.6 * R))); }
+      // only right at the ground, under the engine: blown away like the dust, so the pad stays visible.
+      // (Higher up the jet smoke must show whichever way the thrust vector points.)
+      if (P && P.on && P.hit && P.hdist < DUST_TOP && s.p[2] < 4) { const d = Math.hypot(s.p[0] - P.hit[0], s.p[1] - P.hit[1]), R = 4 + 0.25 * Math.min(P.hdist, 30); a *= Math.max(0, Math.min(1, (d - R) / (0.6 * R))); }
     }
     else a = s.a0 * Math.min(1, s.age * 3) * Math.pow(1 - life, 1.3);
     if (s.kind === 1 && rocketAxis) {
