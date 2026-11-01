@@ -185,6 +185,11 @@ class Autopilot3D:
     lift_gain_tau = 3.0           # s, memory of that ratio
     lift_trim = True              # the planner and the glide use the lift of the booster as the attitude loop trims it
     lineup_q_max = 1500.0         # Pa: above this dynamic pressure the glide goes on until ignition (no line-up)
+    brake_floor = True            # a plan that is not being renewed, and the plan-less law, never command less vertical thrust than stopping the fall takes
+    catch_far_distance = 25.0     # m from the catch axis beyond which a catch with a stale plan puts the legs out
+    brake_floor_age = 1.0         # s without a new plan after which the one in hand is held to that floor
+    brake_margin = 1.1            # the floor asks this much more deceleration than the bare stopping need
+    brake_floor_limit = 0.97      # ... and never more than this share of the available thrust
     plan_stale_after = 5.0        # s without a new plan (nothing solves): the one in hand is not trusted any more
     fallback_pull_max = 2.0       # m/s^2: pull towards the pad of the plan-less fallback law
     # Wind profile for the predictions: the wind measured now, extrapolated
@@ -1424,6 +1429,13 @@ class Autopilot3D:
                 v_lim = -(self.gate_speed + self.sink_gain * max(0.0, h))
                 if v[2] < v_lim:
                     accel[2] += 2.0 * (v_lim - v[2])
+            if self.elapsed - self.plan.created_at > self.brake_floor_age:
+                accel = self._braking_floor(veh, r, v, m, accel)
+                if (not self.use_legs and float(veh.altitude) < self.legs_deploy_height
+                        and float(np.linalg.norm(r[:2])) > self.catch_far_distance):
+                    # a catch that is nowhere near the tower any more and a plan
+                    # that is not renewed: the way out is a landing on the legs
+                    c.legs_down = True
             # Tilt budget tightens with height (upright at contact) and with
             # dynamic pressure: there the body lift of an engines-first
             # booster opposes its tilt and outweighs the thrust's sideways
@@ -1452,12 +1464,44 @@ class Autopilot3D:
             if pn > self.fallback_pull_max:
                 pull *= self.fallback_pull_max / pn
             accel = np.array([pull[0] - 0.9 * v[0], pull[1] - 0.9 * v[1], g + a_brake + 1.5 * (vz_ref - v[2])])   # ... fed forward
+            accel = self._braking_floor(veh, r, v, m, accel)
             max_tilt = math.radians(35.0)
             center = None
             if self.aero is not None:
                 accel = self._aoa_limit(veh, accel, wind_now, max_tilt, self._aoa_table(veh), self._q_filt)
         self._mark()
         self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 and (self.plan is not None or accel[2] > 0.7 * g) else None, center=center)
+
+    def _braking_floor(self, veh, r, v, m, accel):
+        """The vertical thrust acceleration of the command, raised to what it
+        takes to stop the fall at the gate with the thrust the engine has.
+
+        A plan that is no longer renewed (nothing solves) lags behind the
+        state, and the plan-less law is sized for a fall from higher up; the
+        stopping distance does not care.  From the height ``h`` and sink
+        ``vz`` a constant deceleration ``a = (vz^2 - v_gate^2) / 2 h`` brings
+        it to the gate speed there; the thrust has to carry ``g + a`` less the
+        drag that is helping now.  Asking for that (``brake_margin`` more, up
+        to ``brake_floor_limit`` of the available thrust) keeps the booster
+        from being flown into the ground with the engine still throttled
+        back; a command that already brakes harder is left alone."""
+        if not self.brake_floor:
+            return accel
+        vz = float(v[2])
+        h_eff = float(r[2]) - self.gate_height - 0.3 * max(0.0, -vz)       # spool-up margin
+        if vz > -(self.gate_speed + 0.5) or h_eff < 0.3:
+            return accel
+        a_v = (vz * vz - self.gate_speed ** 2) / (2.0 * max(h_eff, 0.5))
+        aero = veh.last.get("aero")
+        drag_up = max(0.0, float(aero[2]) / m) if aero is not None else 0.0
+        need = self.brake_margin * a_v + G0 - drag_up
+        cap = self.brake_floor_limit * self._thrust_available(veh, float(r[2])) * self.thrust_scale / m
+        need = min(need, cap)
+        if need <= float(accel[2]):
+            return accel
+        out = np.array(accel, float)
+        out[2] = need
+        return out
 
     def _catch_hold(self, veh, r, v, dt):
         """Tower catch: hold the collar just above the arm tops, centred on the
