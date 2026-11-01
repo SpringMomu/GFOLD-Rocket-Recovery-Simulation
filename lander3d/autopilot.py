@@ -186,6 +186,8 @@ class Autopilot3D:
     lift_trim = True              # the planner and the glide use the lift of the booster as the attitude loop trims it
     lineup_q_max = 1500.0         # Pa: above this dynamic pressure the glide goes on until ignition (no line-up)
     brake_floor = True            # a plan that is not being renewed, and the plan-less law, never command less vertical thrust than stopping the fall takes
+    ground_legs_time = 5.0        # s to the ground (at the present sink) at which a given-up catch puts the legs out
+    ground_legs_height = 60.0     # m, or this height
     catch_far_distance = 25.0     # m from the catch axis beyond which a catch with a stale plan puts the legs out
     brake_floor_age = 1.0         # s without a new plan after which the one in hand is held to that floor
     brake_margin = 1.1            # the floor asks this much more deceleration than the bare stopping need
@@ -1431,10 +1433,7 @@ class Autopilot3D:
                     accel[2] += 2.0 * (v_lim - v[2])
             if self.elapsed - self.plan.created_at > self.brake_floor_age:
                 accel = self._braking_floor(veh, r, v, m, accel)
-                if (not self.use_legs and float(veh.altitude) < self.legs_deploy_height
-                        and float(np.linalg.norm(r[:2])) > self.catch_far_distance):
-                    # a catch that is nowhere near the tower any more and a plan
-                    # that is not renewed: the way out is a landing on the legs
+                if self._commit_to_ground(veh, r, v):
                     c.legs_down = True
             # Tilt budget tightens with height (upright at contact) and with
             # dynamic pressure: there the body lift of an engines-first
@@ -1457,7 +1456,10 @@ class Autopilot3D:
             # (down to the ground, not to the end of the planned burn: a tower
             # catch's end point is 30 m up, and the legs come out here)
             vz_ref = -math.sqrt(2 * a_brake * max(float(veh.altitude), 0.0)) - self.touchdown_speed
-            if float(veh.altitude) < self.legs_deploy_height:
+            if self.use_legs:
+                if float(veh.altitude) < self.legs_deploy_height:
+                    c.legs_down = True
+            elif self._commit_to_ground(veh, r, v):
                 c.legs_down = True
             pull = -0.08 * r[:2]
             pn = float(np.linalg.norm(pull))
@@ -1471,6 +1473,19 @@ class Autopilot3D:
                 accel = self._aoa_limit(veh, accel, wind_now, max_tilt, self._aoa_table(veh), self._q_filt)
         self._mark()
         self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 and (self.plan is not None or accel[2] > 0.7 * g) else None, center=center)
+
+    def _commit_to_ground(self, veh, r, v) -> bool:
+        """A tower catch that has been given up: the booster is nowhere near
+        the tower any more (``catch_far_distance``), has no plan to get back
+        with, and is about to reach the ground (``ground_legs_time`` s at the
+        present sink, or ``ground_legs_height``) -- then the legs come out so
+        that it lands instead of hitting the ground on its hull.  Not before:
+        the legs cannot be folded again, and with them out a catch is gone."""
+        if self.use_legs or float(np.linalg.norm(r[:2])) <= self.catch_far_distance:
+            return False
+        alt = float(veh.altitude)
+        t_ground = alt / max(5.0, -float(v[2]))
+        return alt < self.ground_legs_height or t_ground < self.ground_legs_time
 
     def _braking_floor(self, veh, r, v, m, accel):
         """The vertical thrust acceleration of the command, raised to what it
