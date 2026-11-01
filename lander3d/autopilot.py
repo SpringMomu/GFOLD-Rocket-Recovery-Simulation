@@ -16,6 +16,7 @@ from common.conic import golden_section_search
 
 from .aero import grid_fin_forces
 from .attitude import attitude_control
+from .glide import GlidePlanner
 from .planner import (
     KeepOutBox,
     Plan3D,
@@ -121,6 +122,20 @@ class Autopilot3D:
     boostback_min_alt = 900.0     # start a boost-back only above this height ...
     boostback_end_alt = 500.0     # ... and stop it below this one (the landing burn diverts the rest)
     aero_steer_max_deg = 15.0
+    # Convex glide (lander3d/glide.py): the engine-off fall to the landing
+    # burn ignition, steered by lift so that the burn needs no sideways
+    # flight.  The lift it may count on is glide_lift_share of the quick
+    # aerodynamic model's at aero_steer_max_deg (measured with
+    # tools/glide_lift.py: 0.23-0.39 over 1.3-13 kPa and 5-15 deg -- the grid
+    # fins deflect to hold the attitude and take part of the body lift back).
+    glide_lift_share = 0.3
+    glide_replan_period = 0.5     # s
+    glide_iterations = 2          # successive convexification passes per re-plan
+    glide_min_airspeed = 25.0     # m/s: slower, no useful lift
+    glide_tolerance = 20.0        # m of landing-burn miss the glide must get within ...
+    glide_usage_max = 0.7         # ... using at most this share of its lift (margin)
+    boostback_align_max = 4.0     # s: a boost-back that cannot line up this long ends
+    boostback_glide_miss = 60.0   # m: a boost-back starts when the glide leaves more than this
     lift_gradient_cap = 3.0       # body lift per radian of tilt, in units of thrust accel
     boostback_done_dv = 2.0       # boost-back ends when the remaining velocity change is this small
     boostback_gamma_ok = 10.0     # deg: flight path at ignition steeper than this needs no loft
@@ -187,6 +202,7 @@ class Autopilot3D:
 
     def __init__(self, aero_model=None) -> None:
         self.planner = Planner3D()
+        self.glider = GlidePlanner()
         self.aero = aero_model
         self.set_target()
         self.reset()
@@ -254,6 +270,10 @@ class Autopilot3D:
         self._bb_next = 0.0
         self._bb_reserve = 0.0
         self._ign_state = None
+        self._glide = None            # current glide plan (GlidePlan) or None
+        self._next_glide = 0.0
+        self._bb_glide_ok = False
+        self._bb_idle = 0.0           # s the boost-back has waited at zero throttle (lining up)
         self._burn_miss_now = np.zeros(2)
         self._brake_time = 0.0
         self.impact = None
@@ -584,8 +604,14 @@ class Autopilot3D:
                 best = (cost, float(k))
         self.wind_shear_est = best[1]
 
-    def _burn_need(self, veh, r, v, m, drag_up):
-        """(thrust fraction needed for a landing burn started now, burn time, thrust direction)."""
+    def _burn_need(self, veh, r, v, m, drag_up, drag_h=None):
+        """(thrust fraction needed for a landing burn started now, burn time, thrust direction).
+
+        ``drag_h``: the horizontal aerodynamic acceleration now.  What it
+        already does towards the sideways need is not asked of the engine:
+        a booster coming back fast against the wind is braked by the air, and
+        counting all of that speed as the burn's job lit the landing burn at
+        once, kilometres up and far off, leaving the glide no time."""
         g = G0
         vz = float(v[2])
         h_eff = r[2] - self.gate_height - 0.45 * max(0.0, -vz)   # engine spool-up margin
@@ -596,6 +622,16 @@ class Autopilot3D:
         a_v = max(0.1, (vz * vz - self.gate_speed ** 2) / (2.0 * h_eff))
         t_b = max(0.5, (-vz - self.gate_speed) / a_v)
         a_lat = -(6.0 * r[:2] / t_b ** 2 + 4.0 * v[:2] / t_b) * 1.0
+        # Near the top of an arc (hardly descending) the burn-time estimate
+        # is long and meaningless (its deceleration floor), and this term
+        # alone lit the burn kilometres up and far off: it counts only once
+        # the booster is really falling (none above 10 m/s, all from 30 m/s).
+        a_lat = a_lat * float(np.clip((-vz - 10.0) / 20.0, 0.0, 1.0))
+        if drag_h is not None:
+            ln = float(np.linalg.norm(a_lat))
+            if ln > 1e-9:
+                e = a_lat / ln
+                a_lat = a_lat - e * float(np.clip(np.dot(drag_h, e), 0.0, ln))
         need = np.array([a_lat[0], a_lat[1], a_v + g - drag_up / 3.0])
         frac = m * float(np.linalg.norm(need)) / self._thrust_available(veh, r[2])
         return frac, t_b, need / float(np.linalg.norm(need))
@@ -624,7 +660,7 @@ class Autopilot3D:
             rho, _, _, a = atmosphere(max(0.0, p[2]))
             f = self.aero.quick_force(u - self._wind(p[2]), None, rho, a, 0.0) if self.aero is not None else np.zeros(3)
             if stop_on_ignition and not math.isfinite(t_ign):
-                frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m))
+                frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m), f[:2] / m)
                 if frac >= self._ignition_threshold(tb, bd):
                     t_ign, t_burn = t, tb
                     ign_p, ign_v = p.copy(), u.copy()
@@ -1134,7 +1170,7 @@ class Autopilot3D:
         # ---- boost-back: put the booster over the pad at ignition.
         airspeed = float(np.linalg.norm(v - wind_now))
         drag_up = max(0.0, float(veh.last["aero"][2]) / m)
-        frac, t_burn, burn_dir = self._burn_need(veh, r, v, m, drag_up)
+        frac, t_burn, burn_dir = self._burn_need(veh, r, v, m, drag_up, np.asarray(veh.last["aero"][:2], float) / m)
         ignite_now = frac >= self._ignition_threshold(t_burn, burn_dir)
         # Boost-back only with time to come back and coast: not when the
         # landing burn is already due (then the burn itself flies the divert,
@@ -1143,7 +1179,19 @@ class Autopilot3D:
         f_v, t_v, _ = self._burn_need(veh, r * up_only, v * up_only, m, drag_up)
         burn_due = f_v >= self._ignition_threshold(t_v, up_only)
         bb_miss = float(np.interp(airspeed, self.boostback_slow_speed, (self.boostback_miss_slow, self.boostback_miss)))
-        start = miss > bb_miss and r[2] > self.boostback_min_alt and airspeed < 180.0 and not ignite_now
+        # A boost-back when the glide alone cannot bring the booster over the
+        # pad (its plan from here leaves a miss, or needs nearly all its
+        # lift); without a glide plan (no ignition ahead) by the predicted miss.
+        if not self._boostback and not self._boostback_done and self.elapsed >= self._next_glide:
+            self._glide_replan(veh, r, v, m, wind_now)
+        if self._glide is not None:
+            # (to start one -- a start of the engine -- the glide must fall
+            # clearly short even at full lift; a running one burns on until
+            # the glide manages with margin, see below)
+            glide_short = self._glide_miss(self._glide) > self.boostback_glide_miss
+        else:
+            glide_short = miss > bb_miss
+        start = glide_short and r[2] > self.boostback_min_alt and airspeed < 180.0 and not ignite_now
         hop = (not start and self.hop_min_alt < r[2] <= self.boostback_min_alt and airspeed < 100.0
                and miss > self.hop_miss and not ignite_now)
         if not self._boostback_done and (self._boostback or start or hop):
@@ -1156,6 +1204,9 @@ class Autopilot3D:
             if self.elapsed >= self._bb_next or self._bb_dv is None:
                 self._boostback_target(veh, r, v, m, wind_now)
                 self._bb_next = self.elapsed + self.boostback_solve_period
+                # would the glide manage from here if the engine stopped now?
+                g = self._glide_replan(veh, r, v, m, wind_now)
+                self._bb_glide_ok = g is not None and self._glide_ok(g)
             elif self._bb_v is not None:
                 self._bb_dv = self._bb_dv - (v - self._bb_v)   # velocity gained since the last solve
                 self._bb_v = v.copy()
@@ -1172,20 +1223,32 @@ class Autopilot3D:
             # it starts slow, so there is no retrograde phase to fly.
             d = None if dv is None or dvn <= 0.0 else dv / dvn
             braking = False
+            turned = False                      # the air has turned it engines-first: no way back
             if d is not None and airspeed > self.nose_first_speed:
                 u_air = (v - wind_now) / airspeed
                 cos_f = float(np.dot(d, u_air))
                 cap = math.radians(self.nose_first_aoa_deg)
                 if cos_f > 0.0:
-                    if float(np.dot(dv[:2], v[:2])) < 0.0 or float(np.dot(veh.axis, u_air)) < 0.0:
+                    turned = float(np.dot(veh.axis, u_air)) < 0.0
+                    if float(np.dot(dv[:2], v[:2])) < 0.0 or turned:
                         braking = True
                     elif cos_f < math.cos(cap):
                         side = d - u_air * cos_f
                         d = u_air * math.cos(cap) + side / float(np.linalg.norm(side)) * math.sin(cap)
                 elif self._hop:
                     braking = True
-            if (dv is None or dvn < self.boostback_done_dv or r[2] < self._bb_floor or burn_due
-                    or veh.propellant < self._bb_reserve or braking):
+            glide_judges = self._glide is not None and not self._hop
+            if glide_judges:
+                # the glide plan says when the boost-back has done enough
+                # (the shooting's own ends -- the remaining change small or
+                # pointing back -- read a ballistic fall without lift); it
+                # still ends if the air has turned the booster engines-first,
+                # or if it cannot line up with the burn (no thrust for
+                # boostback_align_max: waiting at zero throttle only falls)
+                done = self._bb_glide_ok or turned or self._bb_idle > self.boostback_align_max
+            else:
+                done = dv is None or dvn < self.boostback_done_dv or braking
+            if done or r[2] < self._bb_floor or burn_due or veh.propellant < self._bb_reserve:
                 self._boostback = False
                 self._boostback_done = True
             else:
@@ -1198,6 +1261,7 @@ class Autopilot3D:
                     # must then fly against)
                     thr = float(np.clip(1.1 * m * G0 / (self._thrust_available(veh, r[2]) * float(veh.axis[2])), 0.0, 1.0))
                 c.throttle = thr
+                self._bb_idle = self._bb_idle + self._dt if thr <= 0.0 else 0.0
                 self.cmd_throttle = thr
                 self.cmd_axis = d
                 self.cmd_accel = d * thr * s.thrust_sl / m
@@ -1240,8 +1304,16 @@ class Autopilot3D:
                 hz = np.array([target[0], target[1], 0.0])
                 hz /= max(1e-9, float(np.linalg.norm(hz)))
                 target = hz * math.sin(cap) + np.array([0.0, 0.0, math.cos(cap)])
-        elif sp > 25.0:
-            target = self._aero_steer(veh, r, v, m, wind_now)   # engines-first, steered by body lift
+        elif sp > self.glide_min_airspeed:
+            # the glide: engines-first, steered by the planned lift
+            if self.elapsed >= self._next_glide:
+                self._glide_replan(veh, r, v, m, wind_now)
+            g = self._glide
+            if g is not None:
+                a_des = g.lift_at(self.elapsed - g.created_at)
+                target = self._lift_attitude(veh, r, vr, m, a_des / self.glide_lift_share)
+            else:
+                target = self._aero_steer(veh, r, v, m, wind_now)   # no glide plan: zero-effort-miss
         else:
             target = np.array([0.0, 0.0, 1.0])
         self.cmd_axis = target
@@ -1256,13 +1328,125 @@ class Autopilot3D:
         while t < t_max and p[2] > 0.0:
             rho, _, _, a = atmosphere(max(0.0, p[2]))
             f = self.aero.quick_force(u - self._wind(p[2]), None, rho, a, 0.0)
-            frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m))
+            frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m), f[:2] / m)
             if frac >= self._ignition_threshold(tb, bd):
                 return t, p, u, tb
             u = u + (f / m + np.array([0.0, 0.0, -G0])) * dt
             p = p + u * dt
             t += dt
         return None
+
+    @staticmethod
+    def _glide_miss(g) -> float:
+        return float(np.linalg.norm(g.miss))
+
+    def _glide_ok(self, g) -> bool:
+        return self._glide_miss(g) <= self.glide_tolerance and g.usage <= self.glide_usage_max
+
+    def _glide_reference(self, veh, r, v, m, lift_fn, dt=0.25, t_max=200.0):
+        """Engine-off fall from (r, v) with drag and the lift ``lift_fn(t)``
+        (the previous glide plan), to the predicted landing-burn ignition:
+        ``(times, positions, velocities, t_ign, t_burn)`` or None."""
+        if self.aero is None:
+            return None
+        p, u = np.asarray(r, float).copy(), np.asarray(v, float).copy()
+        ts, ps, us = [0.0], [p.copy()], [u.copy()]
+        t = 0.0
+        while t < t_max and p[2] > 0.0:
+            rho, _, _, a = atmosphere(max(0.0, p[2] + self.h_off))
+            f = self.aero.quick_force(u - self._wind(p[2]), None, rho, a, 0.0)
+            frac, tb, bd = self._burn_need(veh, p, u, m, max(0.0, f[2] / m), f[:2] / m)
+            if frac >= self._ignition_threshold(tb, bd) and t > 0.0:
+                return np.asarray(ts), np.asarray(ps), np.asarray(us), t, tb
+            u = u + (f / m + lift_fn(t) + np.array([0.0, 0.0, -G0])) * dt
+            p = p + u * dt
+            t += dt
+            ts.append(t)
+            ps.append(p.copy())
+            us.append(u.copy())
+        return None
+
+    def _glide_replan(self, veh, r, v, m, wind_now):
+        """Re-solve the convex glide from the current state (every
+        glide_replan_period): successive convexification -- the reference is
+        the fall with the previous plan's lift, the landing-burn miss is
+        linearised about its ignition state, and the solve is repeated about
+        the new plan's own fall.  Every plan is then checked on the full
+        (nonlinear) prediction: its lift flown to the predicted ignition and
+        the burn-end miss from there (GlidePlan.miss), which is what the
+        boost-back decisions use -- the linear miss is only good near its
+        reference, and a correction of hundreds of metres is not."""
+        self._next_glide = self.elapsed + self.glide_replan_period
+        if not self.glider.available or self.aero is None:
+            self._glide = None
+            return None
+        prev = self._glide
+        if prev is not None:
+            t0 = self.elapsed - prev.created_at
+            lift_fn = lambda t: prev.lift_at(t0 + t)  # noqa: E731
+        else:
+            lift_fn = lambda t: np.zeros(3)  # noqa: E731
+        g = None
+        for _ in range(self.glide_iterations):
+            q = self._glide_solve(veh, r, v, m, wind_now, lift_fn)
+            if q is None:
+                break
+            g = q
+            lift_fn = lambda t, q=q: q.lift_at(t)  # noqa: E731
+        if g is not None:
+            # the full prediction with this lift
+            ref = self._glide_reference(veh, r, v, m, lift_fn)
+            if ref is not None:
+                g.miss = np.asarray(self._burn_miss(veh, ref[1][-1], ref[2][-1], m, wind_now)[0], float)
+            g.created_at = self.elapsed
+        self._glide = g
+        return g
+
+    def _glide_solve(self, veh, r, v, m, wind_now, lift_fn):
+        """One convex glide about the fall with ``lift_fn``."""
+        ref = self._glide_reference(veh, r, v, m, lift_fn)
+        if ref is None:
+            return None
+        ts, ps, us, t_ign, _ = ref
+        T = max(1.0, float(t_ign))
+        N = int(np.clip(round(T / 0.6), 6, self.glider.knots))
+        dtk = T / N
+        mid = (np.arange(N) + 0.5) * dtk
+        drag = np.zeros((N, 3))
+        jac = np.zeros((N, 3, 3))
+        vref = np.zeros((N, 3))
+        flow = np.zeros((N, 3))
+        lmax = np.zeros(N)
+        a_max = math.radians(self.aero_steer_max_deg)
+        for k, tk in enumerate(mid):
+            p = np.array([np.interp(tk, ts, ps[:, c]) for c in range(3)])
+            u = np.array([np.interp(tk, ts, us[:, c]) for c in range(3)])
+            vref[k] = u
+            vr = u - self._wind(p[2])
+            sp = float(np.linalg.norm(vr))
+            if sp < 1.0:
+                continue
+            w = vr / sp
+            rho, _, _, a = atmosphere(max(0.0, p[2] + self.h_off))
+            f0 = self.aero.quick_force(vr, -w, rho, a, 0.0)
+            drag[k] = f0 / m
+            D = max(0.0, -float(np.dot(f0, w))) / m
+            jac[k] = -(D / sp) * (np.eye(3) + np.outer(w, w))
+            flow[k] = -w
+            if sp >= self.glide_min_airspeed:
+                e = np.cross(w, [0.0, 0.0, 1.0] if abs(w[2]) < 0.9 else [1.0, 0.0, 0.0])
+                e /= np.linalg.norm(e)
+                df = self.aero.quick_force(vr, math.cos(a_max) * (-w) + math.sin(a_max) * e, rho, a, 0.0) - f0
+                lmax[k] = self.glide_lift_share * float(np.linalg.norm(df - w * float(np.dot(df, w)))) / m
+        x_end = np.concatenate([ps[-1], us[-1]])
+        miss0 = self._burn_miss(veh, ps[-1], us[-1], m, wind_now)[0]
+        M = np.zeros((2, 6))
+        for j, step in enumerate((5.0, 5.0, 5.0, 2.0, 2.0, 2.0)):
+            x1 = x_end.copy()
+            x1[j] += step
+            M[:, j] = (self._burn_miss(veh, x1[:3], x1[3:], m, wind_now)[0] - miss0) / step
+        return self.glider.solve(r, v, T, dict(drag=drag, jac=jac, v_ref=vref, flow=flow, lift_max=lmax,
+                                               x_end=x_end, miss=np.asarray(miss0, float), miss_jac=M))
 
     def _burn_miss(self, veh, p_ign, v_ign, m, wind_now, dt=0.2):
         """Where a (nearly) upright landing burn lit at ``(p_ign, v_ign)`` ends.
@@ -1290,19 +1474,51 @@ class Autopilot3D:
         if t_br < dt:                       # already below the envelope: low, short burn
             t_br = 0.6 * max(0.0, -vz0) / a_v
         t_br = max(t_br, 1.0)
-        p, u = p_ign.copy(), v_ign.copy()
+        p, u = np.asarray(p_ign, float).copy(), np.asarray(v_ign, float).copy()
         up = np.array([0.0, 0.0, 1.0])
-        e0 = v_ign[:2] / max(1e-6, float(np.linalg.norm(v_ign[:2])))
+        e0 = u[:2] / max(1e-6, float(np.linalg.norm(u[:2])))
+        qs, lims = self._aoa_table(veh)
+        cap = math.tan(math.radians(self.trim_max_deg)) * G0
         t = 0.0
         while t < t_br - 1e-9:
-            a_h = np.zeros(2)
+            a_aero = np.zeros(2)
+            lat = -e0 * max(0.0, float(np.dot(u[:2], e0))) / max(dt, t_br - t)
             if self.aero is not None:
-                rho, _, _, a = atmosphere(max(0.0, p[2]))
-                a_h = self.aero.quick_force(u - self._wind(p[2]), up, rho, a, 0.0)[:2] / m
-            # steady thrust decel that stops the along-track drift by t_br
-            # (drag does part of it); a cross wind is not fought with tilt
-            a_h -= e0 * max(0.0, float(np.dot(u[:2], e0))) / max(dt, t_br - t)
-            u[:2] += a_h * dt
+                vr = u - self._wind(p[2])
+                rho, _, _, a = atmosphere(max(0.0, p[2] + self.h_off))
+                a_aero = self.aero.quick_force(vr, up, rho, a, 0.0)[:2] / m
+                # As the burn really flies it: leaning into the wind to cancel
+                # the air's push (the wind trim, <= trim_max_deg), plus the
+                # steady deceleration that stops the along-track drift by
+                # t_br -- but its sideways thrust only as far as the angle of
+                # attack the air allows at this dynamic pressure (fast and
+                # high the booster drifts with the wind, slower it holds).
+                trim = -a_aero
+                tn = float(np.linalg.norm(trim))
+                if tn > cap:
+                    trim *= cap / tn
+                lat = lat + trim
+                sp = float(np.linalg.norm(vr))
+                if sp > 3.0:
+                    lim = math.radians(float(np.interp(0.5 * rho * sp * sp, qs, lims)))
+                    base = -vr / sp
+                    az = a_v + G0
+
+                    def angle(sc, lat=lat, az=az, base=base):
+                        th = np.array([sc * lat[0], sc * lat[1], az])
+                        return math.acos(max(-1.0, min(1.0, float(np.dot(th, base)) / float(np.linalg.norm(th)))))
+
+                    if angle(1.0) > lim:
+                        lo_, hi_ = 0.0, 1.0
+                        if angle(0.0) > lim:
+                            hi_ = 0.0
+                        else:
+                            for _ in range(8):
+                                mid_ = 0.5 * (lo_ + hi_)
+                                lo_, hi_ = (mid_, hi_) if angle(mid_) <= lim else (lo_, mid_)
+                            hi_ = lo_
+                        lat = lat * hi_
+            u[:2] += (a_aero + lat) * dt
             u[2] += a_v * dt
             p = p + u * dt
             t += dt
@@ -1399,8 +1615,21 @@ class Autopilot3D:
         an = float(np.linalg.norm(a_des))
         if an < 0.02:
             return base
+        return self._lift_attitude(veh, r, vr, m, a_des)
+
+    def _lift_attitude(self, veh, r, vr, m, a_des):
+        """Engines-first attitude whose body/grid-fin lift (quick model) is
+        ``a_des`` across the flow: the angle of attack by a secant on the
+        model's lift curve, up to aero_steer_max_deg."""
+        sp = float(np.linalg.norm(vr))
+        u = vr / sp
+        base = -u
+        a_des = np.asarray(a_des, float) - u * float(np.dot(a_des, u))
+        an = float(np.linalg.norm(a_des))
+        if an < 0.02 or self.aero is None:
+            return base
         e_a = a_des / an
-        rho, _, _, a_snd = atmosphere(max(0.0, r[2]))
+        rho, _, _, a_snd = atmosphere(max(0.0, r[2] + self.h_off))
         l0 = float(np.dot(self.aero.quick_force(vr, base, rho, a_snd, veh.legs), e_a))
         a_max = math.radians(self.aero_steer_max_deg)
 
