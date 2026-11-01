@@ -328,6 +328,16 @@ class Plan3D:
     sane_velocity_error = 5.0         # m/s
 
     @property
+    def flyable(self) -> bool:
+        """Fit to be flown (not to be a reference): finite, within the
+        propellant and at speeds the booster can have.  A plan that cannot
+        stop the booster in time (terminal velocity error) still says how to
+        brake as hard as the limits allow -- better to fly its first seconds
+        than the plan-less law."""
+        return bool(np.all(np.isfinite(self.v)) and np.all(np.isfinite(self.u)) and self.fuel_violation < 0.05
+                    and float(np.max(np.abs(self.v))) < 400.0)
+
+    @property
     def reaches_pad(self) -> bool:
         # Reaching the pad by breaking a physical limit (through an obstacle
         # or the ground, nose-first beyond what the air allows) does not

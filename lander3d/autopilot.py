@@ -189,6 +189,7 @@ class Autopilot3D:
     brake_floor_age = 1.0         # s without a new plan after which the one in hand is held to that floor
     brake_margin = 1.1            # the floor asks this much more deceleration than the bare stopping need
     brake_floor_limit = 0.97      # ... and never more than this share of the available thrust
+    fly_best_effort = True        # a plan that cannot stop the booster in time (but has not run away) is still flown -- not used as a reference
     net_gain_live = False         # the sideways PD feedback is converted by the net gain of a tilt also while re-planning
     plan_stale_after = 5.0        # s without a new plan (nothing solves): the one in hand is not trusted any more
     fallback_pull_max = 2.0       # m/s^2: pull towards the pad of the plan-less fallback law
@@ -1134,10 +1135,11 @@ class Autopilot3D:
         t_go = self.touchdown_time - self.elapsed
         self._plan_deadline = time.monotonic() + (self.plan_budget_short if t_go < 8.0 else self.plan_budget)
         solve = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))
-        if self.plan is not None and not self.plan.sane:
+        fit = (lambda p: p.flyable) if self.fly_best_effort else (lambda p: p.sane)
+        if self.plan is not None and not fit(self.plan):
             self.plan = None            # a runaway plan is no plan: fly the fallback law until a real one is found
         plan = solve(t_go)
-        if plan is not None and not plan.sane:
+        if plan is not None and not fit(plan):
             plan = None
         lost = plan is None or plan.terminal_position_error > 10.0
         if self.elapsed >= self._next_search and (t_go > self.retime_freeze or lost):
