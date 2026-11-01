@@ -162,6 +162,10 @@ class Autopilot3D:
     catch_hold_tilt_deg = 4.0     # tilt budget about the wind trim while holding
     catch_integral_radius = 1.0   # m: the hold's integral only builds up this close to the axis
     glide_gain = 1.5
+    frozen_kp = 0.5               # PD gains and limit of the feedback when the plan is frozen (replan off); the re-planned
+    frozen_kd = 1.6               # flight keeps 0.5 / 1.6 / 5 m/s^2 (the plan itself is renewed every 0.6 s)
+    frozen_fb_limit = 5.0
+    frozen_net_gain = True        # a frozen plan (replan off): feedback through the net-acceleration gain of a tilt (_net_gain_feedback)
     replan_enabled = True         # continuous planning (front-end switch); off: the plan in hand is flown to touchdown, no new ones
     lift_calibrate = True         # ... and scaled by the ratio of the lift measured in flight to the lift of that model
     lift_gain_tau = 3.0           # s, memory of that ratio
@@ -954,10 +958,13 @@ class Autopilot3D:
             self.phase = "LANDING BURN"
             tau = self.elapsed - self.plan.created_at
             p_ref, v_ref, u_ff = self.plan.sample(tau)
-            fb = 0.5 * (p_ref - r) + 1.6 * (v_ref - v)
+            kp, kd, lim = (0.5, 1.6, 5.0) if self.replan_enabled else (self.frozen_kp, self.frozen_kd, self.frozen_fb_limit)
+            fb = kp * (p_ref - r) + kd * (v_ref - v)
             nfb = float(np.linalg.norm(fb))
-            if nfb > 5.0:
-                fb *= 5.0 / nfb
+            if nfb > lim:
+                fb *= lim / nfb
+            if not self.replan_enabled and self.frozen_net_gain:
+                fb = self._net_gain_feedback(veh, wind_now, u_ff, fb)
             accel = u_ff + fb
             if h < self.sink_track_height:
                 # Final approach envelope (same as the planner's): if sinking
@@ -1232,6 +1239,48 @@ class Autopilot3D:
             self._lift_den += n2
         if self._lift_den > 0.5:
             self._lift_gain = float(np.clip(self._lift_num / self._lift_den, 0.3, 1.5))
+
+    def _net_gain_feedback(self, veh, wind_now, u_ff, fb):
+        """The sideways feedback of the PD loop, converted from a wish for net
+        acceleration into a thrust change.
+
+        Tilting the thrust by ``d`` moves the booster by ``u d`` sideways, and
+        the lift of its body by ``G u d`` -- against it, and at high dynamic
+        pressure by more than the thrust (the planner linearises the same
+        thing: ``G``).  So a tilt changes the net sideways acceleration by
+        only ``f = 1 + G`` of the thrust change: nothing at ``f`` near 0 (and
+        the opposite way for ``f < 0``, where plain feedback is positive
+        feedback: the booster drifts off a frozen plan until the air thins).
+        The correction is divided by ``f`` (at most x2.5), faded out towards
+        ``f = 0``, and reversed below it."""
+        fh = np.asarray(fb[:2], float)
+        n = float(np.linalg.norm(fh))
+        if n < 1e-6 or self.aero is None:
+            return fb
+        vr = veh.vel - wind_now
+        sp = float(np.linalg.norm(vr))
+        if sp < 8.0:
+            return fb
+        e = np.array([fh[0] / n, fh[1] / n, 0.0])
+        axis = np.asarray(veh.axis, float)
+        e = e - float(np.dot(e, axis)) * axis
+        en = float(np.linalg.norm(e))
+        if en < 1e-6:
+            return fb
+        e /= en
+        rho, _, _, a = atmosphere(max(0.0, float(veh.pos[2])))
+        d = math.radians(2.0)
+        a1, a2 = axis + d * e, axis - d * e
+        f1 = self._quick(veh, vr, a1 / np.linalg.norm(a1), rho, a, veh.legs)
+        f2 = self._quick(veh, vr, a2 / np.linalg.norm(a2), rho, a, veh.legs)
+        e_h = np.array([fh[0] / n, fh[1] / n, 0.0])
+        grad = float(np.dot((f1 - f2) / (2.0 * d), e_h)) / veh.mass          # m/s^2 per rad of tilt towards the correction
+        sig = max(float(np.linalg.norm(u_ff)), 3.0)
+        f = 1.0 + grad / sig
+        s = float(np.clip(1.0 / f, -2.5, 2.5)) * min(1.0, abs(f) / 0.4) if abs(f) > 1e-3 else 0.0
+        out = np.array(fb, float)
+        out[:2] = fh * s
+        return out
 
     def _quick(self, veh, vr, axis, rho, a_snd, legs):
         """``AeroModel.quick_force`` with the lift as flown (``_lift_trim``)."""

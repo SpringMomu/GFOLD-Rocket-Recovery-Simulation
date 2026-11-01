@@ -463,7 +463,7 @@ export class LandingND {
     if (final) { pad(1, "#4dff8e", 1.5, [4, 3]); pad(3, "rgba(255,180,60,0.9)", 1.2, [6, 5]); }
     if (st.tower) {
       // catch tower footprint and the two arms (top view)
-      const g = st.tower.geom, a = st.tower.arm * D2R;
+      const g = st.tower.geom, arms = st.tower.arms || [st.tower.arm, st.tower.arm];
       ctx.strokeStyle = "rgba(200,210,220,0.85)"; ctx.lineWidth = 1.5;
       ctx.beginPath();
       [[g.tower_x[0], -g.tower_half_y], [g.tower_x[1], -g.tower_half_y], [g.tower_x[1], g.tower_half_y], [g.tower_x[0], g.tower_half_y]]
@@ -471,10 +471,11 @@ export class LandingND {
       ctx.closePath(); ctx.stroke();
       ctx.strokeStyle = st.tower.mode === "OPEN" ? "rgba(200,210,220,0.85)" : "#ffb43c";
       ctx.lineWidth = Math.max(2, 2 * g.arm_half_width * k);
-      for (const sgn of [1, -1]) {
+      [1, -1].forEach((sgn, ki) => {
+        const a = arms[ki] * D2R;
         const p0 = [g.pivot[0], sgn * g.pivot[1]], p1 = [p0[0] + g.arm_length * Math.cos(a), p0[1] + sgn * g.arm_length * Math.sin(a)];
         ctx.beginPath(); ctx.moveTo(...P(...p0)); ctx.lineTo(...P(...p1)); ctx.stroke();
-      }
+      });
     }
 
     // history breadcrumbs

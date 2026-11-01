@@ -578,14 +578,15 @@ export class Scene {
   towerParts(st) {
     const tw = st.tower;
     if (!tw || !this.tower) return [];
-    const g = tw.geom, sink = tw.sink || 0, a = (tw.arm || 0) * Math.PI / 180;
+    const g = tw.geom, sink = tw.sink || 0, arms = tw.arms || [tw.arm || 0, tw.arm || 0];
     const out = this.tower.parts.map(([m, mat, c]) => [m, mat, M4.ident(), c]);
     const down = M4.translate([0, 0, -sink]);
     for (const [m, mat, c] of this.tower.carriage) out.push([m, mat, down, c]);
-    for (const sgn of [1, -1]) {
+    [1, -1].forEach((sgn, k) => {
+      const a = arms[k] * Math.PI / 180;
       const M = M4.mul(M4.translate([g.pivot[0], sgn * g.pivot[1], g.arm_top - sink]), M4.rotAxis([0, 0, 1], sgn * a));
       for (const [m, mat, c] of this.tower.arm) out.push([m, mat, M, c]);
-    }
+    });
     return out;
   }
 

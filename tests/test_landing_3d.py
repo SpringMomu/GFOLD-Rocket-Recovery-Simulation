@@ -131,3 +131,26 @@ def _fly(pos, vel, propellant=4000, t_max=260.0):
 def test_extreme_start_is_recovered(pos):
     veh = _fly(pos, (0.0, 0.0, 0.0))
     assert passed(veh, catch=False), (veh.state, veh.touchdown)
+
+
+def test_tower_arms_steer_to_an_off_centre_booster():
+    # The arms follow the barrel, each by its own angle, and close on where it
+    # actually is -- not on the catch axis.
+    from lander3d.tower import ARM_OPEN
+
+    tower = CatchTower()
+    veh = Vehicle()
+    off = (-0.8, 0.7)
+    veh.reset(position=(off[0], off[1], tower.catch_base_z + 3.0), on_pad=False)
+    veh.vel[:] = (0.0, 0.0, -0.8)
+    for _ in range(40 * 120):
+        tower.update(1.0 / 120.0, veh)
+        veh.pos[2] = tower.catch_base_z + 3.0              # hold it still above the arms
+        if tower.mode == "CLOSED":
+            break
+    a_plus, a_minus = tower.angles
+    assert tower.mode in ("CLOSING", "CLOSED") and tower.secured
+    assert a_plus < ARM_OPEN and a_minus < ARM_OPEN
+    assert abs(a_plus - a_minus) > 0.02                    # not the symmetric pose of a centred booster
+    assert all(g < 0.2 for g in tower.face_gaps(veh))
+    assert len(tower.snapshot()["arms"]) == 2
