@@ -66,6 +66,8 @@ export function event(e) {
   if (e === "ARMS CLOSING") return "筷子臂合拢";
   if (e === "CATCH CONTACT") return "挂点落上筷子臂，发动机关机";
   if (e === "WIND OFF") return "风场断开";
+  if (e === "REPLAN ON") return "持续规划：开";
+  if (e === "REPLAN OFF") return "持续规划：关，沿最后一次规划的线路飞到着陆";
   if (e === "SOLVER CFG") return "求解器设置已更新";
   if (e === "SOLVER CFG DEFAULT") return "求解器设置恢复默认";
   if ((m = e.match(/^WIND CFG (\d+)-(\d+) ([\d.]+)-([\d.]+) ([\d.]+)$/))) {

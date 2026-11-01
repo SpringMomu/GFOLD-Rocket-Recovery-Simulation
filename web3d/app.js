@@ -136,6 +136,7 @@ function command(k) {
   else if (k === ".") act("warp+");
   else if (k === "c") act("cfd_forces");
   else if (k === "y") act("wind");
+  else if (k === "replan") act("replan");
   else if (k === "f") { view.flowMode = 1 - view.flowMode; toast(view.flowMode ? "主视图气流：" + VOL_NAMES[view.volField] : "主视图气流已关闭，流场计算与风洞截面照常"); }
   else if (k === "k") { view.showTraj = !view.showTraj; toast(view.showTraj ? "实际轨迹与预测轨迹：显示" : "实际轨迹与预测轨迹：隐藏"); }
   else if (k === "b") { view.volField = (view.volField + 1) % 3; hud.tunnel.setMode(VOL_TO_TUNNEL[view.volField]); toast("显示量：" + VOL_NAMES[view.volField]); }
@@ -145,6 +146,9 @@ function command(k) {
   else if (k === "foldall") hud.foldAll();
 }
 const controls = initControls({ press, command, act });
+const helpClose = document.getElementById("helpClose");
+helpClose.addEventListener("click", (ev) => { ev.stopPropagation(); hud.toggleHelp(); });
+helpClose.addEventListener("pointerdown", (ev) => ev.stopPropagation());
 
 window.addEventListener("keydown", (ev) => {
   if (ev.target && (ev.target.tagName === "SELECT" || ev.target.tagName === "INPUT")) return;   // menu controls keep their keys
