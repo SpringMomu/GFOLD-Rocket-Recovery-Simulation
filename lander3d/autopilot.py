@@ -162,6 +162,7 @@ class Autopilot3D:
     catch_hold_tilt_deg = 4.0     # tilt budget about the wind trim while holding
     catch_integral_radius = 1.0   # m: the hold's integral only builds up this close to the axis
     glide_gain = 1.5
+    lineup_q_max = 1500.0         # Pa: above this dynamic pressure the glide goes on until ignition (no line-up)
     plan_stale_after = 5.0        # s without a new plan (nothing solves): the one in hand is not trusted any more
     fallback_pull_max = 2.0       # m/s^2: pull towards the pad of the plan-less fallback law
     # Wind profile for the predictions: the wind measured now, extrapolated
@@ -1333,7 +1334,7 @@ class Autopilot3D:
         self.cmd_accel = np.zeros(3)
         vr = v - wind_now
         sp = float(np.linalg.norm(vr))
-        if self.ignition_in < 3.0:
+        if self.ignition_in < 3.0 and float(veh.last.get("q", 0.0)) < self.lineup_q_max:
             # Line up for the landing burn: upright, plus the steady lateral
             # deceleration of _burn_miss and what removes the rest of the
             # aim-point miss (the glide has done the bulk of it).
