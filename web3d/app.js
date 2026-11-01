@@ -392,16 +392,16 @@ function spawnEffects(st, dt, P) {
         }
       }
     }
-    // Exhaust trail in flight: a thin string of small crisp puffs left in the
-    // air along the path (not near the ground, where the dust takes over, and
-    // not in the body camera, which sits beside the flame).
-    if (view.cam !== 3 && (!P.hit || P.hdist > DUST_TOP + 5) && trailCount < MAX_TRAIL) {
+    // Exhaust trail: a thin string of small crisp puffs left in the air along
+    // the path, all the way down (it goes on while the pad dust blows, the two
+    // together); not in the body camera, which sits beside the flame.
+    if (view.cam !== 3 && trailCount < MAX_TRAIL) {
       trailAcc += (0.3 + 0.7 * P.thr) * TRAIL_RATE * dt;
       const n = Math.min(Math.floor(trailAcc), MAX_TRAIL - trailCount);
       trailAcc -= Math.floor(trailAcc);
       const thin = 0.35 + 0.65 * P.pamb;
       for (let i = 0; i < n; i++) {
-        const f = Math.random() * dt, t = 0.5 + 2.5 * Math.random();
+        const f = Math.random() * dt, t = Math.min(0.5 + 2.5 * Math.random(), 0.8 * P.hdist);
         const base = V.sub(P.exit, V.mul(st.vel, f));
         addP({ p: V.add(V.add(base, V.mul(ex, t)), [rnd(0.25), rnd(0.25), rnd(0.25)]), v: V.add(V.mul(ex, 6 + 6 * Math.random()), [rnd(1.2), rnd(1.2), rnd(1.2)]),
           life: 2.5 + 2.5 * Math.random(), size: 0.5 + 0.4 * Math.random(), kind: 6, col: [0.8, 0.8, 0.82], a0: 0.5 * thin, heat: 0, grow: 0.7 + 0.5 * Math.random() });
@@ -497,6 +497,7 @@ function stepEffects(st, dt, P) {
       const k = Math.exp(-1.6 * dt), kw = (1 - k);
       for (let c = 0; c < 3; c++) s.v[c] = s.v[c] * k + wind[c] * kw;
       s.p = V.add(s.p, V.mul(s.v, dt));
+      if (s.p[2] < 0.3 * s.size) s.p[2] = 0.3 * s.size;
       s.size += s.grow * dt; s.grow *= Math.exp(-0.5 * dt);
       continue;
     }
@@ -574,7 +575,11 @@ function buildParticles(eye, P) {
       a = s.a0 * Math.min(1, (1 - life) / 0.4);
       // nothing lingers under the engine: the wall jet has already swept it away
       if (P && P.on && P.hit) { const d = Math.hypot(s.p[0] - P.hit[0], s.p[1] - P.hit[1]), R = 4 + 0.25 * Math.min(P.hdist, 30); a *= Math.max(0, Math.min(1, (d - R) / (0.6 * R))); }
-    } else if (s.kind === 6) a = s.a0 * Math.min(1, s.age * 4) * (1 - life);
+    } else if (s.kind === 6) {
+      a = s.a0 * Math.min(1, s.age * 4) * (1 - life);
+      // below the nozzle, in the jet: blown away like the dust, so the ground under the engine stays visible
+      if (P && P.on && P.hit && s.p[2] < P.exit[2] - 0.3) { const d = Math.hypot(s.p[0] - P.hit[0], s.p[1] - P.hit[1]), R = 4 + 0.25 * Math.min(P.hdist, 30); a *= Math.max(0, Math.min(1, (d - R) / (0.6 * R))); }
+    }
     else a = s.a0 * Math.min(1, s.age * 3) * Math.pow(1 - life, 1.3);
     if (s.kind === 1 && rocketAxis) {
       const q = V.sub(s.p, rocketAxis[0]), t = Math.max(0, Math.min(20, V.dot(q, rocketAxis[1])));
