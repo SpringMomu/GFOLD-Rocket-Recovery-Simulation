@@ -315,6 +315,7 @@ class Plan3D:
     limit_violation: float = 0.0      # m/s^2 outside the tilt cone / slew rate / first-knot thrust (now)
     windows: tuple | None = None      # engine burn windows it was planned with (None: free)
     lift: np.ndarray | None = None    # glide lift acceleration per interval (engine off)
+    burns: tuple | None = None        # (boost-back end, landing ignition) overrides it was planned with
     created_at: float = 0.0
 
     @property
@@ -632,11 +633,22 @@ class Planner3D:
             h_mid = np.asarray(cfg.height_ref(mid), float) if cfg.height_ref is not None else None
             d_nf = np.asarray(cfg.dir_ref(mid), float).reshape(N, 3) if cfg.dir_ref is not None else None
             last_burn = cfg.burn_windows[-1][0] if cfg.burn_windows else math.inf
+            v_nf = np.asarray(cfg.vel_ref(mid), float).reshape(N, 3) if cfg.vel_ref is not None else None
+            to_pad = np.array([cfg.target_xy[0] - r0[0], cfg.target_xy[1] - r0[1]], float)
+            to_pad = to_pad / max(1e-6, float(np.linalg.norm(to_pad)))
+            boost_end = cfg.burn_windows[0][1] if cfg.burn_windows and len(cfg.burn_windows) > 1 else (
+                0.4 * t_f if cfg.burn_windows is None else -1.0)
             for k in range(1, N + 1):
                 w = w_mid[k - 1]
                 if not np.any(w):
                     continue
-                if (d_nf is not None and float(np.dot(d_nf[k - 1], w)) < 0.0 and mid[k - 1] < last_burn - 1e-6):
+                # nose-first where the reference thrusts along the motion, or
+                # in the boost-back where the reference already flies back
+                # towards the pad fast (accelerating it further is thrust along
+                # the motion: without this the plan cannot find that attitude
+                # and creeps back at the ~25 m/s the engines-first limit allows)
+                homing = (v_nf is not None and mid[k - 1] <= boost_end and -float(np.dot(w, [to_pad[0], to_pad[1], 0.0])) > 0.5)
+                if ((homing or (d_nf is not None and float(np.dot(d_nf[k - 1], w)) < 0.0)) and mid[k - 1] < last_burn - 1e-6):
                     # Nose-first (a boost-back thrusting along the motion,
                     # grid fins stowed): the other attitude the air allows --
                     # the thrust within nose_first_aoa_deg of the motion.  The

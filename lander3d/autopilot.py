@@ -109,7 +109,8 @@ class Autopilot3D:
     time_search_evals = 9         # golden-section evaluations
     time_grow = 1.5               # longer times tried by this factor ...
     time_grow_steps = 6           # ... at most this often
-    engage_refine = 2             # re-solves about the first plan (successive convexification)
+    structure_step = 1.0          # s: local search step of the landing ignition / boost-back end
+    engage_refine = 3             # re-solves about the first plan (successive convexification)
     trust_weight = 0.01           # per (m/s)^2 s: trust region round the reference plan's velocities
     ignite_soon = 1.0             # s: a landing burn due this soon is checked against ...
     ignite_delay = 1.5            # ... the same plan lit this much later (still reaching: wait)
@@ -117,6 +118,11 @@ class Autopilot3D:
     burn_sigma_frac = 0.5         # free-plan thrust above this share of the minimum throttle counts as a burn
     nose_first_speed = 50.0       # m/s: above this a nose-first burn keeps its thrust ...
     nose_first_aoa_deg = 20.0     # ... within this of the motion (planner: PlanConfig3D.nose_first_aoa_deg)
+    # The lift the glide really gets: about half of the body/fin lift at that
+    # angle in the quick model (measured: the grid fins deflect to hold the
+    # attitude and their force takes part of it back) -- a plan counting on
+    # all of it lit the landing burn hundreds of metres short.
+    glide_lift_share = 0.5
     glide_aoa_deg = 15.0          # largest angle of attack of the glide (body + grid-fin lift)
     coast_accel = 1.0             # m/s^2: planned thrust below this is a coast (engine off)
     burn_lookahead = 3.0          # s: turn to the next burn's direction this early
@@ -199,6 +205,7 @@ class Autopilot3D:
         self.solver_fail = None       # (time, status) of the last re-plan that found no solution at all
         self._hold_bias = np.zeros(2)
         self._route = None            # reference path round the obstacles while no plan gets through
+        self._burns = None            # committed burn structure: ((boost start, end) | None, landing ignition), absolute
         self._touched = False
         self.relax = 0                # (no relaxation levels any more; kept for the front end)
         self._next_search = 0.0
@@ -335,7 +342,7 @@ class Autopilot3D:
                 e_g /= np.linalg.norm(e_g)
                 al = math.radians(self.glide_aoa_deg)
                 df = self.aero.quick_force(vr, math.cos(al) * base + math.sin(al) * e_g, rho, a, legs) - f_b
-                lmax[i] = float(np.linalg.norm(df - u * float(np.dot(df, u)))) / m
+                lmax[i] = self.glide_lift_share * float(np.linalg.norm(df - u * float(np.dot(df, u)))) / m
                 if coast:
                     # the reference coasts: engine off, engines-first into the
                     # flow (as the tracker flies it) -- aligned drag, and no
@@ -492,45 +499,73 @@ class Autopilot3D:
             vel_ref=self._vel_ref(veh), trust_weight=self.trust_weight,
         )
 
-    def _solver(self, veh, wind_now, frac, keep_out):
-        """t_f -> plan from the current state (drag predicted for that horizon)."""
+    def _solver(self, veh, wind_now, frac, keep_out, free=False):
+        """t_f -> plan from the current state (drag predicted for that
+        horizon).  ``free``: thrust anywhere in [0, max] (where the optimiser
+        wants the engine on); otherwise the committed burn structure
+        (_burn_windows: the boost-back and the landing burn, coasting at zero
+        thrust between, burning at no less than the minimum throttle), whose
+        boost-back end and landing ignition may be overridden (absolute times)."""
         r, v, m = self._state(veh)
         base = self._config(veh, frac, keep_out)
+        t_min = self.minimum_throttle * veh.spec.thrust_sl * self.thrust_scale
 
-        def solve(t_f):
+        def solve(t_f, ign=None, bend=None):
             if not t_f > 0.6:
                 return None
             cfg = dataclasses.replace(base, drag_model=self._drag_model(veh, wind_now, t_f))
-            # Two passes.  Free thrust first (0 .. max): where the optimiser
-            # wants the engine on.  Then the burns it can really have with
-            # the engine starts left (_windows) -- coasts at zero thrust,
-            # burns at least at the minimum throttle -- and that plan is flown.
-            free = self.planner.solve(r, v, m, t_f, cfg)
-            if free is None:
-                return None
-            windows = self._windows(veh, free)
-            t_min = self.minimum_throttle * veh.spec.thrust_sl * self.thrust_scale
-
-            def constrained(win):
-                q = self.planner.solve(r, v, m, t_f, dataclasses.replace(cfg, burn_windows=win, thrust_min=t_min))
-                if q is not None:
-                    q.windows = win
-                return q
-
-            p = constrained(windows)
-            left = veh.spec.max_ignitions - veh.ignitions
-            if (p is not None and not veh.engine_lit and left == 1 and len(windows) == 1
-                    and windows[0][0] < self.ignite_soon and t_f - windows[0][0] > 2.0 * self.ignite_delay):
-                # The last start (the landing burn) is about to be used: only
-                # if waiting would lose the gate (latest safe ignition) -- a
-                # burn lit early must run to the end at no less than the
-                # minimum throttle, and that is long and costly.
-                later = constrained(((windows[0][0] + self.ignite_delay, t_f),))
-                if later is not None and (later.reaches_pad or (not p.reaches_pad and self._miss(later) <= self._miss(p) + 1.0)):
-                    p = later
+            if free or self._burns is None:
+                return self.planner.solve(r, v, m, t_f, cfg)
+            win = self._burn_windows(veh, t_f, ign, bend)
+            p = self.planner.solve(r, v, m, t_f, dataclasses.replace(cfg, burn_windows=win, thrust_min=t_min))
+            if p is not None:
+                p.windows = win
+                p.burns = (bend, ign)
             return p
 
         return solve
+
+    def _burn_windows(self, veh, t_f, ign=None, bend=None):
+        """The committed burn structure as windows relative to now, as far as
+        the engine allows: a burning engine with no start left burns to the
+        end; a boost-back needs a start of its own besides the landing burn."""
+        now = self.elapsed
+        left = veh.spec.max_ignitions - veh.ignitions
+        lit = bool(veh.engine_lit)
+        if lit and left <= 0:
+            return ((0.0, t_f),)
+        boost, ign_abs = self._burns
+        if ign is not None:
+            ign_abs = ign
+        win = []
+        if boost is not None:
+            b0, b1 = boost[0], boost[1] if bend is None else bend
+            if b1 > now and (lit or left >= 2):
+                a = 0.0 if lit else max(0.0, b0 - now)
+                b = min(b1 - now, t_f - 1.0)
+                if b > a:
+                    win.append((a, b))
+        if not lit and left <= 0:
+            return ()
+        t_ign = max(0.0, ign_abs - now)
+        if lit and not win and t_ign < 0.5:
+            t_ign = 0.0                      # the landing burn is burning
+        # (lit before the landing ignition, outside the boost-back: the end of
+        # the boost-back, the throttle still running down -- it shuts down)
+        if win:
+            t_ign = max(t_ign, win[-1][1] + 0.5)
+        win.append((min(t_ign, t_f - 0.5), t_f))
+        return tuple(win)
+
+    def _commit_structure(self, veh, free):
+        """Fix the burn structure (absolute times) from a free-thrust plan."""
+        now = self.elapsed
+        w = self._windows(veh, free)
+        if not w:
+            self._burns = (None, now + free.t_f)
+            return
+        boost = (now + w[0][0], now + w[0][1]) if len(w) > 1 else None
+        self._burns = (boost, now + w[-1][0])
 
     def _windows(self, veh, free):
         """Engine burn windows for a plan, from the free-thrust plan and the
@@ -687,50 +722,78 @@ class Autopilot3D:
 
     # ------------------------------------------------------------- replan
     def _replan(self, veh, wind_now):
-        """Re-plan from the current state at the time to go; every
-        search_backoff a shorter time is tried (minimum time), and when the
-        plan does not reach the gate longer times are searched until one does."""
+        """Re-plan from the current state with the committed burn structure.
+        Every search_backoff a local search: the touchdown time, the landing
+        ignition and the boost-back end a step either way, kept when the plan
+        still reaches and J is lower (a later ignition that still reaches is
+        the latest safe one).  When the plan in hand no longer reaches, the
+        structure is found afresh from a free-thrust plan and the time
+        searched until one reaches."""
         t_go = max(0.7, self.touchdown_time - self.elapsed)
-        plan = self._solve_now(veh, wind_now, t_go)
+        solve = self._solver(veh, wind_now, self.burn_fraction, self._keep_out(veh))
+        plan = solve(t_go)
+        now = self.elapsed
+        boost, ign = self._burns if self._burns is not None else (None, None)
+        left = veh.spec.max_ignitions - veh.ignitions
+        ign_pending = ign is not None and not veh.engine_lit and left >= 1 and (boost is None or boost[1] <= now)
+        if (plan is not None and ign_pending and ign - now < self.ignite_soon and t_go > ign - now + 2.0 * self.ignite_delay):
+            # the landing burn is about to use the last start: not if it can
+            # still wait (every re-plan, not only at the searches)
+            later = solve(t_go, ign=ign + self.ignite_delay)
+            if later is not None and (later.reaches_pad or (not plan.reaches_pad and self._miss(later) <= self._miss(plan))):
+                plan = later
+                self._burns = (boost, ign + self.ignite_delay)
         if self.elapsed >= self._next_search:
-            if plan is None or not plan.reaches_pad:
-                best = self._search_time(veh, wind_now, t_go)
+            if plan is not None and plan.reaches_pad:
+                d = max(0.3, self.retime_step * t_go)
+                cands = [dict(t=t_go - d), dict(t=t_go + d)]
+                if ign is not None and (ign_pending or (boost is not None and boost[0] > now)):
+                    cands += [dict(ign=ign - self.structure_step), dict(ign=ign + self.structure_step)]
+                if boost is not None and boost[1] > now and (veh.engine_lit or left >= 2):
+                    cands += [dict(bend=boost[1] - self.structure_step), dict(bend=boost[1] + self.structure_step)]
+                for c in cands:
+                    p = solve(max(0.7, c.get("t", t_go)), ign=c.get("ign"), bend=c.get("bend"))
+                    if p is not None and p.reaches_pad and p.objective < plan.objective:
+                        plan = p
+                b_, i_ = plan.burns if getattr(plan, "burns", None) else (None, None)
+                if self._burns is not None and (b_ is not None or i_ is not None):
+                    boost, ign = self._burns
+                    self._burns = ((boost[0], b_) if (b_ is not None and boost is not None) else boost,
+                                   i_ if i_ is not None else ign)
+                self._search_fails = 0
+            else:
+                best = self._restructure(veh, wind_now, t_go)
                 self._search_fails = 0 if best is not None and best.reaches_pad else min(self._search_fails + 1, 2)
                 if best is not None:
                     plan = best
-            else:
-                d = max(0.3, self.retime_step * t_go)
-                for t in (t_go - d, t_go + d):
-                    p = self._solve_now(veh, wind_now, max(0.7, t))
-                    if p is not None and p.reaches_pad and p.objective < plan.objective:
-                        plan = p
-                self._search_fails = 0
             self._next_search = self.elapsed + self.search_backoff * 2 ** self._search_fails
         self.last_status = self.planner.last_status
-        if plan is not None and not plan.reaches_pad and self.plan is not None and self.elapsed - self.plan.created_at < 1.0 and (
-                self.plan.reaches_pad or self._miss(plan) >= self._miss(self.plan)):
-            # a re-plan that misses where the plan in hand still gets there
-            # (or misses less) is not taken: it would also become the
-            # reference the next plans are linearised about
-            plan = None
-            if self.touchdown_time - self.elapsed > 0.6:
-                return
         if plan is not None:
             self._commit(plan)
         elif self.planner.last_status not in ("Solved", "AlmostSolved"):
             # no solution at all (numerical): fly on along the last plan
             self.solver_fail = (self.elapsed, self.planner.last_status)
 
+    def _restructure(self, veh, wind_now, t_guess):
+        """The burn structure afresh: the free-thrust plan with the best J
+        (time searched), its burns as far as the engine starts allow, then
+        the time searched again with them."""
+        free = self._search_time(veh, wind_now, t_guess, free=True)
+        if free is None:
+            return None
+        self._commit_structure(veh, free)
+        return self._search_time(veh, wind_now, free.t_f, narrow=True)
+
     @staticmethod
     def _miss(p):
         return p.terminal_position_error + p.terminal_velocity_error + p.keep_out_violation + p.ground_violation
 
-    def _solve_now(self, veh, wind_now, t_f, path=None):
+    def _solve_now(self, veh, wind_now, t_f, path=None, free=False):
         """One plan from the current state for final time t_f (references --
         drag, heights, thrust directions, obstacle faces -- from the plan in
         hand, or ``path`` round the obstacles)."""
         keep_out = self._keep_out(veh, path)
-        return self._solver(veh, wind_now, self.burn_fraction, keep_out)(t_f)
+        return self._solver(veh, wind_now, self.burn_fraction, keep_out, free=free)(t_f)
 
     def solver_alert(self):
         """For the display: None, or (kind, status) -- 'fail' when the last
@@ -762,7 +825,7 @@ class Autopilot3D:
         if plan.reaches_pad:
             self._route = None          # from now on along this plan
 
-    def _search_time(self, veh, wind_now, t_guess):
+    def _search_time(self, veh, wind_now, t_guess, free=False, narrow=False):
         """Final time minimising J = propellant + time_weight t_f among plans
         that reach the gate (golden section); if none in the bracket reaches,
         longer times (x time_grow) until one does -- the search never settles
@@ -789,15 +852,18 @@ class Autopilot3D:
         ceiling = 3.0 * t_far + 30.0
         for frac in dict.fromkeys((self.burn_fraction, 0.97)):
             self.burn_fraction = frac
-            path = self._routes(veh, wind_now, frac, max(t_guess, 5.0)) if self.obstacles else None
-            lo = max(1.0, 0.35 * min(t_guess, t_far))
-            hi = 1.5 * max(t_guess, t_far) + 2.0
-            golden_section_search(lambda t, path=path: _Scored(self._solve_now(veh, wind_now, t, path), value), lo, hi,
+            path = self._routes(veh, wind_now, frac, max(t_guess, 5.0)) if self.obstacles and not narrow else None
+            if narrow:
+                lo, hi = 0.8 * t_guess, 1.3 * t_guess + 1.0
+            else:
+                lo = max(1.0, 0.35 * min(t_guess, t_far))
+                hi = 1.5 * max(t_guess, t_far) + 2.0
+            golden_section_search(lambda t, path=path: _Scored(self._solve_now(veh, wind_now, t, path, free), value), lo, hi,
                                   self.time_search_evals)
             t = hi
             while best is None and t < ceiling:
                 t = min(ceiling, t * self.time_grow + 2.0)
-                value(self._solve_now(veh, wind_now, t, path))
+                value(self._solve_now(veh, wind_now, t, path, free))
             if best is not None:
                 break
         if best is None:
@@ -1322,14 +1388,26 @@ class Autopilot3D:
         r, v, _ = self._state(veh)
         t_est = self._far_time(r, v)
         self.touchdown_time = self.elapsed + t_est
-        plan = self._search_time(veh, wind_now, t_est) if self.planner.available else None
+        self._burns = None
+        plan = None
+        if self.planner.available:
+            # 1. the free-thrust plan (where the optimiser wants the engine
+            #    on), converged: re-solved about itself a few times
+            free = self._search_time(veh, wind_now, t_est, free=True)
+            if free is not None:
+                self._commit(free)
+                for _ in range(self.engage_refine):
+                    p = self._solve_now(veh, wind_now, self.plan.t_f, free=True)
+                    if p is None:
+                        break
+                    if p.reaches_pad or not self.plan.reaches_pad:
+                        self._commit(p)
+                # 2. its burns become the committed structure (boost-back,
+                #    landing ignition), and the time is searched with them
+                self._commit_structure(veh, self.plan)
+                plan = self._search_time(veh, wind_now, self.plan.t_f, narrow=True)
         if plan is not None:
             self._commit(plan)
-            for _ in range(self.engage_refine):
-                p = self._solve_now(veh, wind_now, self.plan.t_f)
-                if p is None or not p.reaches_pad:
-                    break
-                self._commit(p)
         self._next_search = self.elapsed + self.search_backoff
         self._publish()
         self.next_replan = self.elapsed + self.burn_replan_period
