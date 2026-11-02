@@ -256,7 +256,8 @@ export class HUD {
     }
     const phase = st.phase;
     // Top strip.
-    const m = Math.floor(st.t / 60), s = st.t - 60 * m;
+    const flightTime = st.flight_time ?? st.t;
+    const m = Math.floor(flightTime / 60), s = flightTime - 60 * m;
     $("met").textContent = `T+${String(m).padStart(2, "0")}:${s.toFixed(1).padStart(4, "0")}`;
     const alt = st.alt;
     if (alt >= 10000) { $("alt").textContent = (alt / 1000).toFixed(2); $("altU").textContent = "km"; }

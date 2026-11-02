@@ -69,6 +69,8 @@ class Sim3D:
         self.keys: dict = {}
         self.throttle_manual = 0.0
         self.time = 0.0
+        self.flight_time = 0.0
+        self._flight_finished = False
         self.time_warp = 1.0
         self.paused = False
         self.trail: list = []
@@ -101,6 +103,8 @@ class Sim3D:
             self.sas = "OFF"
             self.throttle_manual = 0.0
             self.time = 0.0
+            self.flight_time = 0.0
+            self._flight_finished = False
             self.trail = [self.vehicle.pos.copy()]
             self.scenario_name = sc["name"]
             self.events = [(0.0, f"SCENARIO: {sc['name']}")]
@@ -113,6 +117,8 @@ class Sim3D:
             self.autopilot_on = False
             self.throttle_manual = 0.0
             self.time = 0.0
+            self.flight_time = 0.0
+            self._flight_finished = False
             self.trail = [self.vehicle.pos.copy()]
             self.scenario_name = "ON PAD - MANUAL"
 
@@ -265,6 +271,9 @@ class Sim3D:
                 self.tower.update(dt, v)
             v.step(dt, self.aero, self.wind)
             self.time += dt
+            if not self._flight_finished:
+                self.flight_time = self.time
+                self._flight_finished = v.state in ("LANDED", "CAUGHT")
             if len(self.trail) == 0 or np.linalg.norm(v.pos - self.trail[-1]) > 4.0:
                 self.trail.append(v.pos.copy())
             if self.tower is not None and self.tower.events:
@@ -292,7 +301,13 @@ class Sim3D:
         A slow step (a long solve) never makes the simulation fast-forward to
         catch up; it just runs slower for a moment.
         """
-        self._realtime_debt += min(0.1, max(0.0, real_seconds)) * self.time_warp
+        elapsed = min(0.1, max(0.0, real_seconds))
+        if self.autopilot._bb_cooperative and self.autopilot._bb_work is not None:
+            # Do not turn a slow guidance slice into an even larger slice on
+            # the next callback. Drop excess wall time while solving so the
+            # worker continues to service state and input messages smoothly.
+            elapsed = min(elapsed, 0.008)
+        self._realtime_debt += elapsed * self.time_warp
         self._realtime_debt = min(self._realtime_debt, 0.1 * max(1.0, self.time_warp))
         steps = 0
         while self._realtime_debt >= PHYSICS_DT and steps < MAX_STEPS_PER_CALL:
@@ -301,3 +316,11 @@ class Sim3D:
             steps += 1
         if steps >= MAX_STEPS_PER_CALL:
             self._realtime_debt = 0.0
+        if not self.paused and self.autopilot_on:
+            # Reset/input/snapshot may run on another server thread. The
+            # lock covers only this bounded slice, never a complete solve.
+            # The budget is the simulated time just advanced: guidance work per
+            # simulated second must not depend on the machine's wall speed.
+            with self.lock:
+                self.autopilot.advance_boostback_work(
+                    max(1e-3, elapsed) * max(1.0, self.time_warp))

@@ -60,7 +60,8 @@ def snapshot(sim: Sim3D) -> dict:
         trail = sim.trail
         cfd = sim.cfd
         return {
-            "t": round(sim.time, 3), "state": v.state, "crash": v.crash_reason, "scenario": sim.scenario_name,
+            "t": round(sim.time, 3), "flight_time": round(sim.flight_time, 3),
+            "state": v.state, "crash": v.crash_reason, "scenario": sim.scenario_name,
             "autopilot": sim.autopilot_on, "sas": sim.sas, "paused": sim.paused, "warp": sim.time_warp,
             "phase": ap.phase if sim.autopilot_on else "MANUAL", "visited": ap.visited, "tgo": None if not math.isfinite(ap.time_to_go) else round(ap.time_to_go, 2),
             "solver": {"status": ap.last_status, "backend": ap.planner.backend, "solves": ap.planner.solve_count,

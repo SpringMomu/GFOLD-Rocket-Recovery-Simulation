@@ -16,3 +16,7 @@ dist/
 tools/out/
 videos/
 build_and_record.log
+
+# Local diagnostics and video production files
+artifacts/
+video/
