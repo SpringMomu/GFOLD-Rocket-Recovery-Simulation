@@ -1,6 +1,6 @@
 # Vector Thrust：火箭定点回收的凸优化制导与控制
 
-> ## 🚀 在线模拟：[http://64.83.43.106:8080/](http://64.83.43.106:8080/)
+> ## 🚀 在线模拟：[https://gfold.ftmine.cn/](https://gfold.ftmine.cn/)
 >
 > 浏览器直接打开，无需安装。仿真（Python 刚体物理 + 凸优化制导）通过 Pyodide/WebAssembly 在**你自己的浏览器里**运行，服务器只发送静态文件。
 > 建议用桌面版 Chrome / Edge（需要 WebGL2）；首次加载要下载约 20 MB（gzip 后）的 Python 运行时，请稍候。
