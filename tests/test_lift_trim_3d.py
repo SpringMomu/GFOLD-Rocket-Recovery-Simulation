@@ -34,7 +34,9 @@ def test_trimmed_lift_factor_is_sane_and_can_be_switched_off():
     ap, veh = sim.autopilot, sim.vehicle
     kappa = ap._lift_trim(veh)
     assert kappa is not None
-    assert abs(kappa(0.0, 5000.0) - 1.0) < 1e-9                    # aligned with the flow: no lift to scale
+    # aligned with the flow there is no lift, so no ratio: the factor is its
+    # limit there (a default of 1 bent the lift curve over the first 10 deg)
+    assert abs(kappa(0.0, 5000.0) - kappa(math.radians(2.0), 5000.0)) < 0.02
     for deg in (5, 10, 15, 20, 30, 60, 90, 150):
         k = kappa(math.radians(deg), 5000.0)
         assert 0.0 <= k <= 1.5, (deg, k)
@@ -73,4 +75,7 @@ def test_the_lift_gain_is_calibrated_in_flight_and_stays_bounded():
     while sim.time < 30.0:
         sim.step(PHYSICS_DT)
     assert 0.3 <= ap._lift_gain <= 1.5
-    assert ap._lift_gain < 0.95          # the loop trims out more lift than the pure trim there
+    # the trimmed model, taken at the Mach number flown, is the lift flown:
+    # the calibration hardly has to correct it (at a fixed 1000 Pa -- Mach
+    # 0.27 at 12 km instead of ~0.85 -- it had to take off ~40 %)
+    assert 0.8 < ap._lift_gain < 1.2
