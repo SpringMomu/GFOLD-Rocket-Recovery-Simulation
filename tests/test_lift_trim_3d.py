@@ -79,3 +79,18 @@ def test_the_lift_gain_is_calibrated_in_flight_and_stays_bounded():
     # the calibration hardly has to correct it (at a fixed 1000 Pa -- Mach
     # 0.27 at 12 km instead of ~0.85 -- it had to take off ~40 %)
     assert 0.8 < ap._lift_gain < 1.2
+
+
+def test_the_burn_counts_the_gimbal_share_of_the_moment():
+    """With the engine running the moment the fins leave is held by the
+    gimbal, whose sideways thrust is part of the push the booster gets:
+    nothing extra while the fins hold it all (near the flow), more once they
+    saturate, never more than the gimbal's range allows."""
+    sim = _sim()
+    ap, veh = sim.autopilot, sim.vehicle
+    coast, burn = ap._lift_trim(veh), ap._lift_trim(veh, burn=True)
+    q = 5000.0
+    assert abs(burn(math.radians(2.0), q) - coast(math.radians(2.0), q)) < 0.05
+    assert burn(math.radians(30.0), q) > coast(math.radians(30.0), q) + 0.1
+    # the gimbal force is capped: at a huge dynamic pressure its share vanishes
+    assert abs(burn(math.radians(30.0), 1e7) - coast(math.radians(30.0), 1e7)) < 0.01

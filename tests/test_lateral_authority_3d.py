@@ -11,7 +11,6 @@ and the coast's prediction of where the burn ends (the glide's aim point).
 import math
 
 import numpy as np
-import pytest
 
 from lander3d.autopilot import SECANT_TILT_DEG
 from lander3d.planner import Plan3D
@@ -114,7 +113,7 @@ def test_plan_lift_linearisation_follows_the_chord_along_the_tilt():
     ap._wind_ref = (np.zeros(3), 10.0)
     ap.wind_shear_est = 1.0
     sp, sigma, m = 120.0, 14.0, veh.mass
-    trim = ap._lift_trim(veh)
+    trim = ap._lift_trim(veh, burn=True)     # (the burn: with the gimbal share of the moment)
     for deg in (6.0, 12.0, 18.0):
         assert deg > SECANT_TILT_DEG
         plan = ap.plan = _reference_plan(ap, veh, sp, deg, sigma)
@@ -136,28 +135,3 @@ def test_plan_lift_linearisation_follows_the_chord_along_the_tilt():
             assert np.allclose(d0[k], f_al, atol=1e-6)                         # ... and along the flow
             gain = 1.0 + float(G[k][0, 0])                                     # net d(sideways)/d(u_x)
             assert np.sign(gain) == np.sign(net_ref), (deg, gain, net_ref)
-
-
-def test_axis_is_aimed_so_that_the_trimmed_thrust_points_as_commanded():
-    """The gimbal holds the aerodynamic moment, so the thrust leans off the
-    axis by its trim angle; the axis is aimed the other way by that much
-    (at low dynamic pressure, where a tilt moves the booster one for one),
-    not at all on the ground, and never beyond the gimbal's range."""
-    sim = Sim3D(cfd=False)
-    sim.vehicle.reset(position=(0.0, 0.0, 60.0), velocity=(0.0, 0.0, -2.0), on_pad=False)
-    ap, veh = sim.autopilot, sim.vehicle
-    ap._dt = 1.0 / 240.0
-    veh.throttle = 0.0                              # (no new measurement: the offset is the one set here)
-    d = np.array([0.0, 0.0, 1.0])
-    ap._thr_off = np.array([math.radians(5.0), 0.0, 0.0])      # thrust 5 deg off the axis, towards +x
-    aim = ap._thrust_aim(veh, d, 9.8)
-    assert math.degrees(math.atan2(-aim[0], aim[2])) == pytest.approx(5.0, abs=0.3)
-    ap._thr_off = np.array([math.radians(30.0), 0.0, 0.0])
-    aim = ap._thrust_aim(veh, d, 9.8)
-    assert math.degrees(math.atan2(-aim[0], aim[2])) <= math.degrees(veh.spec.gimbal_limit) + 0.1
-    veh.pos[2] = veh.rest_height + 0.2                         # touching down: upright
-    ap._thr_off = np.array([math.radians(5.0), 0.0, 0.0])
-    assert np.allclose(ap._thrust_aim(veh, d, 9.8), d)
-    ap.thrust_aim = False
-    veh.pos[2] = 60.0
-    assert np.allclose(ap._thrust_aim(veh, d, 9.8), d)

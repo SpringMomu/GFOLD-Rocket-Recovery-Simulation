@@ -18,7 +18,7 @@ import numpy as np
 from common.conic import golden_section_search
 
 from .aero import grid_fin_forces
-from .attitude import FIN_MIN_EFF, attitude_control, gimbal_trim
+from .attitude import FIN_MIN_EFF, attitude_control
 from .planner import (
     KeepOutBox,
     Plan3D,
@@ -236,8 +236,6 @@ class Autopilot3D:
     trim_max_deg = 12.0
     trim_filter = 0.5             # s
     hold_bias_filter = 1.0        # s (_update_hold_bias)
-    thrust_aim = True             # aim the axis so that the thrust, off it by the gimbal's trim, points as commanded (_thrust_aim)
-    thrust_off_filter = 0.6       # s, smoothing of that trim offset
     aoa_moment_margin = 0.8       # share of the gimbal's moment the aerodynamic moment may take (_aoa_table)
     aoa_refresh = 2.0             # s between recomputations of the angle-of-attack table
     q_filter = 1.0                # s, smoothing of the dynamic pressure for that limit
@@ -539,7 +537,6 @@ class Autopilot3D:
         self._q_filt = 0.0
         self.solver_fail = None       # (time, status) of the last re-plan that found no solution at all
         self._hold_bias = np.zeros(2)
-        self._thr_off = np.zeros(3)     # thrust direction off the body axis (gimbal trim), low-passed
         self._boostback = False
         self._boostback_done = False
         self._hop = False
@@ -615,7 +612,7 @@ class Autopilot3D:
         legs = max(veh.legs, 1.0 if veh.controls.legs_down else 0.0)
         s = veh.spec
         sig_now = max(3.0, veh.throttle * s.thrust_sl / m0)
-        trim = self._lift_trim_many(veh)
+        trim = self._lift_trim_many(veh, burn=True)
 
         def model(times):
             times = np.atleast_1d(np.asarray(times, float))
@@ -849,9 +846,9 @@ class Autopilot3D:
                 axis0 = base + tilt
                 axis0 /= np.linalg.norm(axis0)
                 if broadside is not None:
-                    out[i] = self._quick(veh, vr, broadside, rho, a, legs) / m
+                    out[i] = self._quick(veh, vr, broadside, rho, a, legs, burn=True) / m
                     continue
-                f0 = self._quick(veh, vr, axis0, rho, a, legs)
+                f0 = self._quick(veh, vr, axis0, rho, a, legs, burn=True)
                 if self.aero_pred == 1:
                     out[i] = f0 / m         # drag at the reference attitude, no lift gradient
                     continue
@@ -869,12 +866,12 @@ class Autopilot3D:
                 Gi = np.zeros((3, 3))
                 for j, e in enumerate((e1, e2)):
                     ax1 = axis0 + d * e
-                    f1 = self._quick(veh, vr, ax1 / np.linalg.norm(ax1), rho, a, legs)
+                    f1 = self._quick(veh, vr, ax1 / np.linalg.norm(ax1), rho, a, legs, burn=True)
                     grad = (f1 - f0) / d / m                  # accel per radian of tilt along e
                     if j == 0 and st > 0.0:
                         wc = float(np.clip((SECANT_FADE_DEG[1] - math.degrees(math.asin(min(st, 1.0))))
                                            / (SECANT_FADE_DEG[1] - SECANT_FADE_DEG[0]), 0.0, 1.0))
-                        chord = (f0 - self._quick(veh, vr, base, rho, a, legs)) / (m * st)
+                        chord = (f0 - self._quick(veh, vr, base, rho, a, legs, burn=True)) / (m * st)
                         grad = wc * chord + (1.0 - wc) * grad
                     # Keep the net effect of a tilt in the thrust direction
                     # (limits over-reliance on a local linearisation).
@@ -1031,7 +1028,10 @@ class Autopilot3D:
         if self.aero is None:
             return
         rho, _, _, a_s = atmosphere(max(0.0, float(veh.pos[2])))
-        f = self.aero.quick_force(veh.vel - wind_now, np.array([0.0, 0.0, 1.0]), rho, a_s, veh.legs)
+        # (with the trimmed fins and the gimbal's share of the moment: the
+        # sideways force the upright booster really gets in the burn)
+        f = self.aero.quick_force(veh.vel - wind_now, np.array([0.0, 0.0, 1.0]), rho, a_s, veh.legs,
+                                  trim=self._lift_trim(veh, burn=True))
         target = -f[:2] / veh.mass
         cap = math.tan(math.radians(self.trim_max_deg)) * G0
         n = float(np.linalg.norm(target))
@@ -1072,7 +1072,8 @@ class Autopilot3D:
         z = self.gate_height + 2.0
         rho, _, _, a_s = atmosphere(max(0.0, z + self.h_off))
         vr = np.array([0.0, 0.0, -self.gate_speed]) - self._wind_plan(z)
-        t = -self.aero.quick_force(vr, np.array([0.0, 0.0, 1.0]), rho, a_s, 1.0)[:2] / veh.mass
+        t = -self.aero.quick_force(vr, np.array([0.0, 0.0, 1.0]), rho, a_s, 1.0,
+                                   trim=self._lift_trim(veh, burn=True))[:2] / veh.mass
         cap = math.tan(math.radians(self.trim_max_deg)) * G0
         n = float(np.linalg.norm(t))
         return (t * (cap / n) if n > cap else t) * self.trim_gain
@@ -1687,7 +1688,7 @@ class Autopilot3D:
         self._aoa_cache = (self.elapsed, table)
         return table
 
-    def _lift_trim(self, veh):
+    def _lift_trim(self, veh, burn=False):
         """The trimmed-lift factor ``kappa(theta, q)`` (see ``AeroModel.quick_force``).
 
         The attitude loop cancels the aerodynamic moment of the body with the
@@ -1696,17 +1697,73 @@ class Autopilot3D:
         RCS.  So the lift that really acts on the booster is that of the body
         plus the fins *as deflected for that*, not at zero deflection: it is
         taken here from the same models and the same allocation as the loop,
-        per angle ``theta`` from engines-first (every ``aoa_refresh``, at a
-        reference dynamic pressure: body and fins both scale with q, so the
-        deflection needed does not).  Below the fins' effectiveness threshold
-        the loop leaves them neutral, hence the fade with q."""
+        per angle ``theta`` from engines-first (every ``aoa_refresh``, at the
+        Mach number flown: body and fins both scale with q, so the deflection
+        needed does not).  Below the fins' effectiveness threshold the loop
+        leaves them neutral, hence the fade with q.
+
+        ``burn``: with the engine running, the moment the fins leave is held
+        by the gimbal, and that tilts the thrust off the axis -- a sideways
+        force at the engine of (residual moment) / (lever), the same for any
+        thrust, and with the dynamic pressure like the lift itself.  For the
+        guidance it is part of the air's push on the booster: the plan's
+        thrust is along the axis the tracker aims, and the sideways part the
+        gimbal spends on the moment is counted here (in a wind it points
+        downwind; engines-first off the flow it adds to the body lift
+        against the tilt).  Leaving it out, a plan expected sideways
+        accelerations the booster did not get, and it was carried off after
+        ignition and at the end.  Coasting (RCS holds the attitude) there is
+        no such force."""
         if not self.lift_trim or self.aero is None:
             return None
+        angles, kap, kb, kb0, b_refs, q_ref, n_pa, f_cap = self._trim_tables(veh)
+        gain = self._lift_gain
+
+        def kappa(theta, q):
+            th = math.degrees(theta)
+            fade = float(np.clip((float(np.interp(th, angles, b_refs)) * q / q_ref - FIN_MIN_EFF) / FIN_MIN_EFF, 0.0, 1.0))
+            k = 1.0 + fade * (float(np.interp(th, angles, kap)) - 1.0)
+            if burn:
+                g0 = float(np.interp(th, angles, kb0))
+                g = g0 + fade * (float(np.interp(th, angles, kb)) - g0)
+                lim = f_cap / max(1e-9, float(np.interp(th, angles, n_pa)) * q)
+                k += max(-lim, min(lim, g))
+            return k * gain
+
+        return kappa
+
+    def _lift_trim_many(self, veh, burn=False):
+        """Vectorised :meth:`_lift_trim` (``theta`` and ``q`` arrays)."""
+        if not self.lift_trim or self.aero is None:
+            return None
+        angles, kap, kb, kb0, b_refs, q_ref, n_pa, f_cap = self._trim_tables(veh)
+        gain = self._lift_gain
+
+        def kappa(theta, q):
+            th = np.degrees(np.asarray(theta, float))
+            q = np.asarray(q, float)
+            fade = np.clip((np.interp(th, angles, b_refs) * q / q_ref - FIN_MIN_EFF) / FIN_MIN_EFF, 0.0, 1.0)
+            k = 1.0 + fade * (np.interp(th, angles, kap) - 1.0)
+            if burn:
+                g0 = np.interp(th, angles, kb0)
+                g = g0 + fade * (np.interp(th, angles, kb) - g0)
+                lim = f_cap / np.maximum(1e-9, np.interp(th, angles, n_pa) * q)
+                k = k + np.clip(g, -lim, lim)
+            return k * gain
+
+        return kappa
+
+    def _trim_tables(self, veh):
+        """``(angles, kappa_coast, gimbal_share, gimbal_share_fins_neutral,
+        fin_effectiveness, q_ref, normal_force_per_Pa, gimbal_force_cap)`` for
+        ``_lift_trim`` (every ``aoa_refresh``): the gimbal's share is its
+        sideways force in units of the untrimmed normal force."""
         t_last, cached = self._trim_cache
         if self.elapsed - t_last < self.aoa_refresh and cached is not None:
             return cached
         s = veh.spec
         _, zc, _, _ = veh.mass_properties()
+        lever = max(0.5, zc - s.gimbal_z)
         rho, _, _, a_s = atmosphere(max(0.0, float(veh.pos[2])))
         # At the Mach number flown (the dynamic pressure does not matter --
         # body and fins both scale with it -- but the fins' and the body's
@@ -1719,7 +1776,7 @@ class Autopilot3D:
         w = np.array([1.0, 0.0, 0.0])
         v_rel = -w * sp
         angles = TRIM_ANGLES
-        kappas, b_refs = [], []
+        kap, kb, kb0, b_refs, n_pa = [], [], [], [], []
         zero3 = np.zeros(3)
         for ang in angles:
             a = math.radians(float(ang))
@@ -1734,26 +1791,35 @@ class Autopilot3D:
                 f, m, _ = grid_fin_forces(s, R, zc, zero3, v_rel, rho, a_s, d, 1.0)
                 return f, R.T @ m
 
+            def gimbal_force(tau, R=R):
+                # the sideways thrust (world) that holds the body-frame moment tau
+                return R @ np.array([-tau[1] / lever, tau[0] / lever, 0.0])
+
             f0, m0 = fins(zero3)
             B = np.zeros((3, 3))
             for j in range(3):
                 e = np.zeros(3)
                 e[j] = 0.5
                 B[:, j] = fins(e)[1] - fins(-e)[1]
+            need = -(R.T @ m_b)
             try:
-                u, *_ = np.linalg.lstsq(B, -(R.T @ m_b) - m0, rcond=1e-3)
+                u, *_ = np.linalg.lstsq(B, need - m0, rcond=1e-3)
             except np.linalg.LinAlgError:
                 u = np.zeros(3)
-            f_trim = f_b + fins(np.clip(u, -1.0, 1.0))[0]
+            f_u, m_u = fins(np.clip(u, -1.0, 1.0))
+            f_trim = f_b + f_u
             f_zero = f_b + f0
             pz = f_zero - float(np.dot(f_zero, axis)) * axis
-            pt = f_trim - float(np.dot(f_trim, axis)) * axis
             den = float(np.dot(pz, pz))
-            kappas.append(float(np.clip(np.dot(pt, pz) / den, -0.5, 1.5)) if den > 1e-3 * (q_ref * 10.0) ** 2 else math.nan)
+            ok = den > 1e-3 * (q_ref * 10.0) ** 2
+            for out, f, lo, hi in ((kap, f_trim, -0.5, 1.5), (kb, gimbal_force(need - m_u), -2.0, 2.0),
+                                   (kb0, gimbal_force(need - m0), -2.0, 2.0)):
+                pf = f - float(np.dot(f, axis)) * axis
+                out.append(float(np.clip(np.dot(pf, pz) / den, lo, hi)) if ok else math.nan)
+            n_pa.append(math.sqrt(den) / q_ref)
             b_refs.append(float(np.abs(B).max()))
         if last is not None:
             self.aero.last = last
-        kappas, b_refs = np.asarray(kappas), np.asarray(b_refs)
         # Aligned with the flow (0 and 180 deg) there is no lift, so no ratio:
         # the factor there is its limit, the nearest angle that has one.  (A
         # default of 1 there bent the lift curve over the first 10 deg -- the
@@ -1761,36 +1827,24 @@ class Autopilot3D:
         # 0.4 just off it: the planner's lift gradient then swung between
         # -12 and -34 /rad with the reference tilt, and a plan "steered" the
         # booster with a sideways force it does not have.)
-        ok = np.isfinite(kappas)
-        if not ok.any():
-            kappas = np.ones_like(kappas)
-        elif not ok.all():
-            kappas = np.interp(angles, angles[ok], kappas[ok])
-        self._trim_table = (angles, kappas, b_refs, q_ref)
-
-        def kappa(theta, q):
-            th = math.degrees(theta)
-            b = float(np.interp(th, angles, b_refs)) * q / q_ref
-            fade = float(np.clip((b - FIN_MIN_EFF) / FIN_MIN_EFF, 0.0, 1.0))
-            return (1.0 + fade * (float(np.interp(th, angles, kappas)) - 1.0)) * self._lift_gain
-
-        self._trim_cache = (self.elapsed, kappa)
-        return kappa
-
-    def _lift_trim_many(self, veh):
-        """Vectorised :meth:`_lift_trim` (``theta`` and ``q`` arrays)."""
-        trim = self._lift_trim(veh)
-        if trim is None:
-            return None
-        angles, kappas, b_refs, q_ref = self._trim_table
-
-        def kappa(theta, q):
-            th = np.degrees(np.asarray(theta, float))
-            b = np.interp(th, angles, b_refs) * np.asarray(q, float) / q_ref
-            fade = np.clip((b - FIN_MIN_EFF) / FIN_MIN_EFF, 0.0, 1.0)
-            return (1.0 + fade * (np.interp(th, angles, kappas) - 1.0)) * self._lift_gain
-
-        return kappa
+        tables = []
+        for k, default in ((kap, 1.0), (kb, 0.0), (kb0, 0.0)):
+            k = np.asarray(k)
+            good = np.isfinite(k)
+            if not good.any():
+                k = np.full_like(k, default)
+            elif not good.all():
+                k = np.interp(angles, angles[good], k[good])
+            tables.append(k)
+        # The gimbal's sideways force is at most thrust * sin(gimbal limit)
+        # (the rest of the moment goes to the RCS, which pushes nothing
+        # sideways); at the thrust that holds the weight: kappa share per
+        # unit of (q * normal force per Pa) it may reach.
+        f_cap = veh.mass * G0 * math.sin(s.gimbal_limit)
+        cached = (angles, tables[0], tables[1], tables[2], np.asarray(b_refs), q_ref, np.asarray(n_pa), f_cap)
+        self._trim_table = (angles, tables[0], np.asarray(b_refs), q_ref)
+        self._trim_cache = (self.elapsed, cached)
+        return cached
 
     def _update_lift_gain(self, veh, wind_now):
         """Calibrate the trimmed-lift model against the flight: the ratio
@@ -1861,8 +1915,8 @@ class Autopilot3D:
         rho, _, _, a = atmosphere(max(0.0, float(veh.pos[2])))
         d = math.radians(2.0)
         a1, a2 = axis + d * e, axis - d * e
-        f1 = self._quick(veh, vr, a1 / np.linalg.norm(a1), rho, a, veh.legs)
-        f2 = self._quick(veh, vr, a2 / np.linalg.norm(a2), rho, a, veh.legs)
+        f1 = self._quick(veh, vr, a1 / np.linalg.norm(a1), rho, a, veh.legs, burn=True)
+        f2 = self._quick(veh, vr, a2 / np.linalg.norm(a2), rho, a, veh.legs, burn=True)
         e_h = np.array([fh[0] / n, fh[1] / n, 0.0])
         grad = float(np.dot((f1 - f2) / (2.0 * d), e_h)) / veh.mass          # m/s^2 per rad of tilt towards the correction
         sig = max(float(np.linalg.norm(u_ff)), 3.0)
@@ -1872,9 +1926,10 @@ class Autopilot3D:
         out[:2] = fh * s
         return out
 
-    def _quick(self, veh, vr, axis, rho, a_snd, legs):
-        """``AeroModel.quick_force`` with the lift as flown (``_lift_trim``)."""
-        return self.aero.quick_force(vr, axis, rho, a_snd, legs, trim=self._lift_trim(veh))
+    def _quick(self, veh, vr, axis, rho, a_snd, legs, burn=False):
+        """``AeroModel.quick_force`` with the lift as flown (``_lift_trim``;
+        ``burn``: with the gimbal's share of the moment)."""
+        return self.aero.quick_force(vr, axis, rho, a_snd, legs, trim=self._lift_trim(veh, burn))
 
     @staticmethod
     def _aoa_limit(veh, accel, wind_now, max_tilt, table=Q_AOA_BUDGET, q_dyn=None):
@@ -1966,10 +2021,7 @@ class Autopilot3D:
             self._dir_rate = veh.R.T @ wv
             self._dir_rate[2] = 0.0
         self._dir_prev = d.copy()
-        # The body axis to aim at so that the *thrust* points along d (the
-        # gimbal is not free: it holds the aerodynamic moment, _gimbal_trim).
-        aim = self._thrust_aim(veh, d, mag)
-        err = math.acos(max(-1.0, min(1.0, float(np.dot(veh.axis, aim)))))
+        err = math.acos(max(-1.0, min(1.0, float(np.dot(veh.axis, d)))))
         t_av = self._thrust_available(veh, veh.pos[2]) * self.thrust_scale
         if err < math.radians(25.0):
             # Small attitude lag: deliver the commanded component along d.
@@ -1979,89 +2031,15 @@ class Autopilot3D:
         # ... but while the attitude still lags a sideways command, its excess
         # must not go into lift: the vertical thrust stays at most the
         # commanded vertical acceleration (no climbing on a divert).
-        thr_dir = veh.axis + self._thr_off
-        thr_dir = thr_dir / float(np.linalg.norm(thr_dir))
-        if thr_dir[2] > 0.2:
-            thr = min(thr, m * (az + 0.5) / (t_av * float(thr_dir[2])))
+        if veh.axis[2] > 0.2:
+            thr = min(thr, m * (az + 0.5) / (t_av * float(veh.axis[2])))
         if floor is not None:
             thr = max(thr, floor)
         self.cmd_throttle = thr
         self.cmd_axis = d
         c.throttle = thr
-        attitude_control(veh, aim, self.k_angle, self.k_rate, self.max_rate,
+        attitude_control(veh, d, self.k_angle, self.k_rate, self.max_rate,
                          veh.throttle < 0.25 or self._height(veh) < self.low_rcs_height, hold_roll=True)
-
-    def _thrust_aim(self, veh, d, sigma):
-        """Body-axis target for a thrust along ``d``.
-
-        The gimbal is not free to point the thrust: in a wind the air pushes
-        on the long body (and on the fins) with a moment, the fins take what
-        they can and the gimbal holds the rest -- the thrust then leans off
-        the axis by that trim angle, and it leans *downwind* (the push at the
-        engine end that holds the nose up against the wind points with it).
-        Aiming the axis at ``d`` therefore delivers less sideways thrust
-        against the wind than commanded -- 2-8 deg off in the last 100 m of
-        a 12 m/s catch, 1-5 m/s^2 -- and the booster is carried off just
-        before contact.  The trim offset is measured (the thrust direction
-        off the axis, low-passed over ``thrust_off_filter``: what the gimbal
-        holds on average, not its quick corrections) and the axis aimed that
-        much the other way, so the thrust lands on ``d``.
-
-        Turning the axis also turns the body in the flow; its lift answers
-        the tilt, so the thrust correction moves the net force only by the
-        tilt's net gain ``f = 1 + G`` (``_tilt_gain``): the axis correction is
-        the offset over ``f`` (x2.5 at most), faded out where ``f`` drops to
-        nothing (high dynamic pressure, where a tilt hardly moves the
-        booster) and towards the ground, where the booster must touch down
-        upright (TRIM_FADE, as the wind trim)."""
-        self._update_thrust_offset(veh)
-        off = self._thr_off - d * float(np.dot(self._thr_off, d))
-        on = float(np.linalg.norm(off))
-        if on < 1e-4 or not self.thrust_aim:
-            return d
-        f = self._tilt_gain(veh, -off / on, sigma)
-        gain = min(2.5, 1.0 / f) if f >= 0.4 else 2.5 * max(0.0, f) / 0.4
-        gain *= float(np.interp(self._height(veh), self._trim_fade(), (0.0, 1.0)))
-        corr = -off * gain
-        cn = float(np.linalg.norm(corr))
-        cap = math.tan(veh.spec.gimbal_limit)
-        if cn > cap:
-            corr *= cap / cn
-        aim = d + corr
-        return aim / float(np.linalg.norm(aim))
-
-    def _update_thrust_offset(self, veh):
-        """Low-passed trim lean of the thrust off the body axis (world frame),
-        while the engine burns: the gimbal angles that hold the known
-        aerodynamic moment (attitude.gimbal_trim).  Not the measured
-        deflection: that includes the gimbal's corrections, which lean the
-        thrust against every turn -- compensating them would turn the axis
-        further, and the turn would feed itself."""
-        if veh.throttle < 0.15:
-            return
-        g = gimbal_trim(veh)
-        off = veh.R @ (veh.thrust_direction_body(g) - np.array([0.0, 0.0, 1.0]))
-        ax = np.asarray(veh.axis, float)
-        off = off - ax * float(np.dot(off, ax))
-        self._thr_off += (off - self._thr_off) * min(1.0, self._dt / self.thrust_off_filter)
-
-    def _tilt_gain(self, veh, e, sigma):
-        """Net sideways gain ``1 + G`` of tilting the thrust (and the body)
-        along ``e`` (world, across the axis): the thrust's own sideways part
-        against the body lift it brings, from the trimmed model (_quick)."""
-        if self.aero is None:
-            return 1.0
-        vr = veh.vel - self._wind_ref[0]            # (the wind measured this step)
-        if float(np.linalg.norm(vr)) < 8.0:
-            return 1.0
-        axis = np.asarray(veh.axis, float)
-        rho, _, _, a = atmosphere(max(0.0, float(veh.pos[2])))
-        dlt = math.radians(2.0)
-        a1, a2 = axis + dlt * e, axis - dlt * e
-        f1 = self._quick(veh, vr, a1 / np.linalg.norm(a1), rho, a, veh.legs)
-        f2 = self._quick(veh, vr, a2 / np.linalg.norm(a2), rho, a, veh.legs)
-        grad = float(np.dot((f1 - f2) / (2.0 * dlt), e)) / veh.mass
-        return 1.0 + grad / max(float(sigma), 3.0)
 
     # ----------------------------------------------------- before ignition
     def _pre_ignition(self, veh, r, v, m, wind_now):
@@ -2246,7 +2224,7 @@ class Autopilot3D:
             return cached
         if self.aero is None:
             return None
-        trim = self._lift_trim_many(veh)
+        trim = self._lift_trim_many(veh, burn=True)
         rho, _, _, a_s = atmosphere(max(0.0, float(veh.pos[2])))
         sp = max(50.0, float(np.linalg.norm(veh.vel)))          # (the Mach number of the burn ahead)
         q_ref = 0.5 * rho * sp * sp
