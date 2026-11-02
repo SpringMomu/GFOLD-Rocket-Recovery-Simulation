@@ -46,6 +46,28 @@ SLEW_DEG = ([2.0, 30.0, 300.0], [8.0, 15.0, 25.0])   # thrust-direction slew-rat
 # (Autopilot3D._aoa_table).
 Q_AOA_BUDGET = ([300.0, 800.0, 1500.0, 2500.0, 8000.0], [115.0, 90.0, 60.0, 30.0, 12.0])
 AOA_Q_GRID = (150.0, 300.0, 500.0, 800.0, 1200.0, 2000.0, 3500.0, 6000.0, 10000.0, 20000.0)
+# Lift linearisation of the plan (Autopilot3D._drag_model): about a reference
+# tilted more than this off the flow, the slope along the tilt is the chord
+# from flight along the flow to the reference, not the local tangent.  The
+# trimmed lift is S-shaped in the tilt (the fins cancel most of it until they
+# saturate, then it grows at the full untrimmed rate): the tangent there says
+# "tilt further and the lift brakes you" where the net force at any tilt the
+# booster can hold still pushes the other way -- the plan tilted the engine
+# ever harder towards the pad, the booster sped towards it and overshot, and
+# the next plan, linearised about the larger tilt, believed it even more.
+# The chord is exact at both ends, so the sign of the net gain is the sign of
+# the net force really produced at the reference.
+# (Only engines-first: hovering in a wind the flow is nearly horizontal and
+# the upright booster ~80 deg off it, where a chord from "nose into the
+# wind" says nothing about a few degrees of lean -- the tangent again, faded
+# in over SECANT_FADE_DEG.)
+SECANT_TILT_DEG = 3.0
+SECANT_FADE_DEG = (25.0, 45.0)
+# Angles (deg from engines-first) of the trimmed-lift table (_lift_trim):
+# denser near the flow either way, where the fins' share changes fastest
+# and where the glide and the high-q burn fly.
+TRIM_ANGLES = np.array([0.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 75.0, 90.0, 105.0, 120.0,
+                        135.0, 150.0, 160.0, 165.0, 170.0, 175.0, 178.0, 180.0])
 
 
 class _AttitudeProbe:
@@ -505,6 +527,7 @@ class Autopilot3D:
         self._trim_xy = np.zeros(2)
         self._aoa_cache = (-1e9, Q_AOA_BUDGET)
         self._trim_cache = (-1e9, None)
+        self._auth_cache = (-1e9, None)
         self._trim_table = None
         self._trim_fn = None
         self._lift_gain = 1.0         # measured / modelled lift of the booster (_update_lift_gain)
@@ -698,6 +721,31 @@ class Autopilot3D:
                 g2 *= np.minimum(1.0, cap / np.maximum(n2, 1e-12))[:, None]
                 s_g = sig[grad, None]
                 Gi = (np.einsum("ni,nj->nij", g1, e1[grad]) + np.einsum("ni,nj->nij", g2, e2[grad])) / s_g[:, :, None]
+                # Along the reference tilt: the chord from the flow, not the
+                # tangent (see SECANT_TILT_DEG).
+                st = np.sqrt(np.sum(tilt[grad] * tilt[grad], axis=1))
+                sec = st > math.sin(math.radians(SECANT_TILT_DEG))
+                if np.any(sec):
+                    idx = np.flatnonzero(grad)[sec]
+                    e_t = tilt[idx] / st[sec, None]
+                    e_p = np.cross(u[idx], e_t)
+                    f_al = self.aero.quick_force_many(vr[idx], base[idx], rho[idx], a_s[idx], legs, trim=trim)
+                    chord = (f0[idx] - f_al) / (m[idx, None] * st[sec, None])
+                    wc = np.clip((SECANT_FADE_DEG[1] - np.degrees(np.arcsin(np.minimum(st[sec], 1.0))))
+                                 / (SECANT_FADE_DEG[1] - SECANT_FADE_DEG[0]), 0.0, 1.0)
+                    if np.any(wc < 1.0):
+                        axt = axis0[idx] + d * e_t
+                        axt /= np.maximum(np.sqrt(np.sum(axt * axt, axis=1)), 1e-9)[:, None]
+                        ft = self.aero.quick_force_many(vr[idx], axt, rho[idx], a_s[idx], legs, trim=trim)
+                        chord = wc[:, None] * chord + (1.0 - wc[:, None]) * (ft - f0[idx]) / d / m[idx, None]
+                    axp = axis0[idx] + d * e_p
+                    axp /= np.maximum(np.sqrt(np.sum(axp * axp, axis=1)), 1e-9)[:, None]
+                    fp = self.aero.quick_force_many(vr[idx], axp, rho[idx], a_s[idx], legs, trim=trim)
+                    g_p = (fp - f0[idx]) / d / m[idx, None]
+                    for g in (chord, g_p):
+                        gn = np.sqrt(np.sum(g * g, axis=1))
+                        g *= np.minimum(1.0, cap[sec] / np.maximum(gn, 1e-12))[:, None]
+                    Gi[sec] = (np.einsum("ni,nj->nij", chord, e_t) + np.einsum("ni,nj->nij", g_p, e_p)) / s_g[sec][:, :, None]
                 out_g = f0[grad] / mg
                 tilted = np.any(tilt[grad] != 0.0, axis=1)
                 if np.any(tilted):
@@ -804,15 +852,27 @@ class Autopilot3D:
                 if self.aero_pred == 1:
                     out[i] = f0 / m         # drag at the reference attitude, no lift gradient
                     continue
-                e1 = np.cross(u, [0.0, 0.0, 1.0] if abs(u[2]) < 0.9 else [1.0, 0.0, 0.0])
-                e1 /= np.linalg.norm(e1)
-                e2 = np.cross(u, e1)
+                st = float(np.linalg.norm(tilt))
+                if st > math.sin(math.radians(SECANT_TILT_DEG)):
+                    # along the reference tilt the chord from the flow, across it the tangent
+                    e1 = tilt / st
+                    e2 = np.cross(u, e1)
+                else:
+                    e1 = np.cross(u, [0.0, 0.0, 1.0] if abs(u[2]) < 0.9 else [1.0, 0.0, 0.0])
+                    e1 /= np.linalg.norm(e1)
+                    e2 = np.cross(u, e1)
+                    st = 0.0
                 d = math.radians(2.0)
                 Gi = np.zeros((3, 3))
-                for e in (e1, e2):
+                for j, e in enumerate((e1, e2)):
                     ax1 = axis0 + d * e
                     f1 = self._quick(veh, vr, ax1 / np.linalg.norm(ax1), rho, a, legs)
                     grad = (f1 - f0) / d / m                  # accel per radian of tilt along e
+                    if j == 0 and st > 0.0:
+                        wc = float(np.clip((SECANT_FADE_DEG[1] - math.degrees(math.asin(min(st, 1.0))))
+                                           / (SECANT_FADE_DEG[1] - SECANT_FADE_DEG[0]), 0.0, 1.0))
+                        chord = (f0 - self._quick(veh, vr, base, rho, a, legs)) / (m * st)
+                        grad = wc * chord + (1.0 - wc) * grad
                     # Keep the net effect of a tilt in the thrust direction
                     # (limits over-reliance on a local linearisation).
                     gn = float(np.linalg.norm(grad))
@@ -1645,12 +1705,17 @@ class Autopilot3D:
         s = veh.spec
         _, zc, _, _ = veh.mass_properties()
         rho, _, _, a_s = atmosphere(max(0.0, float(veh.pos[2])))
-        q_ref = 1000.0
+        # At the Mach number flown (the dynamic pressure does not matter --
+        # body and fins both scale with it -- but the fins' and the body's
+        # normal-force slopes change with Mach: at 12 km a fixed 1000 Pa was
+        # Mach 0.27 while the booster flies at ~0.85, and the factor came out
+        # half the one flown).
+        q_ref = max(1000.0, float(veh.last.get("q", 0.0)))
         sp = math.sqrt(2.0 * q_ref / rho)
         last = getattr(self.aero, "last", None)
         w = np.array([1.0, 0.0, 0.0])
         v_rel = -w * sp
-        angles = np.arange(0.0, 181.0, 10.0)
+        angles = TRIM_ANGLES
         kappas, b_refs = [], []
         zero3 = np.zeros(3)
         for ang in angles:
@@ -1681,11 +1746,23 @@ class Autopilot3D:
             pz = f_zero - float(np.dot(f_zero, axis)) * axis
             pt = f_trim - float(np.dot(f_trim, axis)) * axis
             den = float(np.dot(pz, pz))
-            kappas.append(float(np.clip(np.dot(pt, pz) / den, -0.5, 1.5)) if den > 1e-3 * (q_ref * 10.0) ** 2 else 1.0)
+            kappas.append(float(np.clip(np.dot(pt, pz) / den, -0.5, 1.5)) if den > 1e-3 * (q_ref * 10.0) ** 2 else math.nan)
             b_refs.append(float(np.abs(B).max()))
         if last is not None:
             self.aero.last = last
         kappas, b_refs = np.asarray(kappas), np.asarray(b_refs)
+        # Aligned with the flow (0 and 180 deg) there is no lift, so no ratio:
+        # the factor there is its limit, the nearest angle that has one.  (A
+        # default of 1 there bent the lift curve over the first 10 deg -- the
+        # angles the glide and the high-q burn fly at -- by 2.5x at 0 deg vs
+        # 0.4 just off it: the planner's lift gradient then swung between
+        # -12 and -34 /rad with the reference tilt, and a plan "steered" the
+        # booster with a sideways force it does not have.)
+        ok = np.isfinite(kappas)
+        if not ok.any():
+            kappas = np.ones_like(kappas)
+        elif not ok.all():
+            kappas = np.interp(angles, angles[ok], kappas[ok])
         self._trim_table = (angles, kappas, b_refs, q_ref)
 
         def kappa(theta, q):
@@ -2067,23 +2144,74 @@ class Autopilot3D:
             t += dt
         return None
 
+    def _burn_authority(self, veh):
+        """``A(q, sigma, m)``: the sideways acceleration a burn can add to
+        flight along the flow by tilting, at dynamic pressure ``q`` with the
+        thrust acceleration ``sigma``.
+
+        Tilting the thrust by ``theta`` off the flow gives it a sideways part
+        ``sigma sin(theta)``; the body (with the grid fins as the attitude loop
+        trims them, ``_lift_trim``) answers with a normal force *against* the
+        tilt, ``q l(theta) / m``.  Low down the thrust wins.  High up the
+        thrust is small (drag does most of the braking) and the lift large:
+        the sum shrinks to nothing, then turns round -- a tilt towards the
+        pad drives the booster away from it, by an amount that hangs on the
+        trim (fins saturating, the gimbal taking the rest of the moment), so
+        it cannot be steered by.  Only the useful branch counts: the largest
+        net acceleration *along* the tilt, within the angle-of-attack limit
+        (``_aoa_table``) -- zero where none is.  Same models as the planner,
+        recomputed every ``aoa_refresh``."""
+        t_last, cached = self._auth_cache
+        if cached is not None and self.elapsed - t_last < self.aoa_refresh:
+            return cached
+        if self.aero is None:
+            return None
+        trim = self._lift_trim_many(veh)
+        rho, _, _, a_s = atmosphere(max(0.0, float(veh.pos[2])))
+        sp = max(50.0, float(np.linalg.norm(veh.vel)))          # (the Mach number of the burn ahead)
+        q_ref = 0.5 * rho * sp * sp
+        th = np.radians(np.concatenate([np.arange(0.0, 30.0, 1.0), np.arange(30.0, 91.0, 5.0)]))
+        axes = np.stack([np.sin(th), np.zeros_like(th), np.cos(th)], axis=1)
+        vr = np.tile(np.array([0.0, 0.0, -sp]), (th.size, 1))
+        f = self.aero.quick_force_many(vr, axes, rho, a_s, 0.0, trim=trim)
+        lift = f[:, 0] / q_ref                                  # N per Pa along the tilt (< 0: against it)
+        table = self._aoa_table(veh)
+        sin_th = np.sin(th)
+
+        def authority(q, sigma, m):
+            # (up to 90 deg off the flow: in thin air the limit is loose, and a
+            # slow fall through a strong wind has the flow far off the vertical)
+            lim = math.radians(min(90.0, float(np.interp(q, *table))))
+            k = int(np.searchsorted(th, lim, side="right"))
+            if k <= 1:
+                return 0.0
+            net = sigma * sin_th[:k] + q * lift[:k] / m
+            return max(0.0, float(net.max()))
+
+        self._auth_cache = (self.elapsed, authority)
+        return authority
+
     def _burn_miss(self, veh, p_ign, v_ign, m, wind_now, dt=0.2, blind=False):
-        """Where a (nearly) upright landing burn lit at ``(p_ign, v_ign)`` ends.
+        """Where a landing burn lit at ``(p_ign, v_ign)`` ends.
 
         Returns ``(miss_xy, t_brake)``.  The burn brakes at constant
         deceleration until it meets the final-approach envelope (sink
         <= gate_speed + sink_gain h), and must be over the pad, without
-        sideways speed, by then: over the braking time the horizontal speed
-        is bled off at the smallest steady rate (the rest is done by the
-        drag of the upright body), so the booster drifts about
-        ``v_ign t_brake / 2``; the drag of a cross wind is leaned against, up
-        to the wind trim's tilt.  The glide and the boost-back aim this point
-        at the pad: the burn then needs only a small, steady tilt -- at high
-        dynamic pressure a tilted engines-first booster gets a body lift
-        *against* its tilt, so a large sideways correction with the engine
-        is costly and fights itself.
+        sideways speed, by then.  Sideways it is flown as the burn can fly
+        it: along the flow, drag and thrust both pull the booster towards the
+        wind's velocity; on top of that it can tilt for the sideways
+        acceleration that stops it by the end of the braking (the smallest
+        steady rate), but only as far as tilting gives one
+        (``_burn_authority``) -- at high dynamic pressure that is nothing,
+        and the booster drifts until the air has thinned out of the way.
+        A sideways speed left at the end is braked at the authority there.
+        The glide and the boost-back aim this point at the pad: the glide,
+        engines-first without thrust, steers by lift where the burn could
+        not, so the sideways error is taken out before ignition instead of
+        being left to a burn that only appears to correct it (a tilt
+        towards the pad that the body lift turns into a push away).
 
-        ``blind``: in still air (the boost-back), without the wind trim."""
+        ``blind``: in still air (the boost-back)."""
         h0, vz0 = float(p_ign[2]) - self.gate_height, float(v_ign[2])
         a_v = max(0.5, (vz0 ** 2 - self.gate_speed ** 2) / (2.0 * max(1.0, h0)))
         # Braking time: the constant-deceleration profile sqrt(2 a_v h)
@@ -2097,36 +2225,39 @@ class Autopilot3D:
             t_br = 0.6 * max(0.0, -vz0) / a_v
         t_br = max(t_br, 1.0)
         p, u = p_ign.copy(), v_ign.copy()
-        up = np.array([0.0, 0.0, 1.0])
-        e0 = v_ign[:2] / max(1e-6, float(np.linalg.norm(v_ign[:2])))
+        auth = self._burn_authority(veh)
+        a_end = math.inf
         t = 0.0
         while t < t_br - 1e-9:
-            a_h = np.zeros(2)
+            base = np.zeros(2)
+            a_max = math.inf
             if self.aero is not None:
                 rho, _, _, a = atmosphere(max(0.0, p[2]))
                 wv = np.zeros(3) if blind else self._wind(p[2])
-                a_h = self.aero.quick_force(u - wv, up, rho, a, 0.0)[:2] / m
-                # The burn leans into the wind (the wind trim; the plan's
-                # sideways-effort cost does not charge thrust that only cancels
-                # drag), up to ``trim_max_deg`` of tilt of a thrust that carries
-                # g + a_v vertically: only the drag beyond that drifts the
-                # booster.  Without this the boost-back aims far upwind of the
-                # pad to make up the whole drift of the burn (1-6 m/s^2 of
-                # drag in 12-30 m/s of wind over ~25 s: hundreds of metres) --
-                # in a strong wind it chases a velocity change that is not
-                # needed (-580 m/s instead of -170 m/s), and the booster is
-                # never over the pad at ignition.
-                n_h = float(np.linalg.norm(a_h))
-                cap = self.trim_gain * math.tan(math.radians(self.trim_max_deg)) * (G0 + a_v)
-                if n_h > 1e-9 and not blind:
-                    a_h *= max(0.0, n_h - cap) / n_h
-            # steady thrust decel that stops the along-track drift by t_br
-            # (drag does part of it)
-            a_h -= e0 * max(0.0, float(np.dot(u[:2], e0))) / max(dt, t_br - t)
-            u[:2] += a_h * dt
+                vr = u - wv
+                sp = float(np.linalg.norm(vr))
+                if sp > 1.0:
+                    q = 0.5 * rho * sp * sp
+                    ax = -vr / sp                               # engines-first, along the flow
+                    f = self.aero.quick_force(vr, ax, rho, a, 0.0)
+                    sigma = max(0.0, (a_v + G0 - f[2] / m) / max(0.2, float(ax[2])))
+                    base = f[:2] / m + sigma * ax[:2]
+                    if auth is not None:
+                        a_max = auth(q, sigma, m)
+            want = -u[:2] / max(dt, t_br - t)
+            c = want - base
+            cn = float(np.linalg.norm(c))
+            if cn > a_max:
+                c *= a_max / cn
+            a_end = a_max
+            u[:2] += (base + c) * dt
             u[2] += a_v * dt
             p = p + u * dt
             t += dt
+        vh = float(np.linalg.norm(u[:2]))
+        if vh > 0.1 and math.isfinite(a_end):
+            # what is left, braked at the authority of the final approach
+            p[:2] += u[:2] * vh / (2.0 * max(a_end, 0.5))
         return p[:2], t_br
 
     def _boostback_target(self, veh, r, v, m, wind_now):
