@@ -66,6 +66,7 @@ SECANT_FADE_DEG = (25.0, 45.0)
 # Angles (deg from engines-first) of the trimmed-lift table (_lift_trim):
 # denser near the flow either way, where the fins' share changes fastest
 # and where the glide and the high-q burn fly.
+USEFUL_TILT_MIN_DEG = 3.0      # deg off the flow always allowed (_useful_tilt_limit)
 TRIM_ANGLES = np.array([0.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 75.0, 90.0, 105.0, 120.0,
                         135.0, 150.0, 160.0, 165.0, 170.0, 175.0, 178.0, 180.0])
 
@@ -219,6 +220,7 @@ class Autopilot3D:
     # vehicle.Wind: 0 = the same at every height, 1 = the standard log law)
     # is fitted to the winds measured on the way down; with little height
     # spread in the samples the prior k = 1 wins.
+    wind_gust_filter = 8.0        # s, smoothing of the measured wind for the predictions (gusts out)
     wind_sample_period = 0.25     # s
     wind_memory = 60.0            # s, e-folding age of the samples
     wind_shear_prior_weight = 0.003   # (shapes of nearby k differ little: a stronger prior hides real shear)
@@ -236,6 +238,14 @@ class Autopilot3D:
     trim_max_deg = 12.0
     trim_filter = 0.5             # s
     hold_bias_filter = 1.0        # s (_update_hold_bias)
+    # Share of that sideways authority the coast's aim point (_burn_miss)
+    # counts on: the plan never holds the largest useful tilt in one
+    # direction for the whole burn (it also steers the other way and brakes
+    # vertically, and brakes late, when it is cheapest) -- measured ~0.5-0.9
+    # m/s^2 against 1-2 m/s^2 of authority at 4-7 kPa in a 12 m/s wind, and
+    # the booster crossed the pad at ~10 m/s.  The rest is left to the glide.
+    burn_authority_share = 0.5
+    useful_tilt = True            # cut the angle-of-attack limit to the tilt that still helps sideways (_useful_tilt_limit)
     aoa_moment_margin = 0.8       # share of the gimbal's moment the aerodynamic moment may take (_aoa_table)
     aoa_refresh = 2.0             # s between recomputations of the angle-of-attack table
     q_filter = 1.0                # s, smoothing of the dynamic pressure for that limit
@@ -520,6 +530,7 @@ class Autopilot3D:
         self.burn_fraction = self.burn_fraction_nominal
         self.thrust_scale = 1.0       # measured / modelled engine thrust (accelerometer estimate)
         self._wind_ref = (np.zeros(3), 10.0)
+        self._w10 = None                # gust-filtered 10 m equivalent of the measured wind (_update_w10)
         self._wind_samples: list = []   # (time, height, wind x, wind y)
         self._next_wind_sample = 0.0
         self._next_shear_fit = 0.0
@@ -1000,18 +1011,35 @@ class Autopilot3D:
 
     def _wind(self, z):
         """Wind assumed at height ``z`` (planner coordinates) for the
-        predictions: the wind measured now, scaled with the estimated profile."""
-        w, z_now = self._wind_ref
-        k = self.wind_shear_est
-        shape = float(self._profile(z + self.h_off, k) / self._profile(z_now, k))
-        return w * min(6.0, shape)
+        predictions: the measured wind as its 10 m equivalent, without the
+        gusts (``_w10``), scaled with the estimated profile."""
+        return self._w10_now() * float(self._profile(z + self.h_off, self.wind_shear_est))
 
     def _wind_many(self, z):
         """Vectorised :meth:`_wind` over an array of heights."""
+        return self._w10_now() * self._profile(np.asarray(z, float) + self.h_off, self.wind_shear_est)[:, None]
+
+    def _w10_now(self):
+        if self._w10 is None:
+            w, z_now = self._wind_ref
+            return np.asarray(w, float) / float(self._profile(z_now, self.wind_shear_est))
+        return self._w10
+
+    def _update_w10(self, wind_now, dt):
+        """Low-passed 10 m equivalent of the measured wind (``wind_gust_filter``).
+
+        The predictions carry the wind to every height of the coast and the
+        burn; a gust is a change in time, not a profile.  Scaling the wind
+        measured this instant, gust and all, a 1.3 m/s gust swing in the last
+        two seconds of the coast moved the predicted end of the burn by 15 m
+        (it drifts with the wind for 12 s and more) -- too late for the glide
+        to take out, and the booster was lit off its mark."""
         w, z_now = self._wind_ref
-        k = self.wind_shear_est
-        shape = self._profile(np.asarray(z, float) + self.h_off, k) / self._profile(z_now, k)
-        return w * np.minimum(6.0, shape)[:, None]
+        w10 = np.asarray(w, float) / float(self._profile(z_now, self.wind_shear_est))
+        if self._w10 is None:
+            self._w10 = w10
+        else:
+            self._w10 = self._w10 + (w10 - self._w10) * min(1.0, dt / self.wind_gust_filter)
 
     def _wind_plan(self, z):
         """The wind the planner's predictions assume at height ``z``: the
@@ -1392,6 +1420,7 @@ class Autopilot3D:
         self._dt = dt
         self._wind_ref = (np.asarray(wind_now, float).copy(), max(0.5, float(veh.altitude)))
         self._update_wind_profile(veh, wind_now)
+        self._update_w10(wind_now, dt)
         self._update_lift_gain(veh, wind_now)
         s = veh.spec
         r, v, m = self._state(veh)
@@ -1496,7 +1525,11 @@ class Autopilot3D:
             if self.elapsed - self.plan.created_at > self.brake_floor_age:
                 accel = self._braking_floor(veh, r, v, m, accel)
                 if (not self.use_legs and float(veh.altitude) < self.legs_deploy_height
+                        and self.elapsed - self.plan.created_at > 0.5 * self.plan_stale_after
                         and float(np.linalg.norm(r[:2])) > self.catch_far_distance):
+                    # (really no new plan: with the planner on its own thread a
+                    # plan a second old is just the pipeline, and a wide swing
+                    # past the tower put the legs out for nothing)
                     # a catch that is nowhere near the tower any more and a plan
                     # that is not renewed: the way out is a landing on the legs
                     c.legs_down = True
@@ -1684,9 +1717,54 @@ class Autopilot3D:
                 a0, a1 = angles[j - 1], angles[j]
                 r0, r1 = 1.0 / q_max[j - 1], 1.0 / q_max[j]
                 out.append(float(a0 + (a1 - a0) * (1.0 / q - r0) / max(r1 - r0, 1e-12)))
+        out = self._useful_tilt_limit(veh, out)
         table = (AOA_Q_GRID, tuple(out))
         self._aoa_cache = (self.elapsed, table)
         return table
+
+    def _useful_tilt_limit(self, veh, limits):
+        """The angle-of-attack limits ``limits`` (per AOA_Q_GRID), cut to the
+        angles at which tilting still helps.
+
+        Tilting the thrust ``theta`` off the flow gives it ``sigma sin(theta)``
+        sideways; the body answers with its lift (trimmed fins and the
+        gimbal's share of the moment, ``_lift_trim(burn=True)``) against the
+        tilt.  The net sideways acceleration along the tilt grows with the
+        tilt only up to a peak; beyond it more tilt gives less, and then the
+        lift wins and pushes the booster the other way -- by an amount that
+        hangs on the fins saturating and the gimbal's range, which no plan
+        can count on.  A plan that went there (tilting towards the pad and
+        expecting the lift to brake it, -5 to -11 m/s^2 predicted, +2.5
+        measured towards the pad: the booster sped past it) did exactly what
+        the engine-towards-the-target-but-drifting-away complaint describes.
+        So the usable angle is the peak (at the thrust that holds the
+        weight); where no tilt helps at all (high dynamic pressure, drag
+        doing most of the braking), the burn flies along the flow and
+        drifts -- the coast takes that out beforehand (``_burn_miss`` sees
+        the same table through ``_burn_authority``).  Planner and tracker
+        share the table."""
+        if not self.useful_tilt or self.aero is None:
+            return limits
+        trim = self._lift_trim_many(veh, burn=True)
+        rho, _, _, a_s = atmosphere(max(0.0, float(veh.pos[2])))
+        sp = max(50.0, float(np.linalg.norm(veh.vel)))
+        q_ref = 0.5 * rho * sp * sp
+        th = np.radians(np.arange(0.0, 91.0, 1.0))
+        axes = np.stack([np.sin(th), np.zeros_like(th), np.cos(th)], axis=1)
+        vr = np.tile(np.array([0.0, 0.0, -sp]), (th.size, 1))
+        lift = self.aero.quick_force_many(vr, axes, rho, a_s, 0.0, trim=trim)[:, 0] / q_ref / veh.mass
+        out = []
+        for q, lim in zip(AOA_Q_GRID, limits):
+            net = G0 * np.sin(th) + q * lift
+            # the first peak going out from the flow (broadside, at 90 deg,
+            # the body's normal force lies along the flow and the thrust has
+            # it all again -- but only past the angles where the lift wins)
+            drop = np.flatnonzero(np.diff(net) < 0.0)
+            if drop.size == 0:
+                out.append(lim)                 # still growing all the way: no cut (thin air)
+            else:
+                out.append(min(lim, max(USEFUL_TILT_MIN_DEG, math.degrees(th[int(drop[0])]))))
+        return out
 
     def _lift_trim(self, veh, burn=False):
         """The trimmed-lift factor ``kappa(theta, q)`` (see ``AeroModel.quick_force``).
@@ -2244,7 +2322,7 @@ class Autopilot3D:
             if k <= 1:
                 return 0.0
             net = sigma * sin_th[:k] + q * lift[:k] / m
-            return max(0.0, float(net.max()))
+            return self.burn_authority_share * max(0.0, float(net.max()))
 
         self._auth_cache = (self.elapsed, authority)
         return authority
@@ -2314,8 +2392,15 @@ class Autopilot3D:
             t += dt
         vh = float(np.linalg.norm(u[:2]))
         if vh > 0.1 and math.isfinite(a_end):
-            # what is left, braked at the authority of the final approach
-            p[:2] += u[:2] * vh / (2.0 * max(a_end, 0.5))
+            # What is left, braked in the final approach: at the authority
+            # there, but no harder than the tracker's tilt near the ground
+            # gives (TILT_BUDGET at the tower's height) and the plan uses.
+            # Counting on more, the coast aimed for a burn that crosses the
+            # pad at ~10 m/s and stops just past it; the booster swept past
+            # and came back low.
+            a_tail = min(a_end, self.burn_authority_share * G0
+                         * math.tan(math.radians(float(np.interp(15.0, *TILT_BUDGET)))))
+            p[:2] += u[:2] * vh / (2.0 * max(a_tail, 0.5))
         return p[:2], t_br
 
     def _boostback_target(self, veh, r, v, m, wind_now):
