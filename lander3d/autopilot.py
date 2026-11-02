@@ -38,6 +38,15 @@ from .vehicle import G0, atmosphere, atmosphere_many, fin_mix
 # it then gives up the last-seconds corrections the tracker can still
 # partly fly, and lands further off in wind.)
 TILT_BUDGET = ([0.3, 1.5, 3.0, 8.0, 15.0, 40.0], [0.6, 2.0, 5.0, 12.0, 20.0, 75.0])
+# Tower catch (heights above the catch point, the base 15 m up with the
+# collar on the arms; the tower top is 33 m above it): beside the tower and
+# the arms the budget stays small all the way up.  The keep-out boxes guard
+# the base point only (plus the body radius and 2 m), and a 40 m booster
+# leaning 20 deg swings its collar 5 m and its top 13 m sideways off that
+# point -- with the 75 deg the pad landing allows at 40 m, the plan swung the
+# booster round beside the tower, into the arms or the tower itself.  Above
+# the tower top the budget eases back to the pad landing's.
+CATCH_TILT_BUDGET = ([0.3, 1.5, 3.0, 8.0, 15.0, 33.0, 60.0], [0.6, 2.0, 4.0, 6.0, 8.0, 12.0, 75.0])
 TRIM_FADE = (0.5, 5.5)          # m: upright below the first height, full trim above the second
 SLEW_DEG = ([2.0, 30.0, 300.0], [8.0, 15.0, 25.0])   # thrust-direction slew-rate limit (deg/s) by height
 # Angle of attack (thrust vs the oncoming flow) vs dynamic pressure (Pa ->
@@ -978,7 +987,7 @@ class Autopilot3D:
             touchdown_speed=self.gate_speed, target_alt=self.gate_height, target_xy=tuple(self._gate_xy),
             sink_gain=self.sink_gain, keep_out=keep_out, q_aoa=self._aoa_table(veh), ground_alt=self._z_ground,
             body_length=s.length,
-            tilt_trim=tuple(self._gate_trim(veh)), trim_fade=self._trim_fade(), tilt_budget=TILT_BUDGET,
+            tilt_trim=tuple(self._gate_trim(veh)), trim_fade=self._trim_fade(), tilt_budget=self._tilt_budget(),
             height_ref=self._height_ref(veh), slew_deg=SLEW_DEG, dir_ref=self._dir_ref(veh), time_weight=self.time_weight,
             min_sink=1.0 if self.catch_link is None else 0.0,
         )
@@ -1083,6 +1092,11 @@ class Autopilot3D:
         if n > cap:
             target *= cap / n
         self._hold_bias += (target - self._hold_bias) * min(1.0, dt / self.hold_bias_filter)
+
+    def _tilt_budget(self):
+        """Tilt budget vs height (planner and tracker): the pad landing's, or
+        the tower catch's (small beside the tower and the arms)."""
+        return CATCH_TILT_BUDGET if self.catch_link is not None else TILT_BUDGET
 
     def _trim_fade(self):
         """Heights (above the end of the burn) over which the wind trim fades
@@ -1537,7 +1551,7 @@ class Autopilot3D:
             # dynamic pressure: there the body lift of an engines-first
             # booster opposes its tilt and outweighs the thrust's sideways
             # part, so more tilt would push the wrong way (and feed back).
-            max_tilt = math.radians(float(np.interp(h, *TILT_BUDGET)))
+            max_tilt = math.radians(float(np.interp(h, *self._tilt_budget())))
             center = self._trim_xy * float(np.interp(h, self._trim_fade(), (0.0, 1.0)))
             trim_tilt = math.atan2(float(np.linalg.norm(center)), G0)
             accel = self._aoa_limit(veh, accel, wind_now, max_tilt + trim_tilt, self._aoa_table(veh), self._q_filt)
@@ -2394,12 +2408,12 @@ class Autopilot3D:
         if vh > 0.1 and math.isfinite(a_end):
             # What is left, braked in the final approach: at the authority
             # there, but no harder than the tracker's tilt near the ground
-            # gives (TILT_BUDGET at the tower's height) and the plan uses.
+            # gives (the tilt budget at the tower's height) and the plan uses.
             # Counting on more, the coast aimed for a burn that crosses the
             # pad at ~10 m/s and stops just past it; the booster swept past
             # and came back low.
             a_tail = min(a_end, self.burn_authority_share * G0
-                         * math.tan(math.radians(float(np.interp(15.0, *TILT_BUDGET)))))
+                         * math.tan(math.radians(float(np.interp(15.0, *self._tilt_budget())))))
             p[:2] += u[:2] * vh / (2.0 * max(a_tail, 0.5))
         return p[:2], t_br
 
