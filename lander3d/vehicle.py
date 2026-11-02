@@ -260,8 +260,8 @@ class VehicleSpec:
     isp_sl: float = 282.0
     isp_vac: float = 311.0
     throttle_rate: float = 1.2       # full range per second
-    gimbal_limit: float = math.radians(12.0)
-    gimbal_rate: float = math.radians(30.0)
+    gimbal_limit: float = math.radians(24.0)
+    gimbal_rate: float = math.radians(60.0)
     gimbal_z: float = 0.3            # pivot height above the base
     nozzle_exit_z: float = -1.6
     rcs_torque: tuple = (60_000.0, 60_000.0, 22_000.0)  # pitch(x), yaw(y), roll(z) N*m

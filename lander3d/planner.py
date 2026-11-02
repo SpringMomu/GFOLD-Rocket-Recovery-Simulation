@@ -416,7 +416,7 @@ class Planner3D:
     approach_pos_w = (0.3, 0.2, 0.0)
     approach_vel_w = (0.4, 0.3, 0.0)
     lateral_jerk_factor = 8.0      # lateral thrust changes mean tilting the whole vehicle
-    lateral_rate = 4.0             # m/s^3, limit on the change of planned lateral thrust
+    lateral_rate = 8.0             # m/s^3, limit on the change of planned lateral thrust
     slew_margin = 0.7              # share of the tracker's slew rate the plan may use
     aoa_weight = 100.0             # per m/s^2 of thrust outside the angle-of-attack cone (per s)
     keep_out_weight = 2000.0       # per m inside an obstacle's half-space (per s)

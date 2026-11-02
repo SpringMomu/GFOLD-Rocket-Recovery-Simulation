@@ -53,7 +53,7 @@ TILT_BUDGET = ([0.3, 1.5, 3.0, 8.0, 15.0, 40.0], [0.6, 2.0, 5.0, 12.0, 20.0, 75.
 CATCH_TILT_BUDGET = ([0.0, 60.0, 61.0, 100.0, 101.0],
                      [15.0, 15.0, 30.0, 30.0, 75.0])
 TRIM_FADE = (0.5, 5.5)          # m: upright below the first height, full trim above the second
-SLEW_DEG = ([2.0, 30.0, 300.0], [8.0, 15.0, 25.0])   # thrust-direction slew-rate limit (deg/s) by height
+SLEW_DEG = ([2.0, 30.0, 300.0], [16.0, 30.0, 50.0])   # thrust-direction slew-rate limit (deg/s) by height
 # Angle of attack (thrust vs the oncoming flow) vs dynamic pressure (Pa ->
 # deg): only a fallback without an aerodynamic model.  With one, the limit is
 # physical -- the attitude the TVC can hold against the aerodynamic moment
@@ -266,7 +266,7 @@ class Autopilot3D:
     # attitude loop
     k_angle = 2.0
     k_rate = 4.0
-    max_rate = math.radians(30.0)
+    max_rate = math.radians(60.0)
 
     def __init__(self, aero_model=None) -> None:
         self.planner = Planner3D()

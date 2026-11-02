@@ -42,7 +42,7 @@ OPTIONS = (
     Option("knots", "int", 40, 20, 60, 2),                       # number of plan nodes (>= this; long plans use ~1 per s)
     Option("lateral_accel_weight", "float", 1.0, 0.0, 5.0, 0.1),
     Option("jerk_weight", "float", 0.1, 0.01, 1.0, 0.01),
-    Option("lateral_rate", "float", 4.0, 1.0, 8.0, 0.5),         # m/s^3, limit on the change of planned sideways thrust
+    Option("lateral_rate", "float", 8.0, 1.0, 16.0, 0.5),        # m/s^3, limit on the change of planned sideways thrust
     Option("divert_tilt_deg", "float", 65.0, 30.0, 80.0, 1.0),   # largest thrust tilt of the plan
     Option("burn_fraction", "float", 0.85, 0.6, 0.97, 0.01),     # thrust ceiling of the plan (share of full thrust)
     Option("time_search_evals", "int", 9, 5, 14, 1),             # solves of the touchdown-time search at ignition

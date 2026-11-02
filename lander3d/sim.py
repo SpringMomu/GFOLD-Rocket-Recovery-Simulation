@@ -267,8 +267,6 @@ class Sim3D:
             self.time += dt
             if len(self.trail) == 0 or np.linalg.norm(v.pos - self.trail[-1]) > 4.0:
                 self.trail.append(v.pos.copy())
-                if len(self.trail) > 1500:
-                    self.trail.pop(0)
             if self.tower is not None and self.tower.events:
                 self.events.extend((self.time, e) for e in self.tower.events)
                 self.tower.events.clear()

@@ -1039,7 +1039,13 @@ export class Scene {
   _drawLines(tris) {
     if (!tris || tris.length === 0) return;
     const gl = this.gl, d = this.lines;
-    const n = Math.min(tris.length / 8, d.max);
+    const n = tris.length / 8;
+    if (n > d.max) {
+      d.max = Math.max(n, d.max * 2);
+      d.data = new Float32Array(d.max * 8);
+      gl.bindBuffer(gl.ARRAY_BUFFER, d.vb);
+      gl.bufferData(gl.ARRAY_BUFFER, d.max * 8 * 4, gl.DYNAMIC_DRAW);
+    }
     d.data.set(tris.subarray ? tris.subarray(0, n * 8) : tris.slice(0, n * 8));
     d.n = n;
     uploadDynamic(gl, d);

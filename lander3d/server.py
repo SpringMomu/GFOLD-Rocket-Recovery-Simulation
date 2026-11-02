@@ -57,9 +57,7 @@ def snapshot(sim: Sim3D) -> dict:
         plan = ap.predicted_points if sim.autopilot_on else []
         if len(plan) > 80:
             plan = plan[:: max(1, len(plan) // 80)] + [plan[-1]]
-        trail = sim.trail[-600:]
-        if len(trail) > 200:
-            trail = trail[:: len(trail) // 200] + [trail[-1]]
+        trail = sim.trail
         cfd = sim.cfd
         return {
             "t": round(sim.time, 3), "state": v.state, "crash": v.crash_reason, "scenario": sim.scenario_name,

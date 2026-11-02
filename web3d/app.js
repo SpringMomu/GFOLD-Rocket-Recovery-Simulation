@@ -4,7 +4,7 @@
 // airflow is shown in the main view: the wind-tunnel window and the CFD
 // force coefficients are always live.
 import { V, rot, slerp } from "./gl.js";
-import { Scene } from "./scene.js";
+import { Scene } from "./scene.js?v=trajectory-tvc-2";
 import { HUD } from "./hud.js";
 import { Fluid3D } from "./fluid.js";
 import { plumeParams } from "./plume.js";
@@ -613,12 +613,17 @@ function buildParticles(eye, P) {
 }
 
 // ------------------------------------------------------------------ ribbons
-const lineBuf = new Float32Array(60000 * 8);
+let lineBuf = new Float32Array(60000 * 8);
 let lineN = 0;
 function ribbon(pts, width, color, eye, fade = false) {
   if (pts.length < 2) return;
+  const needed = (lineN + 6 * (pts.length - 1)) * 8;
+  if (needed > lineBuf.length) {
+    const grown = new Float32Array(Math.max(needed, lineBuf.length * 2));
+    grown.set(lineBuf);
+    lineBuf = grown;
+  }
   for (let i = 0; i < pts.length - 1; i++) {
-    if (lineN + 6 > 60000) return;
     const a = pts[i], b = pts[i + 1];
     const d = V.sub(b, a);
     if (V.len(d) < 1e-4) continue;
