@@ -40,18 +40,18 @@ from .vehicle import G0, atmosphere, atmosphere_many, fin_mix
 TILT_BUDGET = ([0.3, 1.5, 3.0, 8.0, 15.0, 40.0], [0.6, 2.0, 5.0, 12.0, 20.0, 75.0])
 # Tower catch (heights above the catch point, the base 15 m up with the
 # collar on the arms; the tower top is 33 m above it): beside the tower and
-# the arms the budget stays small all the way up.  The keep-out boxes guard
+# the arms the budget stays small.  The keep-out boxes guard
 # the base point only (plus the body radius and 2 m), and a 40 m booster
 # leaning 20 deg swings its collar 5 m and its top 13 m sideways off that
 # point -- with the 75 deg the pad landing allows at 40 m, the plan swung the
 # booster round beside the tower, into the arms or the tower itself.  Above
-# the tower top it stays within 15 deg up to 60 m, 30 deg from there to
-# 100 m, and above that the pad landing's 75 deg is allowed again.  The
-# planner's tilt cone uses the same table (PlanConfig3D.tilt_budget, an
-# elastic constraint of the convex problem); the tracker's clip is only the
-# backstop.
-CATCH_TILT_BUDGET = ([0.3, 1.5, 3.0, 8.0, 15.0, 33.0, 60.0, 61.0, 100.0, 101.0],
-                     [0.6, 2.0, 4.0, 6.0, 8.0, 12.0, 15.0, 30.0, 30.0, 75.0])
+# 15 deg everywhere below 60 m, 30 deg from there to 100 m, and above that
+# the pad landing's 75 deg is allowed again (the hold at the gate keeps its
+# own 4 / 1 deg, _catch_hold).  The planner's tilt cone uses the same table
+# (PlanConfig3D.tilt_budget, an elastic constraint of the convex problem);
+# the tracker's clip is only the backstop.
+CATCH_TILT_BUDGET = ([0.0, 60.0, 61.0, 100.0, 101.0],
+                     [15.0, 15.0, 30.0, 30.0, 75.0])
 TRIM_FADE = (0.5, 5.5)          # m: upright below the first height, full trim above the second
 SLEW_DEG = ([2.0, 30.0, 300.0], [8.0, 15.0, 25.0])   # thrust-direction slew-rate limit (deg/s) by height
 # Angle of attack (thrust vs the oncoming flow) vs dynamic pressure (Pa ->
