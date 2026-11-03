@@ -14,7 +14,12 @@ const progress = (text) => self.postMessage({ type: "progress", text });
 
 async function main() {
   progress("正在加载 Python 运行时…");
-  const py = await loadPyodide({ indexURL: PYODIDE });
+  // The package index names the wheel files of this build: always revalidate
+  // it (a stale cached copy asks for wheels that a newer build removed, 404).
+  const base = new URL(PYODIDE, self.location.href).href;
+  const lockResp = await fetch(base + "pyodide-lock.json", { cache: "no-cache" });
+  if (!lockResp.ok) throw new Error(`pyodide-lock.json: HTTP ${lockResp.status}`);
+  const py = await loadPyodide({ indexURL: base, lockFileContents: await lockResp.json(), packageBaseUrl: base });
   progress("正在加载 numpy / scipy / Clarabel…");
   await py.loadPackage(["numpy", "scipy", "clarabel"]);
   progress("正在加载仿真代码…");
