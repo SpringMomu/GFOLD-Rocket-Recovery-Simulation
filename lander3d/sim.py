@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import threading
+import time
 
 import numpy as np
 
@@ -324,18 +325,32 @@ class Sim3D:
         elapsed = min(0.1, max(0.0, real_seconds))
         self._realtime_debt += elapsed * self.time_warp
         self._realtime_debt = min(self._realtime_debt, 0.1 * max(1.0, self.time_warp))
+        ap = self.autopilot
+        # The boost-back solve gets a fixed number of steps per simulated
+        # second (Autopilot3D.boostback_work_rate), interleaved with the
+        # physics steps.  When the wall slice runs out first, the clock waits
+        # for it: a slow CPU runs the return in slow motion, never a different
+        # (late-solved) one.  Guidance per simulated second must not depend on
+        # the machine's speed.
+        deadline = time.monotonic() + ap.boostback_slice_wall
         steps = 0
-        while self._realtime_debt >= PHYSICS_DT and steps < MAX_STEPS_PER_CALL:
+        while steps < MAX_STEPS_PER_CALL:
+            guided = not self.paused and self.autopilot_on
+            if guided and ap.boostback_work_pending():
+                # Reset/input/snapshot may run on another server thread. The
+                # lock covers only this bounded slice, never a complete solve.
+                with self.lock:
+                    ap.advance_boostback_work(0.0, deadline)
+                if ap.boostback_work_pending():
+                    break                   # out of wall time: physics waits for the guidance
+                continue
+            if self._realtime_debt < PHYSICS_DT:
+                break
             self.step(PHYSICS_DT)
             self._realtime_debt -= PHYSICS_DT
             steps += 1
+            if guided:
+                with self.lock:
+                    ap.advance_boostback_work(PHYSICS_DT, deadline)
         if steps >= MAX_STEPS_PER_CALL:
             self._realtime_debt = 0.0
-        if not self.paused and self.autopilot_on:
-            # Reset/input/snapshot may run on another server thread. The
-            # lock covers only this bounded slice, never a complete solve.
-            # The budget is the simulated time just advanced: guidance work per
-            # simulated second must not depend on the machine's wall speed.
-            with self.lock:
-                self.autopilot.advance_boostback_work(
-                    max(1e-3, elapsed) * max(1.0, self.time_warp))

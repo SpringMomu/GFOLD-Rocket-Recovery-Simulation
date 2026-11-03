@@ -104,16 +104,39 @@ def test_inflight_wind_updates_do_not_move_the_frozen_shooting_problem():
     assert not np.shares_memory(ap._w10, frozen._w10)
 
 
-def test_boostback_work_does_not_slow_the_simulation_clock(monkeypatch):
+def test_boostback_work_is_a_fixed_quota_per_simulated_second(monkeypatch):
+    # Guidance per simulated second must not depend on the CPU: with the
+    # quota paid in time the clock runs at wall speed ...
     sim = Sim3D(cfd=False, scenario=3)
-    sim.autopilot._bb_cooperative = True
+    ap = sim.autopilot
+    ap._bb_cooperative = True
     sim.step(PHYSICS_DT)
     budgets = []
-    monkeypatch.setattr(sim.autopilot, "advance_boostback_work", budgets.append)
+
+    def pay(budget, deadline=None):
+        budgets.append(budget)
+        ap._bb_work_debt = 0.0
+
+    monkeypatch.setattr(ap, "advance_boostback_work", pay)
     before = sim.time
     sim.advance_realtime(0.1)
     assert sim.time - before == pytest.approx(0.1, abs=PHYSICS_DT)
-    assert budgets == [0.1]
+    assert sum(budgets) == pytest.approx(sim.time - before)
+
+
+def test_simulated_clock_waits_for_an_unpaid_boostback_quota(monkeypatch):
+    # ... and a CPU too slow to pay it (a phone) runs the same flight in slow
+    # motion instead of flying a command solved seconds late.
+    sim = Sim3D(cfd=False, scenario=3)
+    ap = sim.autopilot
+    ap._bb_cooperative = True
+    sim.step(PHYSICS_DT)
+    assert ap._bb_work is not None
+    monkeypatch.setattr(ap, "boostback_slice_wall", 0.0)
+    before = sim.time
+    sim.advance_realtime(0.1)
+    assert ap.boostback_work_pending()
+    assert sim.time - before <= 2 * PHYSICS_DT
 
 
 @pytest.mark.parametrize("wind_speed", [0.0, 12.0])
@@ -180,7 +203,7 @@ def test_urgent_wait_brakes_descent_without_freezing_the_clock(monkeypatch):
     ap.reset()
     ap._bb_cooperative = True
     sim.autopilot_on = True
-    monkeypatch.setattr(ap, "advance_boostback_work", lambda budget: None)
+    monkeypatch.setattr(ap, "advance_boostback_work", lambda budget, deadline=None: None)
     for _ in range(40):
         sim.advance_realtime(0.01)
     assert sim.time == pytest.approx(0.4, abs=PHYSICS_DT)
@@ -196,7 +219,7 @@ def test_urgent_wait_eventually_hands_over_if_no_return_is_found(monkeypatch):
     ap.reset()
     ap._bb_cooperative = True
     sim.autopilot_on = True
-    monkeypatch.setattr(ap, "advance_boostback_work", lambda budget: None)
+    monkeypatch.setattr(ap, "advance_boostback_work", lambda budget, deadline=None: None)
     # Far off and flying away, the booster does not wait at zero throttle:
     # it turns the outward motion round towards the pad while it waits, and
     # hands over once it is heading back at a conservative return speed.
@@ -362,7 +385,7 @@ def test_scenario_8_16m_s_south_wind_returns_at_different_solver_speeds(work_sca
     ap, veh = sim.autopilot, sim.vehicle
     ap._bb_cooperative = True
     original = ap.advance_boostback_work
-    ap.advance_boostback_work = lambda budget: original(budget * work_scale)
+    ap.advance_boostback_work = lambda budget, deadline=None: original(budget * work_scale, deadline)
     while sim.time < 30.0 and not ap._boostback_done and veh.state == "FLYING":
         sim.advance_realtime(0.016)
     assert ap._bb_exit_reason == "impulse-complete"

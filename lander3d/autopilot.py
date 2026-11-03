@@ -177,12 +177,21 @@ class Autopilot3D:
     boostback_done_dv = 2.0       # boost-back ends when the remaining velocity change is this small
     boostback_loft_max = 80.0     # m/s: upper end of the hop initial guess (not an optimised route constraint)
     boostback_solve_period = 0.3
-    # Upper bound of solver steps per simulated second.  The real limit of a
-    # work slice is its wall-clock deadline (advance_boostback_work), so a
-    # fast CPU solves faster.  It was 4000 (x8 urgent): a cold solve of a far
-    # return (~38 000 steps) then took ~1.2-9 simulated seconds on any CPU,
-    # and the booster waited that long however idle the processor was.
-    boostback_work_rate = 40000.0
+    # Boost-back solver work per simulated second (cooperative path: server
+    # and browser), in work units (boostback.WORK_*, ~25 us of CPython each;
+    # a 6-DOF prediction step is 10).  A fixed quota, not a wall-clock share:
+    # the realtime loop (Sim3D.advance_realtime) holds the simulated clock
+    # while the quota is owed, so a slow CPU (a phone running Pyodide) flies
+    # the same return in slow motion instead of a different one.  It used to
+    # be whatever fitted in a 15 ms wall slice per call: on a phone the solve
+    # then lagged seconds behind the booster, the green line updated rarely
+    # and the return ended with "no-command", pushed sideways off the pad.
+    # 30 000 (~0.75 s of CPython per simulated second) is about what a
+    # desktop browser did; 10 000 found the first return only 4-6 s into the
+    # 8 s boost-back of scenario 8 in a 21 m/s wind.
+    boostback_work_rate = 30000.0
+    boostback_work_urgent = 2.0   # x quota when coasting would soon reach the boost-back floor
+    boostback_slice_wall = 0.015  # s, longest wall slice per realtime call (keeps the frame stream going)
     # Hop: low (below boostback_min_alt), slow and far off.  The landing burn
     # would fly the divert as a long traverse at its lateral-speed limit
     # (~30 m/s: faster needs thrust along the motion, nose-first, which the
@@ -614,6 +623,7 @@ class Autopilot3D:
         self._bb_evaluations = 0
         self._bb_work = None
         self._bb_work_ap = None
+        self._bb_work_debt = 0.0     # solver work units owed to the simulated time already flown
         self._bb_urgent_work = False
         self._bb_fast_work = False
         self._bb_delivered = 0.0
@@ -1772,7 +1782,7 @@ class Autopilot3D:
                 dm = m1 - m0
                 best = max(best, float(np.linalg.norm(dm - axis * float(np.dot(dm, axis)))))
             k_fin.append(best / q_ref)
-            yield
+            yield boostback.WORK_TABLE
         if last is not None:
             self.aero.last = last
         # highest dynamic pressure each angle can be held at:
@@ -1976,7 +1986,7 @@ class Autopilot3D:
                 out.append(float(np.clip(np.dot(pf, pz) / den, lo, hi)) if ok else math.nan)
             n_pa.append(math.sqrt(den) / q_ref)
             b_refs.append(float(np.abs(B).max()))
-            yield
+            yield boostback.WORK_TABLE
         if last is not None:
             self.aero.last = last
         # Aligned with the flow (0 and 180 deg) there is no lift, so no ratio:
@@ -2466,7 +2476,7 @@ class Autopilot3D:
             t += dt
             if trace is not None and trace_offset + t >= trace[-1][0] + 0.5:
                 trace.append((trace_offset + t, p.copy()))
-            yield
+            yield boostback.WORK_COAST
         return None
 
     def _burn_authority(self, veh):
@@ -2652,8 +2662,8 @@ class Autopilot3D:
         self._bb_vel_now = np.asarray(veh.vel, float).copy()
         self._bb_pos_now = self._state(veh)[0]
         # Prioritise a first usable prediction when coasting would soon reach
-        # the boost-back floor. The live vehicle continues flying while the
-        # predictor works; the simulation clock is never artificially slowed.
+        # the boost-back floor: the urgent solve gets boostback_work_urgent
+        # times the step quota per simulated second.
         clearance = max(0.0, self._height(veh) - self._bb_floor)
         vz = float(veh.vel[2])
         coast_time = (vz + math.sqrt(vz * vz + 2.0 * G0 * clearance)) / G0
@@ -2755,19 +2765,32 @@ class Autopilot3D:
             self._bb_work.close()
         self._bb_work = None
 
-    def advance_boostback_work(self, budget=0.004):
-        """Feed the boost-back solve in bounded slices between physics steps."""
+    def boostback_work_pending(self) -> bool:
+        """Whether the boost-back solve is owed steps for simulated time already
+        flown (the realtime loop then holds the clock and works first)."""
+        return self._bb_work is not None and self._bb_work_debt > 0.0
+
+    def advance_boostback_work(self, budget=0.004, deadline=None):
+        """Feed the boost-back solve in bounded slices between physics steps.
+
+        ``budget`` is simulated time just flown: it adds a fixed amount of
+        computation (work units, boostback.WORK_*) to the debt, the same on
+        every machine.  The steps run
+        until the debt is paid or the wall-clock ``deadline`` passes (default
+        ``boostback_slice_wall`` from now); an unpaid debt carries over and
+        the realtime loop does not advance physics until it is paid."""
         if not self._boostback or self.burn_locked or self._boostback_done:
             self._bb_work = None
+            self._bb_work_debt = 0.0
             return
         if self._bb_work is None:
+            self._bb_work_debt = 0.0
             return
-        # Bound both the number of iterations and wall time. A fixed number of
-        # Python steps is not a time bound on slower machines or in Pyodide.
-        work_rate = self.boostback_work_rate * (8.0 if self._bb_urgent_work else 1.0)
-        steps = max(1, int(budget * work_rate))
-        deadline = time.monotonic() + min(0.015, max(0.001, budget))
-        for _ in range(steps):
+        rate = self.boostback_work_rate * (self.boostback_work_urgent if self._bb_urgent_work else 1.0)
+        self._bb_work_debt += max(0.0, budget) * rate
+        if deadline is None:
+            deadline = time.monotonic() + self.boostback_slice_wall
+        while self._bb_work_debt > 0.0:
             if self._bb_work is None:
                 break
             try:
@@ -2790,10 +2813,14 @@ class Autopilot3D:
                 self._bb_next = self.elapsed + self.boostback_solve_period
                 self.plan_errors += 1
                 break
+            # each step reports its cost in work units (boostback.WORK_*)
+            self._bb_work_debt -= candidate if isinstance(candidate, int) else 1
             if isinstance(candidate, boostback.Prediction):
                 self._queue_boostback_candidate(candidate)
             if time.monotonic() >= deadline:
                 break
+        if self._bb_work is None:
+            self._bb_work_debt = 0.0     # a finished or accepted solve owes nothing; the next one starts fresh
 
     def _boostback_target(self, veh, r, v, m, wind_now):
         boostback.finish(self._boostback_target_steps(veh, r, v, m, wind_now))

@@ -37,6 +37,15 @@ FAST_BURN_DT = 0.2
 FLIP_MAX_TIME = 8.0
 FLIP_DONE_COS = math.cos(math.radians(15.0))
 FLIP_DT = 0.1
+# Cost of one step of a resumable computation, in work units (~25 us of
+# CPython each), yielded by the step so the cooperative path can give the
+# solve a fixed amount of computation per simulated second
+# (Autopilot3D.boostback_work_rate).  A bare ``yield`` is one unit (a
+# point-mass step).  Measured: a 6-DOF prediction step ~250 us, a coast step
+# ~40 us, one angle of the attitude/trim tables ~1.5 ms.
+WORK_6DOF = 10
+WORK_COAST = 2
+WORK_TABLE = 60
 
 
 def unit(v):
@@ -224,7 +233,7 @@ def execution_state_steps(ap, veh, impulse, lead, waiting, dt=0.05):
             mag = float(np.linalg.norm(remaining))
             remaining *= max(0.0, mag - dv) / max(1e-9, mag)
         t += step
-        yield
+        yield WORK_6DOF
     return probe, desired, remaining, delivered
 
 
@@ -287,7 +296,7 @@ def predict_steps(ap, veh, r, v, m, wind_now, impulse, dt=0.05, fast=False):
         probe.step(dt, aero, forecast_wind)
         remaining -= float(np.linalg.norm(probe.last["thrust"])) / mass * dt
         elapsed += dt
-        yield
+        yield WORK_6DOF
         position = ap._state(probe)[0]
         if elapsed >= next_point:
             trajectory.append((elapsed, position.copy()))
