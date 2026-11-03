@@ -189,6 +189,7 @@ export function initControls({ press, command, act }) {
         const k = b.dataset.cmd;
         if (k === "f") b.classList.toggle("on", !!view.flowMode);
         else if (k === "k") b.classList.toggle("on", !!view.showTraj);
+        else if (k === "attitude") b.classList.toggle("on", !!view.showAttitude);
         else if (k === "c") b.classList.toggle("on", !!(st.aero && st.aero.cfd_forces));
         else if (k === "y") b.classList.toggle("on", !!st.wind_on);
       }

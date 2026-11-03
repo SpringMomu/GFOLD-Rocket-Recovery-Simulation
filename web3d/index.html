@@ -124,6 +124,8 @@ html, body { margin: 0; height: 100%; background: #04070c; color: var(--txt); fo
 #events { left: 10px; top: 392px; width: 250px; max-height: 150px; overflow: hidden; font-size: 10.5px; }
 #events .e { color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #events .e b { color: var(--txt); font-weight: 500; }
+#historyPanel { left: 270px; top: 325px; width: 370px; }
+#historyCv { display: block; width: 100%; height: auto; }
 
 /* toasts / help */
 #banner { position: fixed; left: 50%; top: 38%; transform: translate(-50%, -50%); font-size: 34px; font-weight: 700; letter-spacing: 0.2em; padding: 12px 30px; border-radius: 6px; display: none; text-shadow: 0 0 20px currentColor; background: rgba(0,0,0,0.45); border: 1px solid currentColor; }
@@ -277,6 +279,7 @@ body.pad #hint { display: none; }
   #ap { left: 6px; top: 96px; width: 240px; }
   #propPanel { left: 6px; top: 130px; width: auto; }
   #events { left: 6px; top: 164px; width: 240px; display: block; }
+  #historyPanel { left: 6px; bottom: auto; top: 198px; width: min(370px, calc(100vw - 12px)); }
   #res { right: 6px; top: 96px; width: 240px; }
   #aero { right: 6px; top: 130px; width: 240px; }
   #camPanel { right: 6px; top: 164px; width: min(260px, calc(100vw - 12px)); }
@@ -407,6 +410,8 @@ body.pad #hint { display: none; }
 
 <div id="events" class="panel"><h3>事件记录 <span class="tag" id="warp">1×</span></h3><div id="evList"></div></div>
 
+<div id="historyPanel" class="panel"><h3>着陆数据 <span class="tag">全程记录</span></h3><canvas id="historyCv" width="700" height="420" aria-label="姿态、速度、高度和水平误差随时间的变化"></canvas></div>
+
 <div id="toolbar" class="panel">
   <h3>菜单 <span class="tag" id="tbWarp">1×</span></h3>
   <div class="tb">
@@ -419,6 +424,7 @@ body.pad #hint { display: none; }
     <button data-cmd="f">气流</button>
     <button data-cmd="b">显示量</button>
     <button data-cmd="k">轨迹</button>
+    <button data-cmd="attitude" id="tbAttitude" title="显示绿线上的规划推力方向和蓝线上的实际箭轴方向">预测姿态</button>
     <button data-cmd="c">CFD 力</button>
     <button data-cmd="y">风场</button>
     <button data-cmd="replan" id="tbReplan" title="持续规划：开 = 每隔一会儿从当前状态重新规划；关 = 沿最后一次规划的线路，只由 PD 控制器跟踪到着陆">持续规划</button>
@@ -515,6 +521,6 @@ body.pad #hint { display: none; }
 </div>
 <div id="err"></div>
 
-<script type="module" src="app.js?v=trajectory-tvc-2"></script>
+<script type="module" src="app.js?v=landing-history-1"></script>
 </body>
 </html>

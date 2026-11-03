@@ -55,8 +55,13 @@ def snapshot(sim: Sim3D) -> dict:
         burn_left = v.propellant / mdot if mdot > 1e-3 else math.inf
         wind = sim.wind.at(v.pos, v.time)
         plan = ap.predicted_points if sim.autopilot_on else []
+        plan_axes = ap.predicted_axes if ap.burn_locked and ap.plan is not None else []
+        if len(plan_axes) != len(plan):
+            plan_axes = []
         if len(plan) > 80:
-            plan = plan[:: max(1, len(plan) // 80)] + [plan[-1]]
+            indices = np.linspace(0, len(plan) - 1, 80, dtype=int)
+            plan = [plan[i] for i in indices]
+            plan_axes = [plan_axes[i] for i in indices] if plan_axes else []
         trail = sim.trail
         cfd = sim.cfd
         return {
@@ -88,6 +93,8 @@ def snapshot(sim: Sim3D) -> dict:
             "wind": _vec(wind), "wind_on": sim.wind.enabled, "wind_cfg": sim.wind.config(), "replan": sim.autopilot.replan_enabled,
             "solver_cfg": dict(sim.solver_cfg), "solver_opts": settings.options_snapshot(),
             "plan": [_vec(pt) for pt in plan], "trail": [_vec(pt) for pt in trail],
+            "plan_axes": [None if axis is None else _vec(axis) for axis in plan_axes],
+            "trail_axes": [_vec(axis) for axis in sim.trail_axes], "history": sim.history,
             "touchdown": v.touchdown, "tower": None if sim.tower is None else sim.tower.snapshot(), "events": [[round(t, 1), e] for t, e in sim.events[-6:]],
             "cfd": None if cfd is None else {"fresh": cfd.fresh},
             "spec": {"length": s.length, "diameter": s.diameter, "grid_fin_z": s.grid_fin_z, "nozzle_exit_z": s.nozzle_exit_z,

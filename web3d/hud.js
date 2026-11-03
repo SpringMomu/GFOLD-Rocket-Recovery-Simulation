@@ -4,6 +4,7 @@
 import { FDAI, LandingND } from "./instruments.js";
 import { TunnelView } from "./tunnel.js";
 import * as ZH from "./zh.js";
+import { drawHistory } from "./history.js";
 
 const $ = (id) => document.getElementById(id);
 const PHASES = ["COAST", "BOOSTBACK", "LANDING BURN", "LANDED"];
@@ -136,7 +137,7 @@ export class HUD {
     // Phones start with only the flight data strip and the touch pad open.
     this.phone = window.matchMedia("(max-width: 760px), (max-height: 520px)").matches;
     const DEFAULT_FOLDED = this.phone
-      ? ["ap", "res", "aero", "tunnelPanel", "events", "propPanel", "scope", "cluster", "toolbar", "solverPanel", "camPanel"]
+      ? ["ap", "res", "aero", "tunnelPanel", "events", "propPanel", "scope", "cluster", "toolbar", "solverPanel", "camPanel", "historyPanel"]
       : ["toolbar", "solverPanel"];
     const panels = [...document.querySelectorAll(".panel")].filter((el) => el.id && el.id !== "help");
     this.panels = panels;
@@ -245,6 +246,7 @@ export class HUD {
 
   // ------------------------------------------------------------------ update
   update(st, view) {
+    if (!this.isFolded("historyPanel")) drawHistory($("historyCv"), st.history || []);
     if (!st) return;
     const propCv = document.getElementById("propCv");
     if (propCv && !this.isFolded("propPanel")) {

@@ -86,6 +86,8 @@ TRIM_ANGLES = np.array([0.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 75.0,
                         135.0, 150.0, 160.0, 165.0, 170.0, 175.0, 178.0, 180.0])
 
 
+_LOG_PROFILE = math.log(10.0 / 0.05)
+
 class _AttitudeProbe:
     """The booster at another attitude, for the aerodynamic model only."""
 
@@ -171,12 +173,16 @@ class Autopilot3D:
     boostback_slow_speed = (80.0, 140.0)   # ... blending to boostback_miss at [1]
     boostback_min_alt = 900.0     # start a boost-back only above this height ...
     boostback_end_alt = 500.0     # ... and stop it below this one (the landing burn diverts the rest)
-    aero_steer_max_deg = 15.0
     lift_gradient_cap = 3.0       # body lift per radian of tilt, in units of thrust accel
     boostback_done_dv = 2.0       # boost-back ends when the remaining velocity change is this small
     boostback_loft_max = 80.0     # m/s: upper end of the hop initial guess (not an optimised route constraint)
     boostback_solve_period = 0.3
-    boostback_work_rate = 4000.0   # solver steps per simulated second (work budget; machine independent)
+    # Upper bound of solver steps per simulated second.  The real limit of a
+    # work slice is its wall-clock deadline (advance_boostback_work), so a
+    # fast CPU solves faster.  It was 4000 (x8 urgent): a cold solve of a far
+    # return (~38 000 steps) then took ~1.2-9 simulated seconds on any CPU,
+    # and the booster waited that long however idle the processor was.
+    boostback_work_rate = 40000.0
     # Hop: low (below boostback_min_alt), slow and far off.  The landing burn
     # would fly the divert as a long traverse at its lateral-speed limit
     # (~30 m/s: faster needs thrust along the motion, nose-first, which the
@@ -187,6 +193,20 @@ class Autopilot3D:
     hop_miss = 500.0              # m of predicted miss ...
     hop_min_alt = 150.0           # ... from this height up (lower: no room to turn and climb)
     hop_end_frac = 0.7            # a hop ends if it sinks below this fraction of its start height
+    # The glide removes a miss of up to about this many times the height
+    # (body lift of an engines-first booster).  Beyond that no airspeed,
+    # ignition-urgency or descent-rate gate may keep the return from
+    # starting: the landing burn would otherwise fly the whole divert as a
+    # traverse (3 km from 1 km receding at 150 m/s: out of propellant).
+    boostback_glide_ratio = 1.0
+    # A return out of the glide's reach may start while the vertical landing
+    # burn is already due (fast descent, far off; then as a hop: vertical
+    # support while turning).  Such a return has no fixed height floor: it
+    # ends, and its predicted arc is rejected, only when the thrust a
+    # vertical stop needs reaches this share of the available.
+    boostback_vertical_cap = 0.9
+    boostback_wait_burn = True    # a far return burns towards the pad while its first solution is computed
+    boostback_handover_cap = 0.8  # ... and below this one at the predicted handover (the burn plans with 85 %)
     # Any boost-back thrusting nose-first (along the motion) above this
     # airspeed keeps its thrust within nose_first_aoa_deg of the flow: low
     # down, a thrust that turns away from the flow puts the booster broadside
@@ -212,7 +232,7 @@ class Autopilot3D:
     catch_hold_max = 25.0         # s; then settle anyway
     catch_hold_tilt_deg = 4.0     # tilt budget about the wind trim while holding
     catch_integral_radius = 1.0   # m: the hold's integral only builds up this close to the axis
-    glide_gain = 1.5
+    glide_gain = 2.0              # remove the predicted miss early in the coast
     frozen_kp = 0.5               # PD gains and limit of the feedback when the plan is frozen (replan off); the re-planned
     frozen_kd = 1.6               # flight keeps 0.5 / 1.6 / 5 m/s^2 (the plan itself is renewed every 0.6 s)
     frozen_fb_limit = 5.0
@@ -569,6 +589,8 @@ class Autopilot3D:
         self._boostback_done = False
         self._hop = False
         self._bb_floor = self.boostback_end_alt
+        self._bb_relaxed = False
+        self._bb_work_reference = None
         self._route = None            # reference path round the obstacles while no plan gets through
         self._touched = False
         self.relax = 0                # (no relaxation levels any more; kept for the front end)
@@ -586,15 +608,21 @@ class Autopilot3D:
         self._bb_dv = None
         self._bb_axis = None
         self._bb_prediction = None
+        self._bb_trajectory_epoch = 0.0
+        self._bb_display_next = 0.0
         self._bb_status = "idle"
         self._bb_evaluations = 0
         self._bb_work = None
         self._bb_work_ap = None
+        self._bb_urgent_work = False
+        self._bb_fast_work = False
         self._bb_delivered = 0.0
         self._bb_work_delivered = 0.0
         self._bb_work_started = 0.0
+        self._bb_started_at = 0.0
         self._bb_freeze_vel = np.zeros(3)
         self._bb_vel_now = np.zeros(3)
+        self._bb_pos_now = np.zeros(3)
         self._bb_work_failed = False
         self._bb_seed = None
         self._bb_guess = None
@@ -619,6 +647,7 @@ class Autopilot3D:
         self.cmd_throttle = 0.0
         self.cmd_axis = np.array([0.0, 0.0, 1.0])
         self.predicted_points: list = []
+        self.predicted_axes: list = []
         self.visited: list = []
 
     # ------------------------------------------------------------ helpers
@@ -1047,8 +1076,11 @@ class Autopilot3D:
     def _wind(self, z):
         """Wind assumed at height ``z`` (planner coordinates) for the
         predictions: the measured wind as its 10 m equivalent, without the
-        gusts (``_w10``), scaled with the estimated profile."""
-        return self._w10_now() * float(self._profile(z + self.h_off, self.wind_shear_est))
+        gusts (``_w10``), scaled with the estimated profile.  (Scalar form of
+        :meth:`_profile`: the predictions call this every step, and numpy's
+        per-call overhead on a scalar was ~10 % of a boost-back solve.)"""
+        f = min(2.6, max(0.25, math.log(max(0.5, float(z) + self.h_off) / 0.05) / _LOG_PROFILE))
+        return self._w10_now() * max(0.05, 1.0 + self.wind_shear_est * (f - 1.0))
 
     def _wind_many(self, z):
         """Vectorised :meth:`_wind` over an array of heights."""
@@ -1438,8 +1470,9 @@ class Autopilot3D:
             return
         start = max(0.0, self.elapsed - p.created_at)
         n = max(2, min(200, int(max(0.0, p.t_f - start) / 0.1) + 2))
-        pos, _, _ = p.sample_many(np.linspace(start, p.t_f, n))
+        pos, _, thrust = p.sample_many(np.linspace(start, p.t_f, n))
         self.predicted_points = [(float(x), float(y), float(max(0.0, z)) + self.h_off) for x, y, z in pos]
+        self.predicted_axes = [u / np.linalg.norm(u) if np.linalg.norm(u) > 1e-8 else None for u in thrust]
 
     # ------------------------------------------------------------ command
     def command(self, veh, wind_now, dt):
@@ -2198,21 +2231,51 @@ class Autopilot3D:
         frac, t_burn, burn_dir = self._burn_need(veh, r, v, m, drag_up)
         ignite_now = frac >= self._ignition_threshold(t_burn, burn_dir)
         # Boost-back only with time to come back and coast: not when the
-        # landing burn is already due (then the burn itself flies the divert,
-        # G-FOLD), and a running one stops once a vertical burn would be due.
+        # landing burn is already due, and a running one stops once a vertical
+        # burn would be due. For a low hop, lateral miss can make the direct
+        # landing-burn estimate urgent even when there is still enough height
+        # to arrest the vertical descent and fly a powered return.
         up_only = np.array([0.0, 0.0, 1.0])
         f_v, t_v, _ = self._burn_need(veh, r * up_only, v * up_only, m, drag_up)
         burn_due = f_v >= self._ignition_threshold(t_v, up_only)
         bb_miss = float(np.interp(airspeed, self.boostback_slow_speed, (self.boostback_miss_slow, self.boostback_miss)))
-        start = miss > bb_miss and r[2] > self.boostback_min_alt and airspeed < 180.0 and not ignite_now
-        hop = (not start and self.hop_min_alt < r[2] <= self.boostback_min_alt and airspeed < 100.0
-               and miss > self.hop_miss and not ignite_now)
+        far_return = miss > self.hop_miss and airspeed < 100.0 and not burn_due
+        # Out of the glide's reach: the return is needed whatever the
+        # airspeed (a retrograde burn is engines-first, i.e. stable) and
+        # whatever the lateral urgency of the landing-burn estimate (that
+        # urgency *is* the miss the return removes).
+        unglidable = miss > max(self.hop_miss, self.boostback_glide_ratio * float(r[2]))
+        start = (miss > bb_miss and r[2] > self.boostback_min_alt and (airspeed < 180.0 or unglidable)
+                 and not burn_due and (not ignite_now or far_return or unglidable))
+        # Hop: low, or already due for the vertical burn (a fast descent);
+        # the return then keeps vertical support while it turns.
+        hop = (not start and r[2] > self.hop_min_alt and miss > self.hop_miss
+               and (airspeed < 100.0 or unglidable)
+               and ((r[2] <= self.boostback_min_alt and not burn_due)
+                    or (unglidable and f_v < self.boostback_vertical_cap)))
         if not self._boostback_done and (self._boostback or start or hop):
             if not self._boostback:
-                self._hop = hop
+                # Out of the glide's reach (or already due for the vertical
+                # burn), the return may sink as far as a vertical stop stays
+                # possible -- a far, receding, descending booster cannot turn
+                # round above a fixed floor (1 km, 80 m/s down: every arc
+                # crossed 500 m) and the landing burn would fly the divert.
+                self._bb_relaxed = bool(unglidable or burn_due)
+                # ... and keeps vertical support while it turns (the hop
+                # throttle) when the sink of a quarter turn at zero throttle
+                # would use up much of the height above the usual floor
+                # (1 km, 80 m/s down: 80 -> 95 m/s in the 3 s of the turn).
+                t_turn = 0.5 * math.pi / self.max_rate
+                sink = max(0.0, -float(v[2])) * t_turn + 0.5 * G0 * t_turn ** 2
+                self._hop = bool(hop or burn_due or (
+                    self._bb_relaxed and sink > 0.25 * max(1.0, float(r[2]) - self.boostback_end_alt)))
                 self._bb_floor = self.hop_end_frac * float(r[2]) if hop else self.boostback_end_alt
+                if self._bb_relaxed:
+                    self._bb_floor = min(self._bb_floor, self.hop_min_alt)
+                self._bb_started_at = self.elapsed
             self._boostback = True
             self.phase = "BOOSTBACK"
+            burn_due = self._return_vertical_due(f_v, t_v)
             self._mark()
             if self._bb_dv is not None:
                 delivered = float(np.linalg.norm(veh.last.get("thrust", np.zeros(3)))) / m * self._dt
@@ -2220,23 +2283,66 @@ class Autopilot3D:
                 self._bb_dv *= max(0.0, mag - delivered) / max(mag, 1e-9)
             self._bb_delivered += float(np.linalg.norm(veh.last.get("thrust", np.zeros(3)))) / m * self._dt
             self._bb_vel_now = np.asarray(v, float).copy()
+            self._bb_pos_now = np.asarray(r, float).copy()
             if self._bb_cooperative:
                 if self._bb_work is None and (self.elapsed >= self._bb_next or self._bb_dv is None):
                     self._submit_boostback(veh, wind_now)
             elif self.elapsed >= self._bb_next or self._bb_dv is None:
                 self._boostback_target(veh, r, v, m, wind_now)
                 self._bb_next = self.elapsed + self.boostback_solve_period
-            if (self._bb_dv is None and self._bb_work is not None
+            self._update_boostback_display(r)
+            toward = -np.asarray(r[:2], float)
+            toward /= max(1e-9, float(np.linalg.norm(toward)))
+            # ... and on towards the pad up to a conservative share of the
+            # speed of a drag-free 45 deg arc back: a slow CPU may still have
+            # no solution when the outward motion is gone, and stopping there
+            # left the booster hanging 2.7 km out (0.3 x the work budget).
+            closing = float((v - wind_bb)[:2] @ toward)
+            distance = float(np.linalg.norm(r[:2]))
+            heading_out = closing < 0.6 * math.sqrt(G0 * distance)
+            if (self.boostback_wait_burn and self._bb_dv is None and self._bb_work is not None
+                    and self._bb_relaxed and heading_out
                     and not burn_due and r[2] >= self._bb_floor):
-                # The first solution is being worked on: hold the current
-                # attitude, engines off, until it is committed.  (Pre-turning
-                # to a guess before the command exists made the epoch state --
-                # and the command it produced -- worse, not better.)
+                # Far off and still flying away: whatever return the solver
+                # finds starts by turning the outward motion round, holding
+                # height.  Waiting at zero throttle for the first solution
+                # (seconds on a slow CPU) only lost the return: 2 km off at
+                # 1 km, 200 m/s out, the booster was 2.8 km off and sinking
+                # at 53 m/s after the 5 s wait, with no arc back left.  Burn
+                # towards the pad (engines-first against the flow: stable)
+                # until a solution arrives or the outward motion is gone.
+                available = self._thrust_available(veh, r[2]) * self.thrust_scale
+                accel = available / m
+                a_z = min(0.9 * accel, G0 + float(np.clip(-0.3 * float(v[2]), 0.0, 7.0)))
+                a_h = math.sqrt(max(0.0, accel * accel - a_z * a_z))
+                d = boostback.steering(self, np.array([a_h * toward[0], a_h * toward[1], a_z]), v, wind_bb, r[2])
+                previous = veh.axis if self._bb_axis is None else self._bb_axis
+                self._bb_axis = boostback.turn_towards(previous, d, self.max_rate * self._dt)
+                thr = boostback.throttle_command(self, veh.axis, d, m, available, True)
+                c.fins_deploy = False
+                c.throttle = self.cmd_throttle = thr
+                self.cmd_axis = self._bb_axis.copy()
+                self.cmd_accel = self.cmd_axis * thr * accel
+                self._attitude(veh, self.cmd_axis, use_rcs=True)
+                return
+            if (self._bb_dv is None and self._bb_work is not None
+                    and not burn_due and r[2] >= self._bb_floor
+                    and self.elapsed - self._bb_started_at < 5.0):
+                # Keep the current attitude while the first return is being
+                # computed. In an urgent descent, arrest some vertical speed
+                # instead of losing the whole return window at zero throttle.
+                # The landing reserve is protected even when no return exists.
                 c.fins_deploy = False
                 self.cmd_axis = veh.axis.copy()
                 thr = 0.0
                 if self._hop and veh.axis[2] > 0.3:
                     thr = float(np.clip(1.1 * m * G0 / (self._thrust_available(veh, r[2]) * veh.axis[2]), 0.0, 1.0))
+                elif self._bb_urgent_work and v[2] < -5.0 and veh.axis[2] > 0.5:
+                    landing_dv = float(np.linalg.norm(v)) + 0.5 * G0 * (t_v if math.isfinite(t_v) else 0.0) + 15.0
+                    reserve = 1.2 * m * (1.0 - math.exp(-landing_dv / (s.isp_sl * G0))) + 150.0
+                    if veh.propellant > reserve:
+                        az = G0 + min(7.0, -0.3 * float(v[2]))
+                        thr = float(np.clip(m * az / (self._thrust_available(veh, r[2]) * self.thrust_scale * veh.axis[2]), 0.0, 1.0))
                 c.throttle = self.cmd_throttle = thr
                 self.cmd_accel = self.cmd_axis * thr * self._thrust_available(veh, r[2]) / m
                 self._attitude(veh, self.cmd_axis, use_rcs=True)
@@ -2256,8 +2362,8 @@ class Autopilot3D:
             # there (with the pad still ~1.5 km off in 15 m/s).  A hop also
             # ends once the change wanted points against the flow (braking):
             # it starts slow, so there is no retrograde phase to fly.
-            d = None if dv is None or dvn <= 0.0 else boostback.steering(self, dv, v, wind_bb)
-            braking = dv is not None and boostback.braking_handover(self, dv, veh.axis, v, wind_bb)
+            d = None if dv is None or dvn <= 0.0 else boostback.steering(self, dv, v, wind_bb, r[2])
+            braking = dv is not None and boostback.braking_handover(self, dv, veh.axis, v, wind_bb, r)
             available = self._thrust_available(veh, r[2]) * self.thrust_scale
             tail_dv = available / m * veh.throttle ** 2 / (2.0 * s.throttle_rate)
             if (dv is None or dvn <= max(self.boostback_done_dv, tail_dv) or r[2] < self._bb_floor or burn_due
@@ -2313,11 +2419,6 @@ class Autopilot3D:
             a_z = max(G0, frac * self._thrust_available(veh, r[2]) / m * float(burn_dir[2]))
             target = np.array([a_lat[0], a_lat[1], a_z])
             target /= float(np.linalg.norm(target))
-            cap = math.radians(float(np.clip(r[2] / 40.0, 1.0, 20.0)))
-            if math.acos(max(-1.0, min(1.0, float(target[2])))) > cap:
-                hz = np.array([target[0], target[1], 0.0])
-                hz /= max(1e-9, float(np.linalg.norm(hz)))
-                target = hz * math.sin(cap) + np.array([0.0, 0.0, math.cos(cap)])
         elif sp > 25.0:
             target = self._aero_steer(veh, r, v, m, wind_now)   # engines-first, steered by body lift
         else:
@@ -2325,10 +2426,20 @@ class Autopilot3D:
         self.cmd_axis = target
         self._attitude(veh, target, use_rcs=True)
 
+    def _return_vertical_due(self, f_v, t_v):
+        """Whether a running return must hand over to the landing burn: the
+        vertical burn is due -- or, for a relaxed return (see
+        ``boostback_vertical_cap``), the vertical stop is about to become
+        impossible.  The same test rejects predicted powered arcs."""
+        if self._bb_relaxed:
+            return f_v >= self.boostback_vertical_cap
+        return f_v >= self._ignition_threshold(t_v, np.array([0.0, 0.0, 1.0]))
+
     def _coast(self, veh, r, v, m, wind_now, dt=0.25, t_max=200.0, blind=False, interpolate=False):
         return boostback.finish(self._coast_steps(veh, r, v, m, wind_now, dt, t_max, blind, interpolate))
 
-    def _coast_steps(self, veh, r, v, m, wind_now, dt=0.25, t_max=200.0, blind=False, interpolate=False):
+    def _coast_steps(self, veh, r, v, m, wind_now, dt=0.25, t_max=200.0, blind=False, interpolate=False,
+                     trace=None, trace_offset=0.0):
         """Drag-aware coast to the predicted ignition: ``(t_ign, p_ign, v_ign, t_burn)``, or None
         (``blind``: in still air)."""
         if self.aero is None:
@@ -2353,6 +2464,8 @@ class Autopilot3D:
             u = u + (f / m + np.array([0.0, 0.0, -G0])) * dt
             p = p + u * dt
             t += dt
+            if trace is not None and trace_offset + t >= trace[-1][0] + 0.5:
+                trace.append((trace_offset + t, p.copy()))
             yield
         return None
 
@@ -2406,7 +2519,8 @@ class Autopilot3D:
     def _burn_miss(self, veh, p_ign, v_ign, m, wind_now, dt=0.2, blind=False, interpolate=False):
         return boostback.finish(self._burn_miss_steps(veh, p_ign, v_ign, m, wind_now, dt, blind, interpolate))
 
-    def _burn_miss_steps(self, veh, p_ign, v_ign, m, wind_now, dt=0.2, blind=False, interpolate=False):
+    def _burn_miss_steps(self, veh, p_ign, v_ign, m, wind_now, dt=0.2, blind=False, interpolate=False,
+                         trace=None, trace_offset=0.0):
         """Where a landing burn lit at ``(p_ign, v_ign)`` ends.
 
         Returns ``(miss_xy, t_brake)``.  The burn brakes at constant
@@ -2477,6 +2591,8 @@ class Autopilot3D:
             u[2] += a_v * step
             p = p + u * step
             t += step
+            if trace is not None and trace_offset + t >= trace[-1][0] + 0.5:
+                trace.append((trace_offset + t, p.copy()))
             yield
         vh = float(np.linalg.norm(u[:2]))
         if vh > 0.1 and math.isfinite(a_end):
@@ -2489,6 +2605,13 @@ class Autopilot3D:
             a_tail = min(a_end, self.burn_authority_share * G0
                          * math.tan(math.radians(float(np.interp(15.0, *self._tilt_budget())))))
             p[:2] += u[:2] * vh / (2.0 * max(a_tail, 0.5))
+        if trace is not None:
+            # The handover model estimates the remaining lateral braking but
+            # does not integrate the final descent. End at its estimated miss,
+            # not at the pad: no landing plan has been solved yet.
+            tail = max(0.5, (p[2] - self.gate_height) / max(self.gate_speed, -u[2], 1.0))
+            end = np.array([p[0], p[1], self.gate_height])
+            trace.append((trace_offset + t + tail, end))
         return p[:2], t_br
 
     def _submit_boostback(self, veh, wind_now):
@@ -2521,55 +2644,116 @@ class Autopilot3D:
         ap._bb_seed = None if seed is None else seed.copy()
         fv = self._frozen_vehicle(veh)
         self._bb_work_ap = ap
+        self._bb_work_reference = None      # the flown command, re-evaluated from this state (first candidate)
         self._bb_work_started = self.elapsed
         self._bb_state_time = self.elapsed
         self._bb_work_delivered = self._bb_delivered
         self._bb_freeze_vel = fv.vel.copy()
         self._bb_vel_now = np.asarray(veh.vel, float).copy()
-        # Exactly the synchronous shooting (fine 6-DOF steps, no VGO gravity
-        # guess): the coarse/gravity-seeded variant was cheaper but its aim was
-        # hundreds of metres off in wind, and the wind case is the whole point.
+        self._bb_pos_now = self._state(veh)[0]
+        # Prioritise a first usable prediction when coasting would soon reach
+        # the boost-back floor. The live vehicle continues flying while the
+        # predictor works; the simulation clock is never artificially slowed.
+        clearance = max(0.0, self._height(veh) - self._bb_floor)
+        vz = float(veh.vel[2])
+        coast_time = (vz + math.sqrt(vz * vz + 2.0 * G0 * clearance)) / G0
+        self._bb_urgent_work = coast_time < 12.0
+        ap._bb_urgent_work = self._bb_urgent_work
+        # An urgent first solution uses the same wind-aware 6-DOF model with
+        # larger integration steps. Subsequent solves refine the flying arc.
+        fast = (self._bb_urgent_work and (seed is None or
+                (self._bb_prediction is not None and np.linalg.norm(self._bb_prediction.miss) > 350.0)))
+        self._bb_fast_work = fast
         self._bb_work = ap._boostback_target_steps(
             fv, *ap._state(fv), np.array(wind_now, float),
-            iterations=(5 if seed is None else 2), partial=True)
+            iterations=(5 if seed is None else 2), progress=fast, partial=True)
 
     def _accept_boostback_prediction(self, prediction):
         """Commit a prediction, corrected from its frozen state to the live one."""
         impulse = np.asarray(prediction.impulse, float).copy()
-        # The measured velocity change already includes thrust delivered since
-        # the frozen state. Subtract it once; subtracting the thrust integral
-        # as well cuts off the burn early, especially during slow solves.
-        self._bb_dv = impulse - (self._bb_vel_now - self._bb_freeze_vel)
+        # The shooting variable is a *propulsive* velocity integral. Gravity,
+        # wind and drag are already propagated by the prediction: treating the
+        # full navigation velocity change as delivered thrust makes a delayed
+        # result inject spurious impulse, even while the engine was off.
+        delivered = max(0.0, self._bb_delivered - self._bb_work_delivered)
+        magnitude = float(np.linalg.norm(impulse))
+        self._bb_dv = impulse * (max(0.0, magnitude - delivered) / max(magnitude, 1e-9))
         self._bb_reserve = prediction.reserve
         self._bb_prediction = prediction
+        self._bb_trajectory_epoch = self._bb_work_started
+
+    def _update_boostback_display(self, r):
+        """Display the remaining propagated return, anchored at the live vehicle."""
+        prediction = self._bb_prediction
+        if prediction is None or not prediction.trajectory or self.elapsed < self._bb_display_next:
+            return
+        self._bb_display_next = self.elapsed + 0.1
+        age = max(0.0, self.elapsed - self._bb_trajectory_epoch)
+        points = [r] + [p for t, p in prediction.trajectory if t > age]
+        self.predicted_points = [(float(p[0]), float(p[1]), float(p[2] + self.h_off)) for p in points]
 
     def _queue_boostback_candidate(self, prediction):
         strong_wind = self._w10 is not None and np.linalg.norm(self._w10[:2]) > 17.0
-        if strong_wind and self._bb_dv is not None and self.elapsed - self._bb_work_started > 0.75:
+        age = self.elapsed - self._bb_work_started
+        if (self._bb_dv is not None and age > 0.75
+                and not boostback.prediction_matches_state(prediction, age, self._bb_pos_now, self._bb_vel_now)):
             # A correction optimised for an old powered state can claim a
             # perfect endpoint while commanding a very different real arc.
             return
-        improvement = (self._bb_prediction is None
+        # The flown prediction's endpoint is a claim made from the state it
+        # was solved for; after a second or so of powered flight it no longer
+        # says where the booster is going.  A fresh candidate (solved from
+        # the live state) then replaces it whenever it is within tolerance --
+        # judged against the stale claim, a 100 m candidate kept losing to a
+        # 20 m one from 10 s earlier, and the booster flew the old command on
+        # to 160 m/s and overflew the pad by 800 m.
+        stale = self._bb_prediction is not None and self.elapsed - self._bb_trajectory_epoch > 1.0
+        improvement = (self._bb_prediction is None or stale
                        or np.linalg.norm(prediction.miss) < 0.8 * np.linalg.norm(self._bb_prediction.miss))
-        # In a strong crosswind a near-return candidate may be the only way to
-        # start a useful burn before the exact corrector converges.  Admit it
+        # In a strong crosswind or an urgent descent a near-return candidate
+        # may be the only way to start before the corrector converges. Admit it
         # only when it removes at least 90% of the unpowered handover miss,
         # and never allow the provisional error to exceed 350 m.
         tolerance = (max(150.0, min(350.0, 0.1 * np.linalg.norm(self._burn_miss_now)))
-                     if strong_wind else 150.0)
+                     if strong_wind or self._bb_urgent_work else 150.0)
         provisional = prediction.valid and np.linalg.norm(prediction.miss) <= tolerance
-        if not (prediction.return_ready or (provisional and improvement)):
+        # A distant, low vehicle may have no near-perfect initial iterate.
+        # Start a physically propagated, fuel-reserved return once it removes
+        # most of the unpowered miss; subsequent solves refine it further.
+        initial_miss = float(np.linalg.norm(self._burn_miss_now))
+        partial_return = (self._bb_urgent_work and self._bb_dv is None and initial_miss > 350.0
+                          and prediction.valid and np.linalg.norm(prediction.miss) <= 0.25 * initial_miss)
+        improving_partial = (self._bb_urgent_work and self._bb_dv is not None and self._bb_prediction is not None
+                             and self.elapsed - self._bb_work_started <= 2.0 and prediction.valid
+                             and np.linalg.norm(prediction.miss) < 0.7 * np.linalg.norm(self._bb_prediction.miss))
+        # A warm solve starts by propagating the command being flown from the
+        # live state: that is what the booster will really do.  A later valid
+        # candidate of the same solve that ends far closer is better to fly,
+        # whatever the tolerance -- the flown command came
+        # from an urgent coarse solve and really overshot by 1.6 km while
+        # 650-1000 m candidates were turned down, and the booster flew past
+        # the pad.
+        reference = self._bb_work_reference
+        if reference is None and self._bb_dv is not None:
+            self._bb_work_reference = prediction
+        # (Only when the flown command is known to miss badly, and only for a
+        # clear gain: accepting every small gain closes the solve after one
+        # step, and in a 21 m/s wind the shooting then never converged.)
+        flown_miss = 0.0 if reference is None else float(np.linalg.norm(reference.miss))
+        better_than_flown = (flown_miss > 300.0 and prediction.valid
+                             and np.linalg.norm(prediction.miss) < 0.5 * flown_miss)
+        if not (prediction.return_ready or (provisional and improvement) or partial_return or improving_partial
+                or better_than_flown):
             return
         self._accept_boostback_prediction(prediction)
         self._bb_next = self.elapsed + self.boostback_solve_period
         # Once a candidate is flown, continue optimising from the live state;
         # further improvements from this frozen snapshot can be stale by the
         # time they arrive, even when their reported endpoint error is tiny.
-        if prediction.return_ready or strong_wind:
-            self._bb_guess = prediction.impulse.copy()
-            if self._bb_work is not None:
-                self._bb_work.close()
-            self._bb_work = None
+        self._bb_guess = prediction.impulse.copy()
+        if self._bb_work is not None:
+            self._bb_work.close()
+        self._bb_work = None
 
     def advance_boostback_work(self, budget=0.004):
         """Feed the boost-back solve in bounded slices between physics steps."""
@@ -2578,15 +2762,11 @@ class Autopilot3D:
             return
         if self._bb_work is None:
             return
-        # The budget is in simulated seconds, converted to a number of solver
-        # steps: the work done per simulated second must not depend on how fast
-        # (or how loaded) the machine is.  A wall-clock slice made the same
-        # solve span very different simulated times on CPython, WASM, or under
-        # CPU contention -- the command then arrived stale, the candidates
-        # missed their execution epoch and the boost-back never fired.  Physics
-        # still advances by wall time; a slow machine just gets a lower
-        # real-time factor for the second or two before ignition.
-        steps = max(1, int(budget * self.boostback_work_rate))
+        # Bound both the number of iterations and wall time. A fixed number of
+        # Python steps is not a time bound on slower machines or in Pyodide.
+        work_rate = self.boostback_work_rate * (8.0 if self._bb_urgent_work else 1.0)
+        steps = max(1, int(budget * work_rate))
+        deadline = time.monotonic() + min(0.015, max(0.001, budget))
         for _ in range(steps):
             if self._bb_work is None:
                 break
@@ -2612,12 +2792,14 @@ class Autopilot3D:
                 break
             if isinstance(candidate, boostback.Prediction):
                 self._queue_boostback_candidate(candidate)
+            if time.monotonic() >= deadline:
+                break
 
     def _boostback_target(self, veh, r, v, m, wind_now):
         boostback.finish(self._boostback_target_steps(veh, r, v, m, wind_now))
 
     def _boostback_target_steps(self, veh, r, v, m, wind_now, iterations=None, progress=False, cold=False,
-                                partial=False):
+                                partial=False, retry=True):
         """Finite-burn predictor-corrector, closed on the landing handover.
 
         The impulsive estimate only seeds the finite-burn shooting problem.
@@ -2638,7 +2820,9 @@ class Autopilot3D:
                     break
                 miss, _ = yield from self._burn_miss_steps(veh, coast[1], coast[2], m, wind_now, blind=blind)
                 seed[:2] -= miss / max(5.0, coast[0] + 0.5 * coast[3])
-            if progress or partial:
+            descending = float(v[2]) < 0.0 and self._bb_relaxed
+            if progress or partial or self._hop or descending:
+                lateral_seed = seed.copy()
                 # VGO contains propulsive velocity, so its initial guess must
                 # pay gravity during the finite burn and attitude acquisition.
                 # This only seeds the optimiser; it is not a flight-path constraint.
@@ -2651,6 +2835,24 @@ class Autopilot3D:
                 duration = (G0 * G0 * lag + math.sqrt(G0 ** 4 * lag ** 2
                             + aa * (planar * planar + G0 * G0 * lag * lag))) / aa
                 seed[2] += G0 * (duration + lag)
+                if self._hop:
+                    # A descending hop must arrest its existing downward
+                    # velocity as well as pay gravity during acquisition.
+                    # This is only a shooting seed; full 6-DOF propagation
+                    # still checks clearance, fuel and the landing reserve.
+                    seed[2] += 2.0 * max(0.0, -float(v[2]))
+                if not (progress or partial or self._hop):
+                    # A descending booster whose return is long (out of the
+                    # glide's reach) sinks through the floor on a flat arc: the
+                    # flat impulse stays the first guess, but the shooting
+                    # also compares arcs that pay gravity and arrest the
+                    # descent (all through the same full propagation).
+                    compensated = seed.copy()
+                    compensated[2] += max(0.0, -float(v[2]))
+                    lofted = compensated.copy()
+                    lofted[2] += max(0.0, -float(v[2]))
+                    alternatives = (*alternatives, compensated, lofted)
+                    seed = lateral_seed
             if partial and not self._hop and np.linalg.norm(wind_now[:2]) > 20.0:
                 # Try a gravity-compensated finite-burn seed in strong wind.
                 # The wind at altitude, rather than its 10 m menu setting,
@@ -2677,6 +2879,26 @@ class Autopilot3D:
                     else:
                         alternatives = (seed.copy(),)
                         seed = higher
+            if self._hop and v[2] < 0.0:
+                # A steeper seed can survive attitude acquisition when the
+                # nominal powered arc crosses the low-altitude safety floor.
+                # Compare the propagated arcs, including landing fuel, before
+                # accepting either one.
+                higher = seed.copy()
+                higher[2] += 2.0 * -float(v[2])
+                alternatives = (*alternatives, higher)
+            elif (self._bb_urgent_work and v[2] < 0.0
+                  and np.linalg.norm(v - (wind_now if self.boostback_wind else 0.0)) > self.nose_first_speed):
+                # At the nose-first flow-cone boundary the nominal seed can
+                # lie in a poor aerodynamic basin. Compare a gravity-supporting
+                # seed using the same nonlinear feasibility and fuel checks.
+                higher = seed.copy()
+                higher[:2] *= 0.85
+                higher[2] += max(0.0, higher[2])
+                alternatives = (*alternatives, higher)
+            if self._bb_relaxed:
+                returns = yield from self._ballistic_return_seeds_steps(veh, r, v, m, wind_now, blind)
+                alternatives = (*alternatives, *returns)
         self._bb_seed = seed.copy()
         yield
         prediction, status, evaluations = yield from boostback.solve_steps(
@@ -2686,6 +2908,16 @@ class Autopilot3D:
         self._bb_status = status
         self._bb_evaluations = evaluations
         self._bb_prediction = prediction
+        if not self._bb_cooperative:
+            self._bb_trajectory_epoch = self.elapsed
+        if prediction is None and not initial and retry:
+            # The warm start (the command being flown) can lie in a basin
+            # with no valid arc left -- one such re-solve used to end the
+            # whole return.  Start over from the fresh seeds first.
+            self._bb_dv = None
+            yield from self._boostback_target_steps(veh, r, v, m, wind_now, iterations, progress, cold,
+                                                    partial, retry=False)
+            return
         if prediction is None:
             # Do not fly an unverified delta-v or spend the landing reserve.
             self._bb_dv = None
@@ -2693,6 +2925,68 @@ class Autopilot3D:
             return
         self._bb_dv = prediction.impulse.copy()
         self._bb_reserve = prediction.reserve
+
+    RETURN_SEED_ANGLES_DEG = (25.0, 40.0, 55.0)
+
+    def _ballistic_return_seeds_steps(self, veh, r, v, m, wind_now, blind):
+        """Shooting seeds that really fly back: a burnout velocity towards the
+        pad on a ballistic arc, for a few flight-path angles.
+
+        Far off, descending and receding, the impulsive seed only stops the
+        booster: it burns out low and sinking, the landing burn is due at
+        once and the endpoint no longer depends on the impulse (2 km off at
+        1 km, 200 m/s out: d miss / d impulse = 0) -- the local corrections
+        have no direction and the return was never commanded.  Here, for each
+        angle, the burnout speed whose drag-aware coast and landing burn end
+        on the pad is bisected with the same point-mass models; the finite
+        burn (its displacement and gravity loss) is taken into account
+        approximately.  These are only seeds: the full propagation compares
+        and corrects them."""
+        d = -np.asarray(r[:2], float)
+        distance = float(np.linalg.norm(d))
+        if distance < 1.0:
+            return ()
+        e = d / distance
+        accel = self._thrust_available(veh, r[2]) * self.thrust_scale / m
+        if accel <= G0:
+            return ()
+        seeds = []
+        coast_dt, burn_dt = 0.5, 0.4        # (seeds only: the full propagation decides)
+        for gamma in np.radians(self.RETURN_SEED_ANGLES_DEG):
+            direction = np.array([e[0] * math.cos(gamma), e[1] * math.cos(gamma), math.sin(gamma)])
+            start = np.asarray(r, float).copy()
+            speed = None
+            for _ in range(2):              # burnout point <- burn duration <- speed
+                lo, hi = (20.0, 500.0) if speed is None else (0.8 * speed, 1.25 * speed)
+                found = False
+                for _ in range(7 if speed is None else 4):
+                    mid = 0.5 * (lo + hi)
+                    coast = yield from self._coast_steps(veh, start, mid * direction, m, wind_now, dt=coast_dt,
+                                                         blind=blind)
+                    if coast is None:
+                        hi = mid
+                        continue
+                    miss, _ = yield from self._burn_miss_steps(veh, coast[1], coast[2], m, wind_now, dt=burn_dt,
+                                                               blind=blind)
+                    if float(miss @ e) < 0.0:            # short of the pad
+                        lo = mid
+                    else:
+                        hi, found = mid, True
+                if not found and speed is None:
+                    break
+                speed = hi if found else speed      # (the refinement keeps the first speed when out of bracket)
+                change = speed * direction - v
+                t_burn = float(np.linalg.norm(change)) / math.sqrt(accel * accel - G0 * G0)
+                start = np.asarray(r, float) + 0.5 * (v + speed * direction) * t_burn
+                if start[2] < self._bb_floor:
+                    speed = None
+                    break
+            if speed is None:
+                continue
+            impulse = speed * direction - v
+            impulse[2] += G0 * float(np.linalg.norm(impulse)) / math.sqrt(accel * accel - G0 * G0)
+            seeds.append(impulse)
+        return tuple(seeds)
 
     def _aero_steer(self, veh, r, v, m, wind_now):
         """Engines-first attitude with a small angle of attack whose body/grid-fin
@@ -2721,28 +3015,34 @@ class Autopilot3D:
             return base
         e_a = a_des / an
         rho, _, _, a_snd = atmosphere(max(0.0, r[2]))
-        l0 = float(np.dot(self._quick(veh, vr, base, rho, a_snd, veh.legs), e_a))
-        a_max = math.radians(self.aero_steer_max_deg)
-
-        def lift(alpha, e):
-            axis = math.cos(alpha) * base + math.sin(alpha) * e
-            return float(np.dot(self._quick(veh, vr, axis, rho, a_snd, veh.legs), e_a)) - l0
-
-        # Engines-first, the lift points against the tilt: find the side that
-        # pushes along e_a, then the angle (secant on the real lift curve).
-        alpha = math.radians(5.0)
-        best = max(((e, lift(alpha, e)) for e in (-e_a, e_a)), key=lambda x: x[1])
-        e, l_a = best
-        if l_a <= 0.0:
-            return base
-        for _ in range(2):
-            alpha = float(np.clip(alpha * an * m / l_a, 0.0, a_max))
-            if alpha >= a_max:
-                break
-            l_a = lift(alpha, e)
-            if l_a <= 0.0:
-                break
-        return math.cos(alpha) * base + math.sin(alpha) * e
+        # Search the full attitude range, including the non-monotonic lift
+        # curve.  Pick the first attitude that supplies the requested force;
+        # when it is unattainable, pick the strongest available force.  This
+        # avoids an arbitrary attitude cap and avoids commanding a larger
+        # angle on the far side of a lift peak for the same force.
+        angles = np.linspace(0.0, math.pi, 73)
+        axes = np.concatenate([np.cos(angles)[:, None] * base + sign * np.sin(angles)[:, None] * e_a
+                               for sign in (-1.0, 1.0)])
+        forces = self.aero.quick_force_many(np.broadcast_to(vr, axes.shape), axes, rho, a_snd, veh.legs,
+                                             trim=self._lift_trim_many(veh)) @ e_a
+        forces = forces.reshape(2, -1) - forces[0]
+        required = an * m
+        choices = []
+        for i, sign in enumerate((-1.0, 1.0)):
+            force = forces[i]
+            hits = np.flatnonzero(force >= required)
+            if len(hits):
+                j = int(hits[0])
+                alpha = float(np.interp(required, force[j - 1:j + 1], angles[j - 1:j + 1])) if j else 0.0
+                choices.append((alpha, sign))
+        if choices:
+            alpha, sign = min(choices)
+        else:
+            i, j = np.unravel_index(int(np.argmax(forces)), forces.shape)
+            if forces[i, j] <= 0.0:
+                return base
+            alpha, sign = float(angles[j]), (-1.0, 1.0)[i]
+        return math.cos(alpha) * base + sign * math.sin(alpha) * e_a
 
     def _ignite(self, veh, r, v, m, wind_now, t_burn):
         self._dir_prev = veh.axis.copy()

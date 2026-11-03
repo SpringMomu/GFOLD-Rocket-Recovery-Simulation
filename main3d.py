@@ -11,6 +11,9 @@ import argparse
 
 
 def main() -> None:
+    from common.venv import ensure_venv
+
+    ensure_venv()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--test", action="store_true", help="run the headless landing regression")
     parser.add_argument("--port", type=int, default=8765)

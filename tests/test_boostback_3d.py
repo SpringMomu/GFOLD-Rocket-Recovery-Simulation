@@ -7,7 +7,15 @@ import numpy as np
 import pytest
 
 from common.conic import ConicSolver
-from lander3d.boostback import Prediction, correction, predict, steering, turn_towards
+from lander3d.boostback import (
+    Prediction,
+    braking_handover,
+    correction,
+    predict,
+    prediction_matches_state,
+    steering,
+    turn_towards,
+)
 from lander3d.sim import Sim3D
 
 
@@ -34,12 +42,44 @@ def test_predictor_owns_its_vehicle_actuators_and_aerodynamic_state():
     r, v, m = ap._state(veh)
     result = predict(ap, veh, r, v, m, np.zeros(3), np.array([-180.0, -15.0, 60.0]))
     assert result.valid and result.duration > 1.0 and result.fuel > 0.0
+    assert len(result.trajectory) > 3
+    assert np.allclose(result.trajectory[0][1], r)
+    assert any(t == pytest.approx(result.duration + result.coast_time) for t, _ in result.trajectory)
+    assert np.allclose(result.trajectory[-1][1][:2], result.miss)
+    assert all(a[0] < b[0] for a, b in zip(result.trajectory, result.trajectory[1:]))
     assert result.fuel + result.reserve < propellant
     assert veh.mass == mass and veh.throttle == throttle and veh.propellant == propellant
     assert vars(veh.controls) == vars(controls)
     assert sim.aero.last == info
     for k, value in state.items():
         assert np.array_equal(getattr(veh, k), value), k
+
+
+def test_boostback_display_follows_live_state_and_ages_accepted_trajectory():
+    sim = Sim3D(cfd=False, wind_on=False)
+    ap = sim.autopilot
+    ap._bb_prediction = Prediction(np.ones(3), np.zeros(2), 1.0, 1.0, 2.0, 2.0, True,
+                                   trajectory=[(0.0, np.array([10.0, 0.0, 100.0])),
+                                               (1.0, np.array([20.0, 0.0, 90.0])),
+                                               (2.0, np.array([30.0, 0.0, 80.0]))])
+    ap._bb_trajectory_epoch = 4.0
+    ap.elapsed = 5.1
+    ap._update_boostback_display(np.array([23.0, 1.0, 88.0]))
+    assert ap.predicted_points == [(23.0, 1.0, 88.0), (30.0, 0.0, 80.0)]
+    ap.elapsed = 5.3
+    ap._update_boostback_display(np.array([25.0, 1.0, 86.0]))
+    assert ap.predicted_points[0] == (25.0, 1.0, 86.0)
+
+
+def test_delayed_prediction_requires_the_real_powered_state_to_match():
+    p = Prediction(np.ones(3), np.zeros(2), 1.0, 1.0, 2.0, 1.0, True,
+                   trajectory=[(0.0, np.array([0.0, 0.0, 100.0])),
+                               (1.0, np.array([10.0, 0.0, 90.0])),
+                               (2.0, np.array([20.0, 0.0, 80.0]))])
+    assert prediction_matches_state(p, 1.5, np.array([15.0, 0.0, 85.0]), np.array([10.0, 0.0, -10.0]))
+    assert not prediction_matches_state(p, 1.5, np.array([50.0, 0.0, 85.0]), np.array([10.0, 0.0, -10.0]))
+    assert not prediction_matches_state(p, 1.5, np.array([15.0, 0.0, 85.0]), np.array([-20.0, 0.0, -10.0]))
+    assert not prediction_matches_state(p, 3.0, np.array([15.0, 0.0, 85.0]), np.array([10.0, 0.0, -10.0]))
 
 
 def test_zero_impulse_still_propagates_engine_shutdown():
@@ -99,3 +139,17 @@ def test_ignition_event_interpolation_handles_an_infinite_previous_burn_time(mon
     with np.errstate(invalid="raise"):
         event = ap._coast(veh, r, v, m, np.zeros(3), interpolate=True)
     assert event is not None and np.isfinite(event[3]) and event[3] == 3.0
+
+
+def test_hop_hands_over_only_when_braking_the_return():
+    sim = Sim3D(cfd=False, wind_on=False)
+    ap = sim.autopilot
+    ap._hop = True
+    up, still = np.array([0.0, 0.0, 1.0]), np.zeros(3)
+    # Still flying away from the pad (+x): the retrograde burn that turns the
+    # booster round is the return itself, not a braking handover.
+    assert not braking_handover(ap, np.array([-200.0, 0.0, 50.0]), up, np.array([80.0, 0.0, -20.0]), still,
+                                np.array([3000.0, 0.0, 800.0]))
+    # Flying back towards the pad and the change wanted brakes the approach.
+    assert braking_handover(ap, np.array([60.0, 0.0, 10.0]), up, np.array([-80.0, 0.0, -20.0]), still,
+                            np.array([1500.0, 0.0, 800.0]))

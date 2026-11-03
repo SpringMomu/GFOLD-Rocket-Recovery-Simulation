@@ -5,10 +5,10 @@
 // force coefficients are always live.
 import { V, rot, slerp } from "./gl.js";
 import { Scene } from "./scene.js?v=trajectory-tvc-2";
-import { HUD } from "./hud.js";
+import { HUD } from "./hud.js?v=landing-history-1";
 import { Fluid3D } from "./fluid.js";
 import { plumeParams } from "./plume.js";
-import { initControls } from "./controls.js";
+import { initControls } from "./controls.js?v=landing-history-1";
 
 const canvas = document.getElementById("view");
 let scene;
@@ -37,7 +37,7 @@ const buf = [];                 // [{t: arrival ms, st}]
 let latest = null;
 let online = true;
 const CLEAN = /[?&]clean/.test(location.search);
-const view = { flowMode: 0, volField: 1, cam: 0, cfdCoef: null, cfdSps: 0, flowTime: 0, showTraj: false };
+const view = { flowMode: 0, volField: 1, cam: 0, cfdCoef: null, cfdSps: 0, flowTime: 0, showTraj: false, showAttitude: false };
 const CAM_NAMES = ["环绕", "着陆台", "侧视", "箭身（裙部）", "箭身（栅格舵）"];
 const VOL_NAMES = ["染料", "涡量", "速度"];
 const VOL_TO_TUNNEL = ["dye", "vort", "speed"];
@@ -139,6 +139,7 @@ function command(k) {
   else if (k === "replan") act("replan");
   else if (k === "f") { view.flowMode = 1 - view.flowMode; toast(view.flowMode ? "主视图气流：" + VOL_NAMES[view.volField] : "主视图气流已关闭，流场计算与风洞截面照常"); }
   else if (k === "k") { view.showTraj = !view.showTraj; toast(view.showTraj ? "实际轨迹与预测轨迹：显示" : "实际轨迹与预测轨迹：隐藏"); }
+  else if (k === "attitude") { view.showAttitude = !view.showAttitude; if (view.showAttitude) view.showTraj = true; toast(view.showAttitude ? "轨迹姿态：显示" : "轨迹姿态：隐藏"); }
   else if (k === "b") { view.volField = (view.volField + 1) % 3; hud.tunnel.setMode(VOL_TO_TUNNEL[view.volField]); toast("显示量：" + VOL_NAMES[view.volField]); }
   else if (k === "v") { view.cam = (view.cam + 1) % CAM_NAMES.length; toast("相机：" + CAM_NAMES[view.cam]); }
   else if (k === "l") { hud.resetLayout(); toast("仪表布局、折叠状态与窗口大小已恢复默认"); }
@@ -646,6 +647,25 @@ function ribbon(pts, width, color, eye, fade = false) {
   }
 }
 
+// Axis glyphs show the planned thrust direction or the actual body axis;
+// sample evenly by index to keep long flights legible and inexpensive.
+function attitudeGlyphs(points, axes, eye, width, color, length) {
+  if (!points || !axes || points.length !== axes.length) return;
+  const stride = Math.max(1, Math.ceil(points.length / 24));
+  for (let i = 0; i < points.length; i += stride) {
+    const p = points[i], axis = axes[i];
+    if (!axis || V.len(axis) < 0.5) continue;
+    const tip = V.add(p, V.mul(axis, length));
+    let side = V.cross(axis, V.sub(eye, p));
+    const n = V.len(side);
+    if (n < 1e-6) continue;
+    side = V.mul(side, length * 0.13 / n);
+    const tail = V.sub(tip, V.mul(axis, length * 0.22));
+    ribbon([p, tip], width, color, eye);
+    ribbon([V.add(tail, side), tip, V.sub(tail, side)], width, color, eye);
+  }
+}
+
 
 // ------------------------------------------------------------------ frame
 let lastFrame = performance.now();
@@ -698,6 +718,11 @@ function frame(now) {
     // Actual trajectory (blue) and G-FOLD plan (green).
     if (!CLEAN && view.showTraj && view.flowMode === 0 && st.trail && st.trail.length > 1) ribbon(st.trail.concat([st.pos]), pxW, [0.3, 0.65, 1.0, 0.75], eye);
     if (!CLEAN && view.showTraj && view.flowMode === 0 && st.plan && st.plan.length > 1) ribbon(st.plan, (p) => pxW(p) * 1.2, [0.35, 1.0, 0.6, 0.85], eye);
+    if (!CLEAN && view.showTraj && view.showAttitude && view.flowMode === 0) {
+      const length = Math.max(18, (st.spec && st.spec.length || 40) * 0.8);
+      attitudeGlyphs(st.trail, st.trail_axes, eye, pxW, [0.4, 0.72, 1, 0.9], length);
+      attitudeGlyphs(st.plan, st.plan_axes, eye, pxW, [0.45, 1, 0.65, 0.9], length);
+    }
     scene.time = now / 1000;
     const stR = Object.assign({}, st, { wind: st.wind || [0, 0, 0] });
     const fx = { rcs: rcsJets(st), lines: lineBuf.subarray(0, lineN * 8), particles: (rocketAxis = [V.add(st.pos, rot(st.q, [0, 0, -2])), rot(st.q, [0, 0, 1])], buildParticles(cam.eye, plumeNow)), plume: plumeNow };

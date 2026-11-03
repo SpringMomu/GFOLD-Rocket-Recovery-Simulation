@@ -101,11 +101,25 @@ def _first_phase(pos, vel):
     return sim.autopilot.phase
 
 
-def test_mid_range_miss_boosts_back_instead_of_a_low_sideways_burn():
-    # ~240 m off from a slow 2 km fall: the glide cannot remove it and the
-    # landing burn would brake to a hover at ~80 m to traverse sideways.
-    assert _first_phase((150.0, 100.0, 2000.0), (0.0, 0.0, -30.0)) == "BOOSTBACK"
-    # A small (wind) drift is left to the glide.
+def test_mid_range_miss_never_flies_a_return_without_thrust():
+    # ~240 m off from a slow 2 km fall.  This used to assert BOOSTBACK, but the
+    # accepted "return" had zero thrust: the nose-first handover fired on the
+    # sign of a near-zero product, the predicted arc shut down at once and the
+    # booster waited 3 s at zero throttle before the coast (the same flight
+    # as going straight to the coast).  Falling at 30-60 m/s with the fins
+    # stowed it cannot turn to the return attitude unpowered, so there is no
+    # real return here; what must hold is that none is faked.
+    sim = Sim3D(cfd=False)
+    sim.vehicle.reset(position=(150.0, 100.0, 2000.0), velocity=(0.0, 0.0, -30.0), propellant=4000, on_pad=False)
+    sim.vehicle.pos[2] += sim.vehicle.rest_height
+    sim.autopilot.reset()
+    sim.autopilot_on = True
+    sim.step(1.0 / 240.0)
+    ap = sim.autopilot
+    assert ap.phase != "BOOSTBACK" or (ap._bb_prediction is not None and ap._bb_prediction.fuel > 0.0)
+
+
+def test_small_drift_is_left_to_the_glide():
     assert _first_phase((0.0, 0.0, 2000.0), (0.0, 0.0, -30.0)) == "COAST"
 
 
@@ -113,6 +127,24 @@ def test_low_far_booster_hops_instead_of_a_long_powered_traverse():
     # 2 km off at 600 m, at rest: the landing burn would traverse at ~20 m/s
     # for ~75 s (gravity loss all the way) and run the tank dry.
     assert _first_phase((2000.0, 0.0, 600.0), (0.0, 0.0, 0.0)) == "BOOSTBACK"
+
+
+def test_low_far_descent_can_boost_back_before_vertical_braking_is_due():
+    # The direct landing burn's lateral demand is already urgent here, but
+    # there is still enough vertical margin for a powered return.
+    assert _first_phase((2000.0, 0.0, 400.0), (0.0, 0.0, -30.0)) == "BOOSTBACK"
+    assert _first_phase((2000.0, 0.0, 200.0), (0.0, 0.0, -30.0)) == "BOOSTBACK"
+
+
+def test_far_receding_descent_boosts_back_whatever_the_speed():
+    # 3 km off at 1 km, descending and still flying away: the glide cannot
+    # remove that miss.  The lateral urgency of the landing-burn estimate,
+    # the airspeed (> 180 m/s) or an already due vertical burn used to veto
+    # the return and leave a 3-4 km traverse to the landing burn.
+    for vel in ((150.0, 0.0, -30.0), (200.0, 0.0, -80.0), (50.0, 0.0, -150.0)):
+        assert _first_phase((3000.0, 0.0, 1000.0), vel) == "BOOSTBACK", vel
+    # Below the high boost-back band and faster than the hop band (100 m/s).
+    assert _first_phase((3000.0, 0.0, 800.0), (100.0, 0.0, -30.0)) == "BOOSTBACK"
 
 
 def _fly(pos, vel, propellant=4000, t_max=260.0):
@@ -131,6 +163,23 @@ def _fly(pos, vel, propellant=4000, t_max=260.0):
 def test_extreme_start_is_recovered(pos):
     veh = _fly(pos, (0.0, 0.0, 0.0))
     assert passed(veh, catch=False), (veh.state, veh.touchdown)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("height", [200.0, 400.0])
+def test_low_far_descent_boosts_back_and_lands(height):
+    veh = _fly((2000.0, 0.0, height), (0.0, 0.0, -30.0))
+    assert passed(veh, catch=False), (veh.state, veh.touchdown)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("vel", [(50.0, 0.0, -30.0), (150.0, 0.0, -80.0), (200.0, 0.0, -30.0)],
+                         ids=["50-out-30-down", "150-out-80-down", "200-out-30-down"])
+def test_far_receding_descent_returns_and_lands(vel):
+    veh = _fly((3000.0, 0.0, 1000.0), vel, propellant=5500)
+    assert passed(veh, catch=False), (veh.state, veh.touchdown)
+    # (before: a 3-4 km traverse by the landing burn, ~110 s and the tank dry, or a crash)
+    assert veh.touchdown["time"] < 100.0 and veh.propellant > 800.0, veh.touchdown
 
 
 def test_tower_arms_steer_to_an_off_centre_booster():
@@ -154,6 +203,16 @@ def test_tower_arms_steer_to_an_off_centre_booster():
     assert abs(a_plus - a_minus) > 0.02                    # not the symmetric pose of a centred booster
     assert all(g < 0.2 for g in tower.face_gaps(veh))
     assert len(tower.snapshot()["arms"]) == 2
+
+
+def test_tower_does_not_report_secured_with_only_one_arm_touching(monkeypatch):
+    tower = CatchTower()
+    veh = Vehicle()
+    veh.reset(position=(0.0, 0.0, tower.catch_base_z + 3.0), on_pad=False)
+    tower.mode = "CLOSING"
+    monkeypatch.setattr(tower, "face_gaps", lambda _: [0.0, 0.6])
+    tower.update(1.0 / 120.0, veh)
+    assert not tower.secured
 
 
 def test_closing_arms_re_aim_when_the_booster_centres_after_the_latch():

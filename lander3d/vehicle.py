@@ -444,7 +444,14 @@ class Vehicle:
         ``aero`` is a callable ``aero(vehicle, v_rel, rho, a, com_world)``
         returning ``(force_world, moment_world_about_com, info)``.
         """
-        if self.state in ("CRASHED", "LANDED", "CAUGHT"):
+        if self.state in ("LANDED", "CAUGHT"):
+            # On contact the flight controller releases the fins.  Keep the
+            # panels deployed, but return each servo to its neutral angle.
+            self.controls.fins = (0.0, 0.0, 0.0)
+            self.fins = np.zeros(3)
+            self.fin_defl += np.clip(-self.fin_defl, -self.spec.fin_rate * dt, self.spec.fin_rate * dt)
+            return
+        if self.state == "CRASHED":
             return
         s = self.spec
         c = self.controls

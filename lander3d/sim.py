@@ -106,6 +106,10 @@ class Sim3D:
             self.flight_time = 0.0
             self._flight_finished = False
             self.trail = [self.vehicle.pos.copy()]
+            self.trail_axes = [self.vehicle.axis.copy()]
+            self.history = []
+            self._history_next = 0.0
+            self._record_history()
             self.scenario_name = sc["name"]
             self.events = [(0.0, f"SCENARIO: {sc['name']}")]
 
@@ -120,6 +124,10 @@ class Sim3D:
             self.flight_time = 0.0
             self._flight_finished = False
             self.trail = [self.vehicle.pos.copy()]
+            self.trail_axes = [self.vehicle.axis.copy()]
+            self.history = []
+            self._history_next = 0.0
+            self._record_history()
             self.scenario_name = "ON PAD - MANUAL"
 
     def _set_tower(self, tower: CatchTower | None) -> None:
@@ -255,6 +263,14 @@ class Sim3D:
                 self.apply_action(action)
 
     # -- stepping --------------------------------------------------------------
+    def _record_history(self) -> None:
+        """Time, vertical tilt, speed, altitude and horizontal target error."""
+        v = self.vehicle
+        self.history.append([round(self.time, 2), round(v.tilt_deg(), 2),
+                             round(float(np.linalg.norm(v.vel)), 2), round(v.altitude, 2),
+                             round(float(np.linalg.norm(v.pos[:2])), 2)])
+        self._history_next = self.time + 0.5
+
     def step(self, dt: float) -> None:
         with self.lock:
             if self.paused:
@@ -276,6 +292,10 @@ class Sim3D:
                 self._flight_finished = v.state in ("LANDED", "CAUGHT")
             if len(self.trail) == 0 or np.linalg.norm(v.pos - self.trail[-1]) > 4.0:
                 self.trail.append(v.pos.copy())
+                self.trail_axes.append(v.axis.copy())
+            if ((not self._flight_finished and v.state != "CRASHED" and self.time >= self._history_next)
+                    or (v.state in ("LANDED", "CAUGHT", "CRASHED") and v.state != previous_state)):
+                self._record_history()
             if self.tower is not None and self.tower.events:
                 self.events.extend((self.time, e) for e in self.tower.events)
                 self.tower.events.clear()
@@ -302,11 +322,6 @@ class Sim3D:
         catch up; it just runs slower for a moment.
         """
         elapsed = min(0.1, max(0.0, real_seconds))
-        if self.autopilot._bb_cooperative and self.autopilot._bb_work is not None:
-            # Do not turn a slow guidance slice into an even larger slice on
-            # the next callback. Drop excess wall time while solving so the
-            # worker continues to service state and input messages smoothly.
-            elapsed = min(elapsed, 0.008)
         self._realtime_debt += elapsed * self.time_warp
         self._realtime_debt = min(self._realtime_debt, 0.1 * max(1.0, self.time_warp))
         steps = 0

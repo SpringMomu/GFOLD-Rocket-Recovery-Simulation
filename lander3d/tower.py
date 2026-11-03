@@ -263,7 +263,6 @@ class CatchTower:
             if in_window and steady:
                 self._close_xy = here
         done = []
-        touching = False
         for k, sgn in enumerate((1.0, -1.0)):
             if self.mode == "OPEN":
                 target, rate = ARM_OPEN, READY_RATE
@@ -281,9 +280,8 @@ class CatchTower:
             self.rates[k] = step / dt if dt > 0 else 0.0
             self.angles[k] += step
             done.append(gaps[k] <= FACE_CLEARANCE + 0.03)   # the face is against the barrel
-            touching = touching or gaps[k] <= 0.02
         if self.mode == "CLOSING":
-            self.secured = all(done) or touching       # as soon as an arm lays on the barrel it is held
+            self.secured = all(done)                   # both faces must support the barrel before settling
             if self.secured and all(abs(self.angles[k] - arm_angle_for(self._close_xy, sgn)) < 2e-3 for k, sgn in enumerate((1.0, -1.0))):
                 self.mode = "CLOSED"
             elif not self.secured and r > ABORT_RADIUS and min(gaps) > 0.3:
