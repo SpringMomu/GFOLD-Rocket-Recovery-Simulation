@@ -153,3 +153,23 @@ def test_hop_hands_over_only_when_braking_the_return():
     # Flying back towards the pad and the change wanted brakes the approach.
     assert braking_handover(ap, np.array([60.0, 0.0, 10.0]), up, np.array([-80.0, 0.0, -20.0]), still,
                             np.array([1500.0, 0.0, 800.0]))
+
+
+def test_landing_burn_is_not_due_at_the_apogee_of_a_lofted_return():
+    # 8.3 km up, 3.3 km out, 128 m/s towards the pad, just past the apogee:
+    # the burn time over that height is about an hour, not the 21 s the
+    # floored deceleration gave -- whose lateral term lit the burn up there.
+    ap = Sim3D(cfd=False, wind_on=False).autopilot
+    veh = Sim3D(cfd=False, wind_on=False).vehicle
+    r = np.array([3337.0, 0.0, 8339.0])
+    v = np.array([-128.0, 0.0, -3.3])
+    frac, t_burn, direction = ap._burn_need(veh, r, v, veh.mass, 0.0)
+    assert t_burn == pytest.approx(2.0 * (r[2] - 0.45 * 3.3) / (3.3 + ap.gate_speed), rel=1e-6)
+    assert frac < ap._ignition_threshold(t_burn, direction)
+    # where the deceleration floor does not bind, the burn time is unchanged
+    v = np.array([0.0, 0.0, -150.0])
+    r = np.array([0.0, 0.0, 1500.0])
+    _, t_burn, _ = ap._burn_need(veh, r, v, veh.mass, 0.0)
+    h_eff = r[2] - 0.45 * 150.0
+    a_v = (150.0 ** 2 - ap.gate_speed ** 2) / (2.0 * h_eff)
+    assert t_burn == pytest.approx((150.0 - ap.gate_speed) / a_v, rel=1e-9)

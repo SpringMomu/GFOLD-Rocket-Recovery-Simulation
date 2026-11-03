@@ -186,12 +186,25 @@ class Autopilot3D:
     # be whatever fitted in a 15 ms wall slice per call: on a phone the solve
     # then lagged seconds behind the booster, the green line updated rarely
     # and the return ended with "no-command", pushed sideways off the pad.
-    # 30 000 (~0.75 s of CPython per simulated second) is about what a
-    # desktop browser did; 10 000 found the first return only 4-6 s into the
-    # 8 s boost-back of scenario 8 in a 21 m/s wind.
-    boostback_work_rate = 30000.0
-    boostback_work_urgent = 2.0   # x quota when coasting would soon reach the boost-back floor
+    # The cooperative solves propagate the powered arc with the 0.2 s 6-DOF
+    # step (boostback.FAST_PREDICT_DT), a few times cheaper a solve, so
+    # 15 000 (~0.4 s of CPython per simulated second) keeps a browser in
+    # real time.  With the 0.05 s step 30 000 was needed (10 000 then found
+    # the first return only 4-6 s into the 8 s boost-back of scenario 8 in
+    # a 21 m/s wind) and Pyodide ran every far return in slow motion.
+    boostback_work_rate = 15000.0
+    boostback_work_urgent = 2.0   # x quota for the first command, and when coasting would soon reach the boost-back floor
     boostback_slice_wall = 0.015  # s, longest wall slice per realtime call (keeps the frame stream going)
+    # Trajectory predictor for the display (green line), cooperative path:
+    # independent of the targeting solve, the command being flown (or, before
+    # the first solution, engine cut now: the instantaneous impact arc) is
+    # propagated from the live state through the same powered-arc / coast /
+    # landing-handover models every boostback_display_period, on its own
+    # fixed work quota.  The line used to change only when a solve was
+    # accepted -- every 2-4 s far out, ~100 m off the vehicle by then, and
+    # before the first one it still showed the pre-return coast.
+    boostback_display_period = 0.5    # s
+    boostback_display_rate = 8000.0   # work units per simulated second (~0.2 s CPython)
     # Hop: low (below boostback_min_alt), slow and far off.  The landing burn
     # would fly the divert as a long traverse at its lateral-speed limit
     # (~30 m/s: faster needs thrust along the motion, nose-first, which the
@@ -619,6 +632,12 @@ class Autopilot3D:
         self._bb_prediction = None
         self._bb_trajectory_epoch = 0.0
         self._bb_display_next = 0.0
+        self._bb_display_work = None
+        self._bb_display_debt = 0.0
+        self._bb_display_due = 0.0
+        self._bb_display_prediction = None
+        self._bb_display_epoch = 0.0
+        self._bb_display_pending_epoch = 0.0
         self._bb_status = "idle"
         self._bb_evaluations = 0
         self._bb_work = None
@@ -1227,7 +1246,12 @@ class Autopilot3D:
         if h_eff <= 0.5:
             return 9.0, 1.0, np.array([0.0, 0.0, 1.0])
         a_v = max(0.1, (vz * vz - self.gate_speed ** 2) / (2.0 * h_eff))
-        t_b = max(0.5, (-vz - self.gate_speed) / a_v)
+        # Constant-deceleration burn over the height: t = 2 h / (|vz| + v_gate),
+        # the same as (|vz| - v_gate) / a_v wherever a_v is above its floor.
+        # Near an apogee (vz ~ -3 m/s, 8 km up) the floored a_v made that a
+        # 21 s burn instead of an hour-long one, and the lateral ZEM/ZEV term
+        # 6 r / t^2 lit the landing burn at the top of a lofted boost-back arc.
+        t_b = max(0.5, 2.0 * h_eff / (-vz + self.gate_speed))
         a_lat = -(6.0 * r[:2] / t_b ** 2 + 4.0 * v[:2] / t_b) * 1.0
         need = np.array([a_lat[0], a_lat[1], a_v + g - drag_up / 3.0])
         frac = m * float(np.linalg.norm(need)) / self._thrust_available(veh, r[2])
@@ -2300,6 +2324,9 @@ class Autopilot3D:
             elif self.elapsed >= self._bb_next or self._bb_dv is None:
                 self._boostback_target(veh, r, v, m, wind_now)
                 self._bb_next = self.elapsed + self.boostback_solve_period
+            if (self._bb_cooperative and self._bb_display_work is None
+                    and self.elapsed >= self._bb_display_due):
+                self._submit_boostback_display(veh, wind_now)
             self._update_boostback_display(r)
             toward = -np.asarray(r[:2], float)
             toward /= max(1e-9, float(np.linalg.norm(toward)))
@@ -2676,7 +2703,7 @@ class Autopilot3D:
         self._bb_fast_work = fast
         self._bb_work = ap._boostback_target_steps(
             fv, *ap._state(fv), np.array(wind_now, float),
-            iterations=(5 if seed is None else 2), progress=fast, partial=True)
+            iterations=(5 if seed is None else 2), progress=fast, partial=True, fast=True)
 
     def _accept_boostback_prediction(self, prediction):
         """Commit a prediction, corrected from its frozen state to the live one."""
@@ -2691,14 +2718,72 @@ class Autopilot3D:
         self._bb_reserve = prediction.reserve
         self._bb_prediction = prediction
         self._bb_trajectory_epoch = self._bb_work_started
+        # A display prediction of the previous command no longer shows what
+        # will be flown: predict the new one from the live state at once.
+        self._bb_display_prediction = None
+        if self._bb_display_work is not None:
+            self._bb_display_work.close()
+        self._bb_display_work = None
+        self._bb_display_due = self.elapsed
+
+    def _submit_boostback_display(self, veh, wind_now):
+        """Start the display prediction of the command being flown, from the
+        live state (see ``boostback_display_period``).  Same powered-arc,
+        coast and landing-handover models as the targeting; its own copies of
+        the autopilot and vehicle, so it changes nothing that flies."""
+        ap = copy.copy(self)
+        ap.aero = copy.copy(self.aero) if self.aero is not None else None
+        ap._bb_work = ap._bb_work_ap = ap._bb_pending = ap._bb_display_work = None
+        ap._w10 = None if self._w10 is None else self._w10.copy()
+        ap._wind_ref = (self._wind_ref[0].copy(), self._wind_ref[1])
+        impulse = np.zeros(3) if self._bb_dv is None else self._bb_dv.copy()
+        fv = self._frozen_vehicle(veh)
+        self._bb_display_pending_epoch = self.elapsed
+        self._bb_display_due = self.elapsed + self.boostback_display_period
+        self._bb_display_work = boostback.predict_steps(
+            ap, fv, *ap._state(fv), np.array(wind_now, float), impulse,
+            dt=boostback.FAST_PREDICT_DT, fast=True)
+
+    def _advance_boostback_display(self, budget, deadline):
+        """Feed the display prediction from its own quota; True if it still owes work."""
+        if self._bb_display_work is None:
+            self._bb_display_debt = 0.0
+            return False
+        self._bb_display_debt += max(0.0, budget) * self.boostback_display_rate
+        while self._bb_display_debt > 0.0:
+            try:
+                cost = next(self._bb_display_work)
+            except StopIteration as done:
+                prediction = done.value
+                self._bb_display_work = None
+                self._bb_display_debt = 0.0
+                if prediction is not None and prediction.trajectory:
+                    self._bb_display_prediction = prediction
+                    self._bb_display_epoch = self._bb_display_pending_epoch
+                    self._bb_display_next = 0.0
+                return False
+            except Exception as error:
+                self._bb_error = repr(error)
+                self._bb_display_work = None
+                self._bb_display_debt = 0.0
+                return False
+            self._bb_display_debt -= cost if isinstance(cost, int) else 1
+            if time.monotonic() >= deadline:
+                break
+        return self._bb_display_debt > 0.0
 
     def _update_boostback_display(self, r):
-        """Display the remaining propagated return, anchored at the live vehicle."""
-        prediction = self._bb_prediction
-        if prediction is None or not prediction.trajectory or self.elapsed < self._bb_display_next:
+        """Display the remaining propagated return, anchored at the live
+        vehicle: the newest of the accepted solution and the display
+        prediction of the command being flown."""
+        sources = [(self._bb_trajectory_epoch, self._bb_prediction),
+                   (self._bb_display_epoch, self._bb_display_prediction)]
+        sources = [(e, p) for e, p in sources if p is not None and p.trajectory]
+        if not sources or self.elapsed < self._bb_display_next:
             return
+        epoch, prediction = max(sources, key=lambda item: item[0])
         self._bb_display_next = self.elapsed + 0.1
-        age = max(0.0, self.elapsed - self._bb_trajectory_epoch)
+        age = max(0.0, self.elapsed - epoch)
         points = [r] + [p for t, p in prediction.trajectory if t > age]
         self.predicted_points = [(float(p[0]), float(p[1]), float(p[2] + self.h_off)) for p in points]
 
@@ -2730,9 +2815,18 @@ class Autopilot3D:
         # A distant, low vehicle may have no near-perfect initial iterate.
         # Start a physically propagated, fuel-reserved return once it removes
         # most of the unpowered miss; subsequent solves refine it further.
+        # A return out of the glide's reach flies the wait burn (full thrust
+        # towards the pad) until a command is accepted, so each solve starts
+        # from a state the burn has already moved on from: 6 km out at 7 km,
+        # 250 m/s out, every candidate ended 150-340 m off (out of 10 km) and
+        # none was flown -- the wait burn ran out with "no-command" and the
+        # booster fell 3 km short.  The first verified command is flown and
+        # refined closed-loop, as on the synchronous path, once it removes
+        # 90 % of the unpowered miss (near the pad that is the 150 m tolerance).
         initial_miss = float(np.linalg.norm(self._burn_miss_now))
-        partial_return = (self._bb_urgent_work and self._bb_dv is None and initial_miss > 350.0
-                          and prediction.valid and np.linalg.norm(prediction.miss) <= 0.25 * initial_miss)
+        share = 0.25 if self._bb_urgent_work else 0.1 if self._bb_relaxed else 0.0
+        partial_return = (self._bb_dv is None and initial_miss > 350.0
+                          and prediction.valid and np.linalg.norm(prediction.miss) <= share * initial_miss)
         improving_partial = (self._bb_urgent_work and self._bb_dv is not None and self._bb_prediction is not None
                              and self.elapsed - self._bb_work_started <= 2.0 and prediction.valid
                              and np.linalg.norm(prediction.miss) < 0.7 * np.linalg.norm(self._bb_prediction.miss))
@@ -2768,7 +2862,8 @@ class Autopilot3D:
     def boostback_work_pending(self) -> bool:
         """Whether the boost-back solve is owed steps for simulated time already
         flown (the realtime loop then holds the clock and works first)."""
-        return self._bb_work is not None and self._bb_work_debt > 0.0
+        return ((self._bb_work is not None and self._bb_work_debt > 0.0)
+                or (self._bb_display_work is not None and self._bb_display_debt > 0.0))
 
     def advance_boostback_work(self, budget=0.004, deadline=None):
         """Feed the boost-back solve in bounded slices between physics steps.
@@ -2782,14 +2877,20 @@ class Autopilot3D:
         if not self._boostback or self.burn_locked or self._boostback_done:
             self._bb_work = None
             self._bb_work_debt = 0.0
+            self._bb_display_work = None
+            self._bb_display_debt = 0.0
             return
+        if deadline is None:
+            deadline = time.monotonic() + self.boostback_slice_wall
+        self._advance_boostback_display(budget, deadline)
         if self._bb_work is None:
             self._bb_work_debt = 0.0
             return
-        rate = self.boostback_work_rate * (self.boostback_work_urgent if self._bb_urgent_work else 1.0)
+        # (The first command, too: until one is accepted the booster flies
+        # no return at all.)
+        urgent = self._bb_urgent_work or self._bb_dv is None
+        rate = self.boostback_work_rate * (self.boostback_work_urgent if urgent else 1.0)
         self._bb_work_debt += max(0.0, budget) * rate
-        if deadline is None:
-            deadline = time.monotonic() + self.boostback_slice_wall
         while self._bb_work_debt > 0.0:
             if self._bb_work is None:
                 break
@@ -2826,12 +2927,20 @@ class Autopilot3D:
         boostback.finish(self._boostback_target_steps(veh, r, v, m, wind_now))
 
     def _boostback_target_steps(self, veh, r, v, m, wind_now, iterations=None, progress=False, cold=False,
-                                partial=False, retry=True):
+                                partial=False, retry=True, fast=None):
         """Finite-burn predictor-corrector, closed on the landing handover.
 
         The impulsive estimate only seeds the finite-burn shooting problem.
         Accepted commands propagate turn time, mass flow, shutdown and coast.
+        ``fast``: the 0.2 s 6-DOF step of the powered arc (boostback.FAST_*;
+        default: as ``progress``).  The cooperative path (server, browser)
+        always uses it: a solve 6 km out cost 40-80 k work units with the
+        0.05 s step, 2-3 simulated seconds of quota each, and the browser ran
+        the return in slow motion.  (A 1 s Heun coast was tried as well:
+        cheaper still, but in a 21 m/s wind the coarse ignition event moved
+        the handover by hundreds of metres.)
         """
+        fast = progress if fast is None else fast
         seed = self._bb_dv
         initial = seed is None or (cold and progress)
         alternatives = ()
@@ -2931,7 +3040,7 @@ class Autopilot3D:
         prediction, status, evaluations = yield from boostback.solve_steps(
             self, veh, r, v, m, wind_now, seed,
             iterations=(5 if initial else 2) if iterations is None else iterations,
-            progress=progress or partial, fast=progress, alternatives=alternatives)
+            progress=progress or partial, fast=fast, alternatives=alternatives)
         self._bb_status = status
         self._bb_evaluations = evaluations
         self._bb_prediction = prediction
@@ -2943,7 +3052,7 @@ class Autopilot3D:
             # whole return.  Start over from the fresh seeds first.
             self._bb_dv = None
             yield from self._boostback_target_steps(veh, r, v, m, wind_now, iterations, progress, cold,
-                                                    partial, retry=False)
+                                                    partial, retry=False, fast=fast)
             return
         if prediction is None:
             # Do not fly an unverified delta-v or spend the landing reserve.
