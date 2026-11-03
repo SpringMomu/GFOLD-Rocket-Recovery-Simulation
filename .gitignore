@@ -20,3 +20,6 @@ build_and_record.log
 # Local diagnostics and video production files
 artifacts/
 video/
+
+# Local agent instructions (not tracked)
+AGENTS.md
