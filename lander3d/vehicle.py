@@ -492,6 +492,12 @@ class Vehicle:
 
         # RCS.
         torque_b = torque_b + self.rcs * np.array(s.rcs_torque)
+        # Jet damping: the exhaust leaving the nozzle carries away the
+        # transverse momentum the rotation gives it (Coriolis), M = -mdot l^2 w.
+        if mdot > 0.0:
+            l_e = zc - s.nozzle_exit_z
+            torque_b = torque_b - mdot * l_e * l_e * np.array([self.omega[0], self.omega[1], 0.0])
+        self.last["thrust_mag"] = thrust_mag            # the aero model's plume interaction needs it now
 
         # Aerodynamics.
         wind_v = wind.at(com, self.time) if wind is not None else np.zeros(3)

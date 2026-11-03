@@ -61,7 +61,6 @@ def attitude_control(veh, desired_axis, k_angle, k_rate, max_rate, use_rcs, hold
     engine gimbal (TVC) when the engine burns, RCS for the rest (and alone
     in near-vacuum)."""
     s = veh.spec
-    c = veh.controls
     R = veh.R
     zd = np.asarray(desired_axis, float)
     zd = zd / (vnorm(zd) + 1e-12)
@@ -96,6 +95,20 @@ def attitude_control(veh, desired_axis, k_angle, k_rate, max_rate, use_rcs, hold
     alpha = k_rate * (w_cmd - veh.omega)
     alpha[2] = 2.0 * (w_cmd[2] - veh.omega[2])
     tau = np.array([ixx, ixx, izz]) * alpha
+    allocate_torque(veh, tau, use_rcs, M0, B)
+
+
+def allocate_torque(veh, tau, use_rcs, M0=None, B=None):
+    """Deliver the body torque ``tau`` (on top of cancelling the known
+    aerodynamic moment): grid fins first, then the engine gimbal, then RCS.
+    Writes controls.fins / gimbal / rcs."""
+    s = veh.spec
+    c = veh.controls
+    R = veh.R
+    if M0 is None or B is None:
+        M0, B = fin_effectiveness(veh)
+    _, zc, _, _ = veh.mass_properties()
+    tau = np.asarray(tau, float)
     # Cancel the known aerodynamic moment of the body (the fins are handled
     # by the allocation below, including their own restoring moment M0).
     info = veh.last.get("aero_info") or {}

@@ -840,7 +840,9 @@ export class Scene {
     // lines + lamp glows (depth tested against the MSAA depth)
     gl.enable(gl.BLEND);
     gl.depthMask(false);
-    this._drawLines(fx.lines);
+    // With the flow volume shown the ribbons go on top of it (below), not under it.
+    const linesOverFluid = !!(fx.fluid && fx.fluidVolume);
+    if (!linesOverFluid) this._drawLines(fx.lines);
     this._drawPoints(this._padGlowPoints(this.time), true);
     gl.depthMask(true);
     gl.disable(gl.BLEND);
@@ -861,6 +863,15 @@ export class Scene {
     gl.enable(gl.BLEND);
     if (fx.fluid) {
       fx.fluid.draw(this, cam, fx.fluidMode, fx.fluidVolume);
+      if (linesOverFluid && fx.lines && fx.lines.length) {
+        // Trajectory / plan ribbons over the flow, still depth tested against the opaque scene.
+        gl.bindFramebuffer(gl.FRAMEBUFFER, T.resolveFbo);
+        gl.viewport(0, 0, W, H);
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthMask(false);
+        gl.enable(gl.BLEND);
+        this._drawLines(fx.lines);
+      }
       gl.bindFramebuffer(gl.FRAMEBUFFER, T.transFbo);
       gl.viewport(0, 0, W, H);
       gl.disable(gl.DEPTH_TEST);

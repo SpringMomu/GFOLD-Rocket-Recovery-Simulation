@@ -128,8 +128,9 @@ def test_plan_lift_linearisation_follows_the_chord_along_the_tilt():
             base = -vel / np.linalg.norm(vel)
             axis = base + (d_ref - base * float(np.dot(d_ref, base)))  # the reference attitude of the model
             axis /= np.linalg.norm(axis)
-            f_al = ap.aero.quick_force(vel, base, rho, a_s, 0.0, trim=trim) / m
-            f0 = ap.aero.quick_force(vel, axis, rho, a_s, 0.0, trim=trim) / m
+            # (the plan's thrust is in the plume interaction of the drag)
+            f_al = ap.aero.quick_force(vel, base, rho, a_s, 0.0, trim=trim, thrust=m * sigma) / m
+            f0 = ap.aero.quick_force(vel, axis, rho, a_s, 0.0, trim=trim, thrust=m * sigma) / m
             net_ref = sigma * math.sin(t) + (f0 - f_al)[0]
             assert np.allclose(d0[k] + G[k] @ u_ref, f0, atol=1e-6)           # exact at the reference
             assert np.allclose(d0[k], f_al, atol=1e-6)                         # ... and along the flow

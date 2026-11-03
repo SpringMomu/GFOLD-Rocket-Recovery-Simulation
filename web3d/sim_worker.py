@@ -32,4 +32,4 @@ def handle_input(payload: str) -> None:
 def handle_cfd(payload: str) -> None:
     p = json.loads(payload)
     if sim.cfd is not None and isinstance(p.get("c_world"), list):
-        sim.cfd.update(p["c_world"])
+        sim.cfd.update(p["c_world"], p.get("zcp"))

@@ -37,7 +37,7 @@ export const CRASH = {
   "HIT LAUNCH MOUNT": "未夹住，坠落在发射台上",
 };
 
-const SAS = { OFF: "关", STABILITY: "姿态保持", RETROGRADE: "对准逆速度" };
+const SAS = { OFF: "仅角速度阻尼", STABILITY: "姿态保持", RETROGRADE: "对准逆来流", VERTICAL: "保持竖直" };
 
 export const SOLVER_STATUS = {
   idle: "空闲", Solved: "已收敛", AlmostSolved: "近似收敛", MaxIterations: "达到迭代上限",

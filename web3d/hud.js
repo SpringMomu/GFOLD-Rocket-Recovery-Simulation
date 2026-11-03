@@ -307,7 +307,7 @@ export class HUD {
     $("att").textContent = `${st.heading.toFixed(0)}° / ${st.pitch.toFixed(1)}° / ${st.roll.toFixed(0)}°`;
     setLamp($("lAP"), st.autopilot ? "on" : "");
     setLamp($("lSAS"), st.sas !== "OFF" ? "cy" : "");
-    $("lSAS").textContent = st.sas === "RETROGRADE" ? "增稳 逆速" : st.sas === "STABILITY" ? "增稳 保持" : "增稳";
+    $("lSAS").textContent = st.sas === "RETROGRADE" ? "增稳 逆速" : st.sas === "STABILITY" ? "增稳 保持" : st.sas === "VERTICAL" ? "增稳 竖直" : "增稳 阻尼";
     setLamp($("lLEGS"), st.legs > 0.98 ? "on" : st.legs > 0.02 ? "amb" : "");
     setLamp($("lENG"), st.throttle > 0.01 ? "amb" : "");
     const rcsOn = Math.abs(st.rcs[0]) + Math.abs(st.rcs[1]) + Math.abs(st.rcs[2]) > 0.05;

@@ -792,13 +792,14 @@ class Autopilot3D:
             tilt[broadside] = 0.0
             axis0 = base + tilt
             axis0 /= np.maximum(np.sqrt(np.sum(axis0 * axis0, axis=1)), 1e-9)[:, None]
-            f0 = self.aero.quick_force_many(vr, axis0, rho, a_s, legs, trim=trim)
+            tf = m * sig                    # reference thrust: the plume cuts the drag (aero.srp_axial_factor)
+            f0 = self.aero.quick_force_many(vr, axis0, rho, a_s, legs, trim=trim, thrust=tf)
             out = f0 / m[:, None]
             if self.aero_pred == 1:
                 out[~live] = 0.0
                 return out, G, qd, wd, dq
             if np.any(broadside):
-                fb = self.aero.quick_force_many(vr, d_ref, rho, a_s, legs, trim=trim)
+                fb = self.aero.quick_force_many(vr, d_ref, rho, a_s, legs, trim=trim, thrust=tf)
                 out[broadside] = fb[broadside] / m[broadside, None]
             grad = ~broadside & live
             if np.any(grad):
@@ -811,8 +812,8 @@ class Autopilot3D:
                 ax1 /= np.maximum(np.sqrt(np.sum(ax1 * ax1, axis=1)), 1e-9)[:, None]
                 ax2 = axis0 + d * e2
                 ax2 /= np.maximum(np.sqrt(np.sum(ax2 * ax2, axis=1)), 1e-9)[:, None]
-                f1 = self.aero.quick_force_many(vr[grad], ax1[grad], rho[grad], a_s[grad], legs, trim=trim)
-                f2 = self.aero.quick_force_many(vr[grad], ax2[grad], rho[grad], a_s[grad], legs, trim=trim)
+                f1 = self.aero.quick_force_many(vr[grad], ax1[grad], rho[grad], a_s[grad], legs, trim=trim, thrust=tf[grad])
+                f2 = self.aero.quick_force_many(vr[grad], ax2[grad], rho[grad], a_s[grad], legs, trim=trim, thrust=tf[grad])
                 mg = m[grad, None]
                 g1 = (f1 - f0[grad]) / d / mg
                 g2 = (f2 - f0[grad]) / d / mg
@@ -833,18 +834,18 @@ class Autopilot3D:
                     idx = np.flatnonzero(grad)[sec]
                     e_t = tilt[idx] / st[sec, None]
                     e_p = np.cross(u[idx], e_t)
-                    f_al = self.aero.quick_force_many(vr[idx], base[idx], rho[idx], a_s[idx], legs, trim=trim)
+                    f_al = self.aero.quick_force_many(vr[idx], base[idx], rho[idx], a_s[idx], legs, trim=trim, thrust=tf[idx])
                     chord = (f0[idx] - f_al) / (m[idx, None] * st[sec, None])
                     wc = np.clip((SECANT_FADE_DEG[1] - np.degrees(np.arcsin(np.minimum(st[sec], 1.0))))
                                  / (SECANT_FADE_DEG[1] - SECANT_FADE_DEG[0]), 0.0, 1.0)
                     if np.any(wc < 1.0):
                         axt = axis0[idx] + d * e_t
                         axt /= np.maximum(np.sqrt(np.sum(axt * axt, axis=1)), 1e-9)[:, None]
-                        ft = self.aero.quick_force_many(vr[idx], axt, rho[idx], a_s[idx], legs, trim=trim)
+                        ft = self.aero.quick_force_many(vr[idx], axt, rho[idx], a_s[idx], legs, trim=trim, thrust=tf[idx])
                         chord = wc[:, None] * chord + (1.0 - wc[:, None]) * (ft - f0[idx]) / d / m[idx, None]
                     axp = axis0[idx] + d * e_p
                     axp /= np.maximum(np.sqrt(np.sum(axp * axp, axis=1)), 1e-9)[:, None]
-                    fp = self.aero.quick_force_many(vr[idx], axp, rho[idx], a_s[idx], legs, trim=trim)
+                    fp = self.aero.quick_force_many(vr[idx], axp, rho[idx], a_s[idx], legs, trim=trim, thrust=tf[idx])
                     g_p = (fp - f0[idx]) / d / m[idx, None]
                     for g in (chord, g_p):
                         gn = np.sqrt(np.sum(g * g, axis=1))
@@ -950,9 +951,9 @@ class Autopilot3D:
                 axis0 = base + tilt
                 axis0 /= np.linalg.norm(axis0)
                 if broadside is not None:
-                    out[i] = self._quick(veh, vr, broadside, rho, a, legs, burn=True) / m
+                    out[i] = self._quick(veh, vr, broadside, rho, a, legs, burn=True, thrust=m * sig) / m
                     continue
-                f0 = self._quick(veh, vr, axis0, rho, a, legs, burn=True)
+                f0 = self._quick(veh, vr, axis0, rho, a, legs, burn=True, thrust=m * sig)
                 if self.aero_pred == 1:
                     out[i] = f0 / m         # drag at the reference attitude, no lift gradient
                     continue
@@ -970,12 +971,12 @@ class Autopilot3D:
                 Gi = np.zeros((3, 3))
                 for j, e in enumerate((e1, e2)):
                     ax1 = axis0 + d * e
-                    f1 = self._quick(veh, vr, ax1 / np.linalg.norm(ax1), rho, a, legs, burn=True)
+                    f1 = self._quick(veh, vr, ax1 / np.linalg.norm(ax1), rho, a, legs, burn=True, thrust=m * sig)
                     grad = (f1 - f0) / d / m                  # accel per radian of tilt along e
                     if j == 0 and st > 0.0:
                         wc = float(np.clip((SECANT_FADE_DEG[1] - math.degrees(math.asin(min(st, 1.0))))
                                            / (SECANT_FADE_DEG[1] - SECANT_FADE_DEG[0]), 0.0, 1.0))
-                        chord = (f0 - self._quick(veh, vr, base, rho, a, legs, burn=True)) / (m * st)
+                        chord = (f0 - self._quick(veh, vr, base, rho, a, legs, burn=True, thrust=m * sig)) / (m * st)
                         grad = wc * chord + (1.0 - wc) * grad
                     # Keep the net effect of a tilt in the thrust direction
                     # (limits over-reliance on a local linearisation).
@@ -2121,10 +2122,10 @@ class Autopilot3D:
         out[:2] = fh * s
         return out
 
-    def _quick(self, veh, vr, axis, rho, a_snd, legs, burn=False):
+    def _quick(self, veh, vr, axis, rho, a_snd, legs, burn=False, thrust=0.0):
         """``AeroModel.quick_force`` with the lift as flown (``_lift_trim``;
         ``burn``: with the gimbal's share of the moment)."""
-        return self.aero.quick_force(vr, axis, rho, a_snd, legs, trim=self._lift_trim(veh, burn))
+        return self.aero.quick_force(vr, axis, rho, a_snd, legs, trim=self._lift_trim(veh, burn), thrust=thrust)
 
     @staticmethod
     def _aoa_limit(veh, accel, wind_now, max_tilt, table=Q_AOA_BUDGET, q_dyn=None):

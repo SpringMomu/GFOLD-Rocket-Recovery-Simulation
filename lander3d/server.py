@@ -89,7 +89,7 @@ def snapshot(sim: Sim3D) -> dict:
                      "drag": round(float(a.get("drag", 0.0)), 1), "normal": round(float(a.get("normal", 0.0)), 1),
                      "cp_z": round(float(a.get("cp_z", zc)), 3), "com_z": round(zc, 3), "source": a.get("source", "MODEL"),
                      "force": _vec(a.get("force", np.zeros(3))), "tail_first": bool(a.get("tail_first", True)),
-                     "rho": round(rho, 4), "cfd_forces": sim.aero.cfd_forces},
+                     "rho": round(rho, 4), "cfd_forces": sim.aero.cfd_forces, "ct": round(float(a.get("ct", 0.0)), 3)},
             "wind": _vec(wind), "wind_on": sim.wind.enabled, "wind_cfg": sim.wind.config(), "replan": sim.autopilot.replan_enabled,
             "solver_cfg": dict(sim.solver_cfg), "solver_opts": settings.options_snapshot(),
             "plan": [_vec(pt) for pt in plan], "trail": [_vec(pt) for pt in trail],
@@ -159,7 +159,7 @@ def make_handler(sim: Sim3D):
                 payload = {}
             if self.path.startswith("/api/cfd3d"):
                 if sim.cfd is not None and isinstance(payload.get("c_world"), list):
-                    sim.cfd.update(payload["c_world"])
+                    sim.cfd.update(payload["c_world"], payload.get("zcp"))
                 return self._json({"ok": True})
             if self.path.startswith("/api/input"):
                 sim.handle_input(payload.get("keys", {}), payload.get("actions", []))

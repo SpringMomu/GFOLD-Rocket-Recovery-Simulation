@@ -1,7 +1,7 @@
 // Browser-side simulator: loads Pyodide and runs the Python 3D simulator
 // (the lander3d package, solved by Clarabel) in this worker.
 // Protocol (same data as the /api endpoints of lander3d/server.py):
-//   in:  {type: "input", keys, actions} | {type: "cfd", c_world}
+//   in:  {type: "input", keys, actions} | {type: "cfd", c_world, zcp}
 //   out: {type: "progress", text} | {type: "state", json} | {type: "error", text}
 const PYODIDE = "pyodide/";
 importScripts(PYODIDE + "pyodide.js");
@@ -42,7 +42,7 @@ async function main() {
       while (queue.length) {
         const m = queue.shift();
         if (m.type === "input") glue.input(JSON.stringify({ keys: m.keys, actions: m.actions }));
-        else if (m.type === "cfd") glue.cfd(JSON.stringify({ c_world: m.c_world }));
+        else if (m.type === "cfd") glue.cfd(JSON.stringify({ c_world: m.c_world, zcp: m.zcp }));
       }
       const now = performance.now();
       glue.advance((now - last) / 1000);

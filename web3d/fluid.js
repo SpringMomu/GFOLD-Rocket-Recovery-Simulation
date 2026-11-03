@@ -13,7 +13,13 @@
 //   dye      : MacCormack advection with min/max clamping (as in fluid/),
 //              injected by a "smoke rake" of coloured streak tubes upstream
 //              of the booster, with periodic time-line gaps
-//   exhaust  : density source in the plume, advected with the dye
+//   exhaust  : momentum + density source in the plume; the jet speed
+//              follows the thrust coefficient C_T = T / (q A) (for the same
+//              density, C_T = 2 (Vj/V)^2 Aj/A), so retro-propulsion shields
+//              the base as strongly as the engine actually pushes
+//   grid fins: porous panels (deflected / folded as flown) that turn the
+//              flow through them along their cells and take a little
+//              momentum (an actuator model: a lattice is far finer than a cell)
 // Outputs: dye / vorticity / speed volumes for the main view, a float
 // cut-plane for the wind-tunnel window, and the surface-pressure force.
 import { V, quatToMat3, createProgram } from "./gl.js";
@@ -54,6 +60,7 @@ const SDF = `
 uniform mat3 u_c2bM; uniform vec3 u_c2bO;     // cell -> body
 uniform vec4 u_c2wZ;                          // cell -> world z (dot(xyz, cell) + w)
 uniform float u_legs;
+uniform vec4 u_finDefl; uniform float u_finFold; uniform float u_finPad;   // grid fins (rad), fold (rad), half-thickness (m)
 float sdCyl(vec3 p, float r, float z0, float z1) {
   vec2 d = vec2(length(p.xy) - r, max(z0 - p.z, p.z - z1));
   return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
@@ -61,17 +68,35 @@ float sdCyl(vec3 p, float r, float z0, float z1) {
 float sdSeg(vec3 p, vec3 a, vec3 b, float r) { vec3 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0); return length(pa - ba * h) - r; }
 float sdBox(vec3 p, vec3 b) { vec3 q = abs(p) - b; return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0); }
 float rocketSDF(vec3 p) {
-  float d = sdCyl(p, 1.83, -0.1, 18.0);
+  float d = sdCyl(p, 1.5, -0.1, 18.0);
   d = min(d, sdCyl(p, 0.95, -1.7, 0.0));
   for (int i = 0; i < 4; i++) {
-    float a = 0.7853982 + float(i) * 1.5707963;
+    float a = 0.7853982 + float(i) * 1.5707963;          // legs at 45 deg
     vec2 cs = vec2(cos(a), sin(a));
     vec3 q = vec3(cs.x * p.x + cs.y * p.y, -cs.y * p.x + cs.x * p.y, p.z);
-    d = min(d, sdBox(q - vec3(2.45, 0.0, 16.8), vec3(0.65, 0.55, 0.12)));
-    float fr = mix(1.95, 5.9, u_legs), fz = mix(9.0, -1.9, u_legs);
+    float fr = mix(1.65, 5.9, u_legs), fz = mix(9.0, -1.9, u_legs);
     d = min(d, sdSeg(q, vec3(1.55, 0.0, 3.2), vec3(fr, 0.0, fz), 0.28));
   }
   return d;
+}
+// Grid fin k (azimuth k*90 deg) containing body point p: k, or -1.  The
+// panel (radial 1.6-2.85 m, 1.24 m wide) folds about its root hinge and
+// deflects about its radial shaft, as drawn (scene.js rocketParts).
+int finAt(vec3 p) {
+  for (int k = 0; k < 4; k++) {
+    float a = float(k) * 1.5707963;
+    vec2 cs = vec2(cos(a), sin(a));
+    vec3 q = vec3(cs.x * p.x + cs.y * p.y, -cs.y * p.x + cs.x * p.y, p.z - 16.8);
+    // undo the fold (about y through x = 1.5)
+    float cf = cos(u_finFold), sf = sin(u_finFold);
+    vec2 xz = vec2(q.x - 1.5, q.z);
+    q.x = cf * xz.x - sf * xz.y + 1.5; q.z = sf * xz.x + cf * xz.y;
+    // undo the deflection (about x)
+    float d = u_finDefl[k], cd = cos(d), sd = sin(d);
+    q.yz = vec2(cd * q.y + sd * q.z, -sd * q.y + cd * q.z);
+    if (q.x > 1.6 && q.x < 2.85 && abs(q.y) < 0.62 && abs(q.z) < u_finPad) return k;
+  }
+  return -1;
 }
 vec3 bodyOf(vec3 cellPos) { return u_c2bM * cellPos + u_c2bO; }
 float worldZ(vec3 cellPos) { return dot(u_c2wZ.xyz, cellPos) + u_c2wZ.w; }
@@ -96,7 +121,8 @@ void main() {
   float along = dot(rel, jd);
   float rad = length(rel - jd * along);
   float jet = (along > 0.0 && along < 4.0 && rad < 1.0 + 0.25 * along) ? u_jetOn : 0.0;
-  o = vec4(max(solid, ground), jet * (1.0 - solid) * (1.0 - ground), ground, 1.0);
+  int fin = solid > 0.5 ? -1 : finAt(pb);
+  o = vec4(max(solid, ground), jet * (1.0 - solid) * (1.0 - ground), ground, fin < 0 ? 0.0 : (float(fin) + 1.0) / 8.0);
 }`;
 
 // ---- pass: advect velocity + frame acceleration + sources + boundaries
@@ -105,6 +131,7 @@ ${COMMON}
 ${CELL}
 uniform sampler2D u_vel; uniform sampler2D u_obst;
 uniform vec3 u_inflowOld; uniform vec3 u_inflow; uniform float u_scale; uniform vec3 u_shift; uniform vec3 u_jetVel;
+uniform vec3 u_finAxis[4]; uniform float u_finTurn; uniform float u_finDrag;
 out vec4 o;
 vec3 velAt(vec3 p) { return inside(p) ? samp(u_vel, p).xyz : u_inflowOld; }
 void main() {
@@ -121,6 +148,13 @@ void main() {
       (lo.y && u_inflow.y > 0.0) || (hi.y && u_inflow.y < 0.0) ||
       (lo.z && u_inflow.z > 0.0) || (hi.z && u_inflow.z < 0.0)) nv = u_inflow;
   nv = mix(nv, u_jetVel, clamp(ob.g, 0.0, 1.0));
+  int fin = int(ob.a * 8.0 + 0.5) - 1;
+  if (fin >= 0) {
+    // cell walls turn the crossflow into the cell axis; the lattice takes a little momentum
+    vec3 ca = u_finAxis[fin];
+    vec3 along = ca * dot(nv, ca);
+    nv = (along + (nv - along) * (1.0 - u_finTurn)) * (1.0 - u_finDrag);
+  }
   o = vec4(nv, 0.0);
 }`;
 
@@ -299,16 +333,16 @@ void main() {
   vec3 nrm, pb; float area; float zs = -99.0;
   if (id.x < ns) {
     float z = -0.5 + 18.3 * (float(id.x) + 0.5) / float(ns);
-    float r = z < 0.0 ? 1.0 : 1.83;
+    float r = z < 0.0 ? 1.0 : 1.5;
     nrm = radial; pb = vec3(radial.xy * (r + 0.9), z);          // just outside the wall
     area = 6.2831853 * r / float(u_n.y) * 18.3 / float(ns);
     zs = z;
   } else if (id.x == ns) {                                        // top (interstage) cap
     nrm = vec3(0.0, 0.0, 1.0); pb = vec3(radial.xy * 1.1, 18.9);
-    area = 3.14159265 * 1.83 * 1.83 / float(u_n.y);
+    area = 3.14159265 * 1.5 * 1.5 / float(u_n.y);
   } else {                                                        // base (engine) end
     nrm = vec3(0.0, 0.0, -1.0); pb = vec3(radial.xy * 1.1, -2.6);
-    area = 3.14159265 * 1.83 * 1.83 / float(u_n.y);
+    area = 3.14159265 * 1.5 * 1.5 / float(u_n.y);
   }
   float p = samp(u_p, u_b2cM * pb + u_b2cO).r;
   o = vec4(-p * nrm * area, zs);             // body-frame force (pressure units x m^2), station z
@@ -598,12 +632,35 @@ export class Fluid3D {
     const jetB = [-Math.sin(gy), Math.sin(gx) * Math.cos(gy), -Math.cos(gx) * Math.cos(gy)];
     const on = st.state === "FLYING" && st.throttle > 0.02 ? 1 : 0;
     const jetW = mulM3(Rm, jetB);
-    const jetC = V.mul(jetW, on ? Math.min(3.0, 1.2 + 2.2 * st.throttle * (60 / (sp + 30))) : 0);
+    // Jet / free-stream speed ratio for the thrust coefficient (same density):
+    // C_T = 2 (Vj/V)^2 Aj/A, Aj the nozzle exit (r 0.95 m), A the body (r 1.5 m).
+    const ct = st.aero && Number.isFinite(st.aero.ct) ? st.aero.ct : null;
+    const jetMag = ct === null ? Math.min(3.0, 1.2 + 2.2 * st.throttle * (60 / (sp + 30)))
+      : Math.min(3.0, Math.max(1.2, this.inflowMag * Math.sqrt(Math.max(0, ct) * (1.5 * 1.5) / (2 * 0.95 * 0.95))));
+    const jetC = V.mul(jetW, on ? jetMag : 0);
+    // Grid fins: deflection, fold and the cell axis of each panel (world = grid axes).
+    const fin = st.fins || { defl: [0, 0, 0, 0], deploy: 1 };
+    const dep = Math.max(0, Math.min(1, fin.deploy));
+    const fold = -(Math.PI / 2) * (1 - dep);
+    const finDefl = [0, 1, 2, 3].map((k) => (fin.defl[k] || 0) * Math.PI / 180);
+    const finAxis = new Float32Array(12);
+    for (let k = 0; k < 4; k++) {
+      const a = k * Math.PI / 2, d = finDefl[k];
+      const et = [-Math.sin(a), Math.cos(a), 0];
+      let c = V.sub(V.mul([0, 0, 1], Math.cos(d)), V.mul(et, Math.sin(d)));
+      // fold about e_t (Rodrigues)
+      const cf = Math.cos(fold), sf = Math.sin(fold);
+      c = V.add(V.add(V.mul(c, cf), V.mul(V.cross(et, c), sf)), V.mul(et, V.dot(et, c) * (1 - cf)));
+      const cw = mulM3(Rm, c);
+      finAxis.set(cw, 3 * k);
+    }
 
     this._run(this.pObst, this.obst, {}, (u) => {
       gl.uniformMatrix3fv(u.u_c2bM, false, this.c2bM); gl.uniform3fv(u.u_c2bO, this.c2bO);
       gl.uniform4fv(u.u_c2wZ, this.c2wZ); gl.uniform1f(u.u_legs, st.legs || 0);
       gl.uniform3fv(u.u_jetBody0, jetB); gl.uniform1f(u.u_jetOn, on);
+      gl.uniform4fv(u.u_finDefl, finDefl); gl.uniform1f(u.u_finFold, fold);
+      gl.uniform1f(u.u_finPad, Math.max(0.16, 0.5 * h));   // at least one cell thick
     });
 
     // Smoke rake: a plane across the flow, upstream of the booster, inside the box.
@@ -638,6 +695,7 @@ export class Fluid3D {
       this._run(this.pAdvV, this.vel[1], { u_vel: this.vel[0], u_obst: this.obst }, (u) => {
         gl.uniform3fv(u.u_inflowOld, inflowOld); gl.uniform3fv(u.u_inflow, uinf);
         gl.uniform1f(u.u_scale, scale); gl.uniform3fv(u.u_shift, shift); gl.uniform3fv(u.u_jetVel, jetC);
+        gl.uniform3fv(u.u_finAxis, finAxis); gl.uniform1f(u.u_finTurn, 0.3 + 0.4 * dep); gl.uniform1f(u.u_finDrag, 0.06 * (0.3 + 0.7 * dep));
       });
       this.vel.reverse();
       this._run(this.pCurl, this.curl, { u_vel: this.vel[0] });
@@ -704,7 +762,7 @@ export class Fluid3D {
       }
       if (Math.abs(f) > 1e-9) zcp = Math.max(-2, Math.min(20, m / f));
     }
-    const scale = 2.0 / (this.inflowMag * this.inflowMag) / (Math.PI * 1.83 * 1.83);
+    const scale = 2.0 / (this.inflowMag * this.inflowMag) / (Math.PI * 1.5 * 1.5);
     const cb = [fx * scale, fy * scale, fz * scale];
     if (!cb.every(Number.isFinite)) return null;
     const R = quatToMat3(st.q);

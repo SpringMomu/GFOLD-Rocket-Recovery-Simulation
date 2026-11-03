@@ -14,7 +14,7 @@ import numpy as np
 
 from . import settings
 from .aero import AeroModel, ExternalCFD
-from .attitude import attitude_control
+from .attitude import allocate_torque, attitude_control
 from .autopilot import Autopilot3D
 from .tower import CatchTower
 from .vehicle import Vehicle, Wind, quat_from_axis_angle
@@ -66,7 +66,10 @@ class Sim3D:
         self.aero.cfd = self.cfd
         self.lock = threading.RLock()
         self.autopilot_on = False
-        self.sas = "OFF"          # OFF | STABILITY | RETROGRADE
+        self.sas = "STABILITY"    # STABILITY | RETROGRADE | VERTICAL | OFF (rate damping only)
+        self._stick = np.zeros(3)
+        self._release_time = 0.0
+        self._aoa_time = -1e9
         self.keys: dict = {}
         self.throttle_manual = 0.0
         self.time = 0.0
@@ -101,7 +104,9 @@ class Sim3D:
                 self.vehicle.controls.fins_deploy = False
             self.autopilot.reset()
             self.autopilot_on = autopilot
-            self.sas = "OFF"
+            self.sas = "STABILITY"
+            self._hold_axis = None
+            self._stick = np.zeros(3)
             self.throttle_manual = 0.0
             self.time = 0.0
             self.flight_time = 0.0
@@ -120,6 +125,7 @@ class Sim3D:
             self._set_tower(None)
             self.autopilot.reset()
             self.autopilot_on = False
+            self._hold_axis = None
             self.throttle_manual = 0.0
             self.time = 0.0
             self.flight_time = 0.0
@@ -142,8 +148,21 @@ class Sim3D:
                                       catch_link=lambda: tower.secured)
             self.vehicle.controls.legs_down = False
 
-    # -- manual control (KSP layout) ---------------------------------------------
+    # -- manual control (KSP layout, fly-by-wire) --------------------------------
+    MANUAL_RATE = math.radians(12.0)    # full-stick body rate
+    STICK_TAU = 0.25                    # stick smoothing [s]
+    SAS_MODES = ("STABILITY", "RETROGRADE", "VERTICAL", "OFF")
+
     def _manual(self, dt: float) -> None:
+        """Rate-command / attitude-hold fly-by-wire.
+
+        The keys command body rates (they never fire the actuators directly);
+        released, the vehicle holds its attitude (STABILITY), points
+        retrograde to the air flow, stands vertical, or (OFF) only damps its
+        rates.  Torque goes through the same allocation as the autopilot: the
+        known aerodynamic moment is cancelled, grid fins first, then the
+        engine gimbal, then RCS.  Without that the bare stick left a free
+        body that the aerodynamic moment turned over."""
         v = self.vehicle
         keys = self.keys
         controls = v.controls
@@ -154,38 +173,116 @@ class Sim3D:
             self.throttle_manual = max(0.0, self.throttle_manual - 0.8 * dt)
         controls.throttle = self.throttle_manual
 
-        # Pitch W/S, yaw A/D, roll Q/E command body rates.
+        # Pitch W/S, yaw A/D, roll Q/E.
         def axis(positive: str, negative: str) -> float:
             return float(bool(keys.get(positive))) - float(bool(keys.get(negative)))
 
-        w_cmd = np.array([axis("s", "w"), axis("d", "a"), axis("q", "e")]) * math.radians(18.0)
-        steering = bool(np.any(w_cmd != 0.0))
-        if not steering and self.sas == "RETROGRADE":
-            vr = v.vel - self.wind.at(v.pos, v.time)
-            speed = float(np.linalg.norm(vr))
-            target = -vr / speed if speed > 3.0 else np.array([0.0, 0.0, 1.0])
-            attitude_control(v, target, 1.2, 2.5, math.radians(20.0), use_rcs=True)
-            return
-        if not steering and self.sas == "STABILITY":
-            if self._hold_axis is None:
-                self._hold_axis = v.axis.copy()
-            attitude_control(v, self._hold_axis, 1.2, 2.5, math.radians(20.0), use_rcs=True)
-            return
-        self._hold_axis = None
+        raw = np.array([axis("s", "w"), axis("d", "a"), axis("q", "e")])
+        self._stick += (raw - self._stick) * min(1.0, dt / self.STICK_TAU)
+        self._stick[np.abs(self._stick) < 1e-3] = 0.0
+        steering = bool(np.any(raw[:2] != 0.0))
+        rolling = raw[2] != 0.0 or abs(self._stick[2]) > 0.02
 
-        _, zc, ixx, izz = v.mass_properties()
-        alpha = 2.5 * (w_cmd - v.omega) if steering else np.zeros(3)
-        torque = np.array([ixx, ixx, izz]) * alpha
-        spec = v.spec
-        thrust = v.throttle * spec.thrust_sl
-        gx = gy = 0.0
-        if thrust > 0.04 * spec.thrust_sl:
-            lever = zc - spec.gimbal_z
-            gy = math.asin(float(np.clip(-torque[1] / lever / thrust, -0.99, 0.99)))
-            gx = math.asin(float(np.clip(-(torque[0] / lever) / thrust, -0.99, 0.99)))
-        controls.gimbal = (gx, gy)
-        controls.fins = (0.0, 0.0, 0.0)
-        controls.rcs = tuple(float(x) for x in np.clip(torque / np.array(spec.rcs_torque), -1.0, 1.0))
+        _, _, ixx, izz = v.mass_properties()
+        aoa = self._manual_aoa(v)
+        if not steering and self.sas != "OFF":
+            target = None
+            if self.sas == "RETROGRADE":
+                vr = v.vel - self.wind.at(v.pos, v.time)
+                speed = float(np.linalg.norm(vr))
+                target = -vr / speed if speed > 3.0 else np.array([0.0, 0.0, 1.0])
+            elif self.sas == "VERTICAL":
+                target = np.array([0.0, 0.0, 1.0])
+            else:
+                # Capture the attitude once the stick rates have died away,
+                # so releasing the keys does not snap back.
+                # The aerodynamic moment may keep it turning: capture anyway
+                # after a short damping phase.
+                self._release_time += dt
+                if self._hold_axis is None and (float(np.linalg.norm(v.omega[:2])) < math.radians(1.5)
+                                                or self._release_time > 0.6):
+                    self._hold_axis = v.axis.copy()
+                target = self._hold_axis
+            if target is not None and aoa is not None:
+                target = self._clamp_to_flow(target, *aoa)
+            if target is not None:
+                attitude_control(v, target, 1.2, 2.5, math.radians(15.0), use_rcs=True,
+                                 hold_roll=not rolling, roll_rate_cmd=float(self._stick[2]) * self.MANUAL_RATE)
+                return
+        if steering:
+            self._hold_axis = None
+            self._release_time = 0.0
+        # Rate command (stick) or rate damping (released, hold not captured yet / SAS off).
+        w_cmd = self._stick * self.MANUAL_RATE
+        if not steering:
+            w_cmd[:2] = 0.0
+        elif aoa is not None:
+            w_cmd = self._protect_rates(v, w_cmd, *aoa)
+        alpha = 2.5 * (w_cmd - v.omega)
+        allocate_torque(v, np.array([ixx, ixx, izz]) * alpha, use_rcs=True)
+
+    def _manual_aoa(self, v):
+        """Envelope protection for the stick: (flow direction w, current and
+        allowed angle off engines-first) while falling through the air, from
+        the autopilot's angle-of-attack table (the largest angle at which the
+        fins + gimbal still hold the aerodynamic moment).  None when there is
+        no limit (slow, thin air, or rising: the table is for engines-first
+        descent)."""
+        vr = v.vel - self.wind.at(v.pos, v.time)
+        sp = float(np.linalg.norm(vr))
+        q = float(v.last.get("q", 0.0))
+        if sp < 3.0 or vr[2] >= 0.0 or q < 200.0:
+            return None
+        ap = self.autopilot
+        if self.time - self._aoa_time > 2.0:
+            ap._aoa_cache = (-1e9, ap._aoa_cache[1])       # recompute at the current mass
+            self._aoa_time = self.time
+        table = ap._aoa_table(v)
+        allowed = math.radians(float(np.interp(q, *table)))
+        if allowed >= math.radians(179.0):
+            return None
+        w = -vr / sp
+        ang = math.acos(float(np.clip(np.dot(v.axis, w), -1.0, 1.0)))
+        return w, ang, allowed
+
+    @staticmethod
+    def _clamp_to_flow(target, w, _ang, allowed):
+        """Pull an attitude target into the cone ``allowed`` around the flow."""
+        target = np.asarray(target, float)
+        a = math.acos(float(np.clip(np.dot(target, w), -1.0, 1.0)))
+        if a <= allowed:
+            return target
+        side = target - w * float(np.dot(target, w))
+        n = float(np.linalg.norm(side))
+        if n < 1e-9:
+            return w.copy()
+        return w * math.cos(allowed) + side / n * math.sin(allowed)
+
+    def _protect_rates(self, v, w_cmd, w, ang, allowed):
+        """Near the limit the stick cannot turn the axis further off the
+        flow (that moment is more than the controls can stop); past it, the
+        axis is brought back."""
+        g = np.cross(v.axis, w)                 # body rates along g turn the axis toward the flow
+        gn = float(np.linalg.norm(g))
+        if gn < 1e-9:
+            return w_cmd
+        g_b = v.R.T @ (g / gn)
+        g_b[2] = 0.0
+        gbn = float(np.linalg.norm(g_b))
+        if gbn < 1e-9:
+            return w_cmd
+        g_b /= gbn
+        out = w_cmd.copy()
+        margin = 0.85 * allowed
+        if ang > margin:
+            along = float(np.dot(out, g_b))
+            # fade the outward rate to zero between 85 % and 100 % of the limit
+            keep = float(np.clip((allowed - ang) / max(1e-6, allowed - margin), 0.0, 1.0))
+            if along < 0.0:
+                out -= (1.0 - keep) * along * g_b
+            if ang > allowed:
+                out += min(self.MANUAL_RATE, 1.5 * (ang - allowed)) * g_b
+        return out
 
     def apply_action(self, action: str) -> None:
         """Discrete commands from the front end."""
@@ -193,9 +290,12 @@ class Sim3D:
             self.autopilot_on = not self.autopilot_on
             if self.autopilot_on:
                 self.autopilot.reset()
+            else:
+                self._hold_axis = None      # manual takes over holding the current attitude
             self.events.append((self.time, "AUTOPILOT ENGAGED" if self.autopilot_on else "AUTOPILOT OFF"))
         elif action == "sas":
-            self.sas = {"OFF": "STABILITY", "STABILITY": "RETROGRADE", "RETROGRADE": "OFF"}[self.sas]
+            modes = self.SAS_MODES
+            self.sas = modes[(modes.index(self.sas) + 1) % len(modes)] if self.sas in modes else modes[0]
             self._hold_axis = None
             self.events.append((self.time, f"SAS {self.sas}"))
         elif action == "legs":

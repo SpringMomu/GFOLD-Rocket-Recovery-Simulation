@@ -698,7 +698,7 @@ function frame(now) {
         const fc = fluid.readForce(st);
         if (fc) {
           view.cfdCoef = fc;
-          if (simWorker) simWorker.postMessage({ type: "cfd", c_world: fc.world });
+          if (simWorker) simWorker.postMessage({ type: "cfd", c_world: fc.world, zcp: fc.zcp });
           else fetch("/api/cfd3d", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ c_world: fc.world, cn: fc.cn, ca: fc.ca, zcp: fc.zcp, t: st.t }) }).catch(() => {});
         }
       }
@@ -716,9 +716,9 @@ function frame(now) {
     const camDist = (p) => V.len(V.sub(p, eye));
     const pxW = (p) => Math.max(0.05, camDist(p) * 0.0022);   // ~constant screen width
     // Actual trajectory (blue) and G-FOLD plan (green).
-    if (!CLEAN && view.showTraj && view.flowMode === 0 && st.trail && st.trail.length > 1) ribbon(st.trail.concat([st.pos]), pxW, [0.3, 0.65, 1.0, 0.75], eye);
-    if (!CLEAN && view.showTraj && view.flowMode === 0 && st.plan && st.plan.length > 1) ribbon(st.plan, (p) => pxW(p) * 1.2, [0.35, 1.0, 0.6, 0.85], eye);
-    if (!CLEAN && view.showTraj && view.showAttitude && view.flowMode === 0) {
+    if (!CLEAN && view.showTraj && st.trail && st.trail.length > 1) ribbon(st.trail.concat([st.pos]), pxW, [0.3, 0.65, 1.0, 0.75], eye);
+    if (!CLEAN && view.showTraj && st.plan && st.plan.length > 1) ribbon(st.plan, (p) => pxW(p) * 1.2, [0.35, 1.0, 0.6, 0.85], eye);
+    if (!CLEAN && view.showTraj && view.showAttitude) {
       const length = Math.max(18, (st.spec && st.spec.length || 40) * 0.8);
       attitudeGlyphs(st.trail, st.trail_axes, eye, pxW, [0.4, 0.72, 1, 0.9], length);
       attitudeGlyphs(st.plan, st.plan_axes, eye, pxW, [0.45, 1, 0.65, 0.9], length);
