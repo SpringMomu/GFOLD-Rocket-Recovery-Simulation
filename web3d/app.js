@@ -599,7 +599,7 @@ function buildParticles(eye, P) {
     partData[o + 4] = s.col[0]; partData[o + 5] = s.col[1]; partData[o + 6] = s.col[2]; partData[o + 7] = a;
     let emis = 0, open = 1;
     if (s.kind === 4) { emis = 6 * Math.pow(1 - life, 2); open = -1; }
-    else if (s.kind === 5 || s.kind === 6) open = -2;                          // crisp flat-shaded puff
+    else if (s.kind === 5 || s.kind === 6) open = 0.85;                        // soft volumetric puff (same as the video)
     else if (s.kind !== 2) {
       emis = s.kind === 0 ? 0.25 * Math.exp(-s.age * 3) : 0;
       open = Math.exp(-0.05 * ((occGrid.get(key(s.p)) || 0) - s.a0 * Math.min(4, s.size)));
