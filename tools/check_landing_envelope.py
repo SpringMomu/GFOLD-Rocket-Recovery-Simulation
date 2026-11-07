@@ -46,7 +46,7 @@ def check(index: int) -> dict:
             if height > HOVER_HEIGHT and float(np.linalg.norm(vehicle.vel)) < HOVER_SPEED:
                 hover += PHYSICS_DT
         low = sim.autopilot._height(vehicle) < LOW_HEIGHT
-        if vehicle.touchdown is None and sim.autopilot.phase in ("LANDING BURN", "CATCH HOLD") and low:
+        if vehicle.touchdown is None and sim.autopilot.phase in ("LANDING BURN",) and low:
             rate = math.degrees(max(abs(float(vehicle.omega[0])), abs(float(vehicle.omega[1]))))
             max_rate = max(max_rate, rate)
     td = vehicle.touchdown or {}

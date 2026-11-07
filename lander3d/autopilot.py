@@ -30,6 +30,7 @@ from .planner import (
     detour_paths,
     separating_planes,
 )
+from .tower import CATCH_COLLAR_Z
 from .vehicle import G0, atmosphere, atmosphere_many, fin_mix
 
 # Landing-burn tilt budget vs height (m -> deg): upright at contact.  It is
@@ -39,20 +40,16 @@ from .vehicle import G0, atmosphere, atmosphere_many, fin_mix
 # it then gives up the last-seconds corrections the tracker can still
 # partly fly, and lands further off in wind.)
 TILT_BUDGET = ([0.3, 1.5, 3.0, 8.0, 15.0, 400.0], [20.0, 20.0, 20.0, 20.0, 20.0, 75.0])
-# Tower catch (heights above the catch point, the base 15 m up with the
-# collar on the arms; the tower top is 33 m above it): beside the tower and
-# the arms the budget stays small.  The keep-out boxes guard
-# the base point only (plus the body radius and 2 m), and a 40 m booster
-# leaning 20 deg swings its collar 5 m and its top 13 m sideways off that
-# point -- with the 75 deg the pad landing allows at 40 m, the plan swung the
-# booster round beside the tower, into the arms or the tower itself.  Above
-# 15 deg everywhere below 60 m, 30 deg from there to 100 m, and above that
-# the pad landing's 75 deg is allowed again (the hold at the gate keeps its
-# own 4 / 1 deg, _catch_hold).  The planner's tilt cone uses the same table
-# (PlanConfig3D.tilt_budget, an elastic constraint of the convex problem);
-# the tracker's clip is only the backstop.
-CATCH_TILT_BUDGET = ([0.0, 60.0, 61.0, 100.0, 500.0],
-                     [20.0, 20.0, 30.0, 30.0, 75.0])
+# Tilt budget for a tower catch: the pad landing's.  Two tighter tables were
+# tried beside the tower (to keep the swinging body off the arms) and both
+# left no sideways authority low down in a strong wind: one held 20-30 deg
+# from 15 to 100 m, the other closed from 20 deg to 2-6 deg over the last
+# 8 m.  The plan then flew past the axis with 18 m/s still across, climbed
+# back and came in beside the tower into the arms: 16 m/s, scenario 9 (live
+# path), 4 of 8 wind directions crashed; with this table none.  The planner's
+# tilt cone uses the same table (an elastic constraint); the tracker's clip
+# is the backstop.
+CATCH_TILT_BUDGET = TILT_BUDGET
 TRIM_FADE = (0.5, 5.5)          # m: upright below the first height, full trim above the second
 SLEW_DEG = ([2.0, 30.0, 300.0], [16.0, 30.0, 50.0])   # thrust-direction slew-rate limit (deg/s) by height
 # Angle of attack (thrust vs the oncoming flow) vs dynamic pressure (Pa ->
@@ -246,15 +243,15 @@ class Autopilot3D:
     retime_freeze = 5.0           # s to go: no more retiming (unless lost)
     time_search_evals = 9
     ignition_refine = 2               # re-solves about the first plan at ignition (successive convexification)
-    # Tower catch: the burn ends with the collar this high above the arm tops,
-    # sinking this slowly; there the booster holds, centred, until the arms
-    # have closed round the barrel, and then settles onto them.
+    # Tower catch: the plan ends in a hover -- the collar this high above the
+    # arm tops, (almost) not sinking -- and the booster holds there on the
+    # plan's end state until the tower reports the arms closed round the
+    # barrel; then it settles onto them.
     catch_gate_height = 1.2
-    catch_gate_speed = 0.5
+    catch_gate_speed = 0.2
     catch_settle_speed = 0.6
-    catch_hold_max = 25.0         # s; then settle anyway
-    catch_hold_tilt_deg = 4.0     # tilt budget about the wind trim while holding
-    catch_integral_radius = 1.0   # m: the hold's integral only builds up this close to the axis
+    hold_bias_filter = 1.0        # s (_update_hold_bias)
+    catch_hold_max = 25.0         # s of hover; then settle anyway
     glide_gain = 2.0              # remove the predicted miss early in the coast
     frozen_kp = 0.5               # PD gains and limit of the feedback when the plan is frozen (replan off); the re-planned
     frozen_kd = 1.6               # flight keeps 0.5 / 1.6 / 5 m/s^2 (the plan itself is renewed every 0.6 s)
@@ -294,7 +291,6 @@ class Autopilot3D:
     # upright over the last TRIM_FADE metres).
     trim_max_deg = 12.0
     trim_filter = 0.5             # s
-    hold_bias_filter = 1.0        # s (_update_hold_bias)
     # Share of that sideways authority the coast's aim point (_burn_miss)
     # counts on: the plan never holds the largest useful tilt in one
     # direction for the whole burn (it also steers the other way and brakes
@@ -339,8 +335,9 @@ class Autopilot3D:
         legs stay stowed.  ``obstacles`` are keep-out boxes for the base point
         in world coordinates (``(centre, axes, half)``, e.g. the catch tower);
         the landing burn plans around them.  ``catch_link`` (a tower catch)
-        reports whether the arms are closed round the barrel: the burn then
-        ends in a hold just above the arms (``_catch_hold``)."""
+        reports whether the arms are closed round the barrel: the plan ends
+        in a hover just above the arms, held until they have closed, and the
+        booster then settles onto them (engine cut at contact)."""
         self.h_off = 0.0 if base_z is None else float(base_z) - float(rest_height)
         self.use_legs = legs
         self.catch_link = catch_link
@@ -607,7 +604,6 @@ class Autopilot3D:
         self._next_lift_fit = 0.0
         self._q_filt = 0.0
         self.solver_fail = None       # (time, status) of the last re-plan that found no solution at all
-        self._hold_bias = np.zeros(2)
         self._boostback = False
         self._boostback_done = False
         self._hop = False
@@ -619,10 +615,9 @@ class Autopilot3D:
         self.relax = 0                # (no relaxation levels any more; kept for the front end)
         self._next_search = 0.0
         self._search_fails = 0
-        self._holding = False
-        self._hold_h = 0.0
-        self._hold_i = np.zeros(2)
-        self._hold_t = 0.0
+        self._hold_bias = np.zeros(2)
+        self._hover_t0 = None         # tower catch: when the hover at the gate began
+        self._settle_t0 = None        # ... and when the settle onto the arms began
         self._secured = False
         self._dir_prev = None
         self._gate_xy = np.zeros(2)
@@ -1061,6 +1056,20 @@ class Autopilot3D:
 
         return dirs
 
+    def _plan_target_xy(self, veh) -> np.ndarray:
+        """Where the plan puts the base point.  A pad landing: the pad centre.
+        A tower catch: the tower grips the barrel at arm height, which a
+        booster leaning into the wind holds ``CATCH_COLLAR_Z - gate_height``
+        (~14 m) of body times the lean off its base -- so the base goes that
+        far to the other side, upwind of the catch axis, and the barrel ends
+        on it.  (Aimed at the axis itself, the plan ended 1.5-2 m short of it
+        in a 16 m/s wind, and the booster hovered there with the barrel out
+        of the capture window.)"""
+        if self.catch_link is None or self.aero is None:
+            return self._gate_xy
+        trim = np.asarray(self._gate_trim(veh), float)
+        return self._gate_xy - trim / G0 * max(0.0, CATCH_COLLAR_Z - self.gate_height)
+
     def _config(self, veh, frac, keep_out=None):
         s = veh.spec
         return PlanConfig3D(
@@ -1070,12 +1079,12 @@ class Autopilot3D:
             u_now=tuple(veh.last["thrust"] / veh.mass), engine_on=True,
             u_cmd=tuple(self.plan.sample(self.elapsed - self.plan.created_at)[2]) if self.plan is not None else None,
             max_tilt_deg=self.divert_tilt_deg,
-            touchdown_speed=self.gate_speed, target_alt=self.gate_height, target_xy=tuple(self._gate_xy),
+            touchdown_speed=self.gate_speed, target_alt=self.gate_height, target_xy=tuple(self._plan_target_xy(veh)),
             sink_gain=self.sink_gain, keep_out=keep_out, q_aoa=self._aoa_table(veh), ground_alt=self._z_ground,
             body_length=s.length,
             tilt_trim=tuple(self._gate_trim(veh)), trim_fade=self._trim_fade(), tilt_budget=self._tilt_budget(),
             height_ref=self._height_ref(veh), slew_deg=SLEW_DEG, dir_ref=self._dir_ref(veh), time_weight=self.time_weight,
-            min_sink=1.0 if self.catch_link is None else 0.0,
+            min_sink=1.0 if self.catch_link is None else 0.5,
         )
 
     def _solver(self, veh, wind_now, frac, keep_out):
@@ -1171,9 +1180,11 @@ class Autopilot3D:
         actually feels besides its commanded thrust (accelerometer: sensed
         specific force minus the command).  Unlike the modelled trim it
         includes the thrust lost to the gimbal holding the attitude against
-        the wind's moment -- in a 15 m/s wind enough to push a fully trimmed,
-        hovering booster off the catch axis at ~0.4 m/s^2.  Used over the gate
-        (catch hold), where the commanded and the felt force are near steady."""
+        the wind's moment -- in a 16 m/s wind the lean that holds a hovering
+        booster is several degrees more than the modelled trim, and with the
+        tilt budget centred on the model the position loop saturates and
+        holds the barrel metres off the catch axis.  Used in the hover at the
+        gate, where the commanded and the felt force are near steady."""
         sensed = (np.asarray(veh.last["thrust"], float) + np.asarray(veh.last["aero"], float))[:2] / veh.mass
         target = np.asarray(self.cmd_accel[:2], float) - sensed
         cap = math.tan(math.radians(self.trim_max_deg)) * G0
@@ -1189,10 +1200,9 @@ class Autopilot3D:
 
     def _trim_fade(self):
         """Heights (above the end of the burn) over which the wind trim fades
-        to upright.  A tower catch does not end in a touchdown: the booster
-        holds at the gate, leaning into the wind, and only comes upright once
-        the arms have closed -- fading the trim over the last metres above the
-        gate would let the wind push it off just before the hold."""
+        to upright.  A tower catch ends in a hover leaning into the wind: the
+        trim stays whole down to the gate (the tracker goes upright only once
+        it settles onto the closed arms)."""
         return (-2.0, -1.0) if self.catch_link is not None else TRIM_FADE
 
     def _gate_trim(self, veh) -> np.ndarray:
@@ -1385,9 +1395,7 @@ class Autopilot3D:
     def solver_alert(self):
         """For the display: None, or ('fail', status) when the last re-plans
         found no solution (shown for 2 s)."""
-        if not self.burn_locked or self._holding:
-            # holding at the gate (or after the burn) nothing is planned:
-            # the plan in hand is stale and says nothing
+        if not self.burn_locked:
             return None
         if self._ignition_searching:
             # the ignition search is still running: there is no plan yet by
@@ -1589,11 +1597,6 @@ class Autopilot3D:
         # descending instead of hovering.
         # Past the plan's end but still high or off the pad (the plan could
         # not be tracked): re-plan from here instead of trusting the old end.
-        if self.catch_link is not None and (self._holding or (
-                (t_go <= 0.6 or h <= self.gate_height + 0.2) and h < self.gate_height + 5.0
-                and float(np.linalg.norm(r[:2])) < 6.0)):
-            self._catch_hold(veh, r, v, dt)
-            return
         stranded = t_go <= 0.6 and (h > 20.0 or float(np.linalg.norm(r[:2])) > 15.0)
         if self.async_plan:
             # The solve runs on the planner thread: this step only commits a
@@ -1619,8 +1622,12 @@ class Autopilot3D:
             self.phase = "LANDING BURN"
             tau = self.elapsed - self.plan.created_at
             p_ref, v_ref, u_ff = self.plan.sample(tau)
+            settling = False
+            r_fb, v_fb = r, v
+            if self.catch_link is not None and tau >= self.plan.t_f:
+                p_ref, v_ref, settling, r_fb, v_fb = self._catch_hover_reference(veh, r, v)
             kp, kd, lim = (0.5, 0.5, 5.0) if self.replan_enabled else (self.frozen_kp, self.frozen_kd, self.frozen_fb_limit)
-            fb = kp * (p_ref - r) + kd * (v_ref - v)
+            fb = kp * (p_ref - r_fb) + kd * (v_ref - v_fb)
             nfb = float(np.linalg.norm(fb))
             if nfb > lim:
                 fb *= lim / nfb
@@ -1632,7 +1639,9 @@ class Autopilot3D:
                 # faster than 1.2 + 0.5 h m/s, brake the excess.  Near the pad
                 # the sink rate settles at touchdown speed with thrust ~ weight,
                 # so cutting the engine at contact cannot bounce the vehicle.
-                v_lim = -(self.gate_speed + self.sink_gain * max(0.0, h))
+                v_lim = -(self.gate_speed + self.sink_gain * max(0.0, h - self.gate_height))
+                if settling:
+                    v_lim = min(v_lim, -self.catch_settle_speed) if h > self.gate_height else v_lim
                 if v[2] < v_lim:
                     accel[2] += 2.0 * (v_lim - v[2])
             if self.elapsed - self.plan.created_at > self.brake_floor_age:
@@ -1652,6 +1661,13 @@ class Autopilot3D:
             # part, so more tilt would push the wrong way (and feed back).
             max_tilt = math.radians(float(np.interp(h, *self._tilt_budget())))
             center = self._trim_xy * float(np.interp(h, self._trim_fade(), (0.0, 1.0)))
+            hovering = self.catch_link is not None and tau >= self.plan.t_f and not settling
+            if hovering:
+                center = self._hold_bias        # hover at the gate: centred on the lean that really holds it
+            if settling:
+                # onto the closed arms: the lean goes out over the settle (a
+                # step to upright swings the barrel across the closed arms)
+                center = self._trim_xy * float(np.clip(h / max(self.gate_height, 0.1), 0.0, 1.0))
             trim_tilt = math.atan2(float(np.linalg.norm(center)), G0)
             accel = self._aoa_limit(veh, accel, wind_now, max_tilt + trim_tilt, self._aoa_table(veh), self._q_filt)
         else:
@@ -1681,6 +1697,44 @@ class Autopilot3D:
                 accel = self._aoa_limit(veh, accel, wind_now, max_tilt, self._aoa_table(veh), self._q_filt)
         self._mark()
         self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 and (self.plan is not None or accel[2] > 0.7 * g) else None, center=center)
+
+    def _catch_hover_reference(self, veh, r, v):
+        """Past the end of a tower-catch plan (a hover at the gate): hold the
+        plan's end point with zero velocity until the tower reports the arms
+        closed (latched: the faces letting go for a moment while they centre
+        the barrel must not flip it back to hovering), the hover has lasted
+        ``catch_hold_max`` or the propellant is nearly gone; then sink onto the
+        arms at ``catch_settle_speed``.  Returns (p_ref, v_ref, settling, r_fb,
+        v_fb): the position and velocity the feedback is taken from."""
+        if self._hover_t0 is None:
+            self._hover_t0 = self.elapsed
+        self._secured = self._secured or bool(self.catch_link())
+        if (self._secured or self.elapsed - self._hover_t0 > self.catch_hold_max
+                or veh.propellant < 80.0) and self._settle_t0 is None:
+            self._settle_t0 = self.elapsed
+        # The tower looks at the body axis at arm height, not at the base: a
+        # booster leaning into the wind has its barrel metres off its base
+        # point (15 m of body times the lean).  The feedback therefore works
+        # on that point -- its position and its velocity, with the tilting of
+        # the body in it: tilting the thrust moves the barrel at once and the
+        # base after it, in the same direction, so this loop is fast and
+        # stable, while holding the base and correcting for the lean by a
+        # smoothed offset swung the barrel about by metres.
+        ax = np.asarray(veh.axis, float)
+        az = max(float(ax[2]), 0.3)
+        dz = max(0.0, CATCH_COLLAR_Z - float(r[2]))
+        omega_w = veh.R @ np.asarray(veh.omega, float)
+        r_fb = np.array([r[0], r[1], r[2]], float)
+        v_fb = np.array([v[0], v[1], v[2]], float)
+        r_fb[:2] += ax[:2] / az * dz
+        v_fb[:2] += np.cross(omega_w, ax)[:2] / az * dz
+        p = np.array([self._gate_xy[0], self._gate_xy[1], self.gate_height], float)     # the barrel goes to the axis
+        v = np.zeros(3)
+        if self._settle_t0 is None:
+            return p, v, False, r_fb, v_fb
+        p[2] -= self.catch_settle_speed * (self.elapsed - self._settle_t0)
+        v[2] = -self.catch_settle_speed
+        return p, v, True, r_fb, v_fb
 
     def _braking_floor(self, veh, r, v, m, accel):
         """The vertical thrust acceleration of the command, raised to what it
@@ -1712,59 +1766,6 @@ class Autopilot3D:
         out = np.array(accel, float)
         out[2] = need
         return out
-
-    def _catch_hold(self, veh, r, v, dt):
-        """Tower catch: hold the collar just above the arm tops, centred on the
-        catch axis, until the tower reports the arms closed round the barrel;
-        then settle onto them (the engine is cut at contact).  The arms close
-        only on a booster that is in their capture window and slow, so a
-        booster that arrives a little off is caught after it has centred,
-        instead of drifting past while they close."""
-        if not self._holding:
-            self._holding = True
-            self._hold_t = 0.0
-            self._hold_i = np.zeros(2)
-            self._hold_h = self.gate_height
-            self._secured = False
-        self._hold_t += dt
-        # latched: the arms touching the barrel can let go for a moment as
-        # they push it to the centre; flipping between holding (leaning into
-        # the wind) and settling (upright) on that rocks the booster
-        self._secured = self._secured or bool(self.catch_link())
-        settle = self._secured or self._hold_t > self.catch_hold_max or veh.propellant < 80.0
-        if settle:
-            vz_ref = -self.catch_settle_speed
-            self._hold_h -= self.catch_settle_speed * dt
-        else:
-            vz_ref = 0.0
-        e = -np.asarray(r[:2], float)
-        if float(np.linalg.norm(e)) < self.catch_integral_radius:
-            # integrate only near the axis: while it is still coming in from
-            # metres off (arrival overshoot) the sum would wind up and carry
-            # it past the axis, out of the capture window on the other side
-            self._hold_i = np.clip(self._hold_i + e * dt, -4.0, 4.0)
-        # settling: the closed arms hold it sideways -- gentle and upright
-        k_xy = 0.5 if settle else 1.0
-        tilt = math.radians(1.0 if settle else self.catch_hold_tilt_deg)
-        # Towards the axis no faster than it can stop with half the tilt
-        # budget: a saturated linear PD brakes too late and swings metres
-        # past the axis in a strong wind.  Near the axis this is the plain PD
-        # (0.6 e - 1.6 v).
-        en = float(np.linalg.norm(e))
-        v_ref = np.zeros(2)
-        if en > 1e-6:
-            v_ref = e / en * min(0.375 * en, math.sqrt(math.tan(tilt) * G0 * en))
-        a_xy = k_xy * (1.6 * (v_ref - v[:2]) + 0.1 * self._hold_i)
-        a_z = G0 + 1.2 * (self._hold_h - r[2]) + 2.0 * (vz_ref - v[2])
-        self.phase = "CATCH HOLD"
-        self.time_to_go = max(0.0, float(r[2]) / self.catch_settle_speed) if settle else math.nan
-        self._mark()
-        # Holding: lean into the wind (else it drifts out of the capture
-        # window and the arms never close), centred on the measured bias.
-        # Settling on closed arms: upright, they hold it sideways.
-        secured = self._secured
-        self._fly_accel(veh, np.array([a_xy[0], a_xy[1], a_z]), tilt, floor=0.9 * self.minimum_throttle,
-                        center=None if secured else self._hold_bias)
 
     def _aoa_table(self, veh):
         return boostback.finish(self._aoa_table_steps(veh))

@@ -51,7 +51,7 @@ def run(case):
         if (vehicle.touchdown is None and ap.phase == "LANDING BURN"
                 and ap._height(vehicle) - ap.gate_height > 1.5 and np.linalg.norm(vehicle.vel) < 1):
             hover += PHYSICS_DT
-        if vehicle.touchdown is None and ap.phase in ("LANDING BURN", "CATCH HOLD") and ap._height(vehicle) < 8:
+        if vehicle.touchdown is None and ap.phase in ("LANDING BURN",) and ap._height(vehicle) < 8:
             rate = max(rate, math.degrees(float(np.abs(vehicle.omega[:2]).max())))
     td = vehicle.touchdown or {}
     return {"case": case, "success": passed(vehicle, sim.tower is not None), "state": vehicle.state,

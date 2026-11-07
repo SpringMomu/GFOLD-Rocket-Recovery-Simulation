@@ -21,7 +21,7 @@ from .vehicle import Vehicle, Wind, quat_from_axis_angle
 
 PHYSICS_DT = 1.0 / 240.0
 MAX_STEPS_PER_CALL = 2400
-LOGGED_PHASES = ("COAST", "BOOSTBACK", "LANDING BURN", "CATCH HOLD")
+LOGGED_PHASES = ("COAST", "BOOSTBACK", "LANDING BURN")
 
 SCENARIOS = [
     {"name": "HOVER-SLAM 100 m", "pos": (0, 0, 100), "vel": (0, 0, 0), "tilt": 0.0, "prop": 2500},

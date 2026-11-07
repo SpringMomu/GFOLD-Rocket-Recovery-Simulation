@@ -190,24 +190,6 @@ def test_low_far_catch_burn_time_is_searched_not_predicted():
     assert float(ap.plan.r[:, 2].max()) < 100.0
 
 
-def test_catch_hold_bias_includes_what_the_model_misses():
-    from lander3d.autopilot import Autopilot3D
-    from lander3d.vehicle import Vehicle
-
-    ap = Autopilot3D()
-    veh = Vehicle()
-    veh.reset(position=(0.0, 0.0, 50.0), on_pad=False)
-    m = veh.mass
-    ap.cmd_accel = np.array([-0.7, 0.0, 9.8])
-    # the thrust delivers only part of the commanded lean (gimbal holding the
-    # attitude), the wind pushes east at 0.75 m/s^2
-    veh.last["thrust"] = np.array([-0.45, 0.0, 9.8]) * m
-    veh.last["aero"] = np.array([0.75, 0.0, 0.0]) * m
-    for _ in range(2000):
-        ap._update_hold_bias(veh, 1.0 / 240.0)
-    assert np.allclose(ap._hold_bias, [-1.0, 0.0], atol=1e-3)
-
-
 def test_the_plan_is_solvable_from_a_state_outside_its_limits():
     from lander3d.planner import PlanConfig3D, Planner3D
 

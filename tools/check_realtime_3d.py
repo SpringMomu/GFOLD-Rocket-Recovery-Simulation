@@ -34,7 +34,7 @@ def check(index):
         if (v.touchdown is None and ap.phase == "LANDING BURN" and ap._height(v) - ap.gate_height > 1.5
                 and np.linalg.norm(v.vel) < 1.0):
             metrics["hover"] += dt
-        if v.touchdown is None and ap.phase in ("LANDING BURN", "CATCH HOLD") and ap._height(v) < 8.0:
+        if v.touchdown is None and ap.phase in ("LANDING BURN",) and ap._height(v) < 8.0:
             metrics["low_rate"] = max(metrics["low_rate"], math.degrees(float(np.abs(v.omega[:2]).max())))
 
     sim.step = measured_step
