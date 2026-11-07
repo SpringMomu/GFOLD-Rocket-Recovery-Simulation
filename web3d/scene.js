@@ -161,18 +161,12 @@ export class Scene {
     this.progDepth = createProgram(gl, S.DEPTH_VS, S.DEPTH_FS);
     this.progPoint = createProgram(gl, S.POINT_VS, S.POINT_FS);
     this.progLine = createProgram(gl, S.LINE_VS, S.LINE_FS);
-    this.progFlame = createProgram(gl, S.FLAME_VS, S.FLAME_FS);
     this.progPart = createProgram(gl, S.PART_VS, S.PART_FS);
     this.progDown = createProgram(gl, S.FS_VS, S.DOWN_FS);
     this.progUp = createProgram(gl, S.FS_VS, S.UP_FS);
     this.progComp = createProgram(gl, S.FS_VS, S.COMPOSITE_FS);
     this.progCopy = createProgram(gl, S.FS_VS, S.COPY_FS);
     this.progRcs = createProgram(gl, S.RCS_VS, S.RCS_FS);
-    // Flame: one teardrop (unit length, unit radius at its widest), scaled per layer.
-    const fp = [];
-    for (let i = 0; i <= 16; i++) { const t = i / 16; fp.push([t < 0.12 ? 0.88 + 0.12 * (t / 0.12) : Math.pow((1 - t) / 0.88, 0.8), t]); }
-    const fl = lathe(fp, 24);
-    this.meshFlame = createMesh(gl, fl.d, fl.idx);
     const rc = frustum(1, 1, 0, 1, 20, false);
     this.meshRcsJet = createMesh(gl, rc.d, rc.idx);
     const t = polarGrid(230, 200, 3.0, 1.0415);
@@ -885,7 +879,7 @@ export class Scene {
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, pa.data, 0, Math.min(pa.n, this.partMax) * 12);
     }
     if (pa && pa.nFar > 0) this._drawParticles(0, pa.nFar, partCtx);
-    if (P.on) this._drawPlume(P, cam);
+    // (the engine flame is drawn with the particles: app.js flamePuffs)
     if (pa && pa.n > pa.nFar) this._drawParticles(pa.nFar, Math.min(pa.n, this.partMax) - pa.nFar, partCtx);
     if (fx.rcs && fx.rcs.length) this._drawRcs(fx.rcs, cam);
 
@@ -906,37 +900,6 @@ export class Scene {
   }
 
   _fullscreen() { this.gl.bindVertexArray(this.emptyVao); this.gl.drawArrays(this.gl.TRIANGLES, 0, 3); }
-
-  // Simple game-style flame: three flat-coloured teardrops along the exhaust
-  // axis (outer orange, yellow, white core), opaque, no spreading.
-  _drawPlume(P, cam) {
-    const gl = this.gl, T = this.targets, pp = this.progFlame;
-    const z = P.axis, ang = Math.acos(Math.max(-1, Math.min(1, z[2]))), ax = V.cross([0, 0, 1], z);
-    const m = M4.mul(M4.translate(P.exit), V.len(ax) > 1e-6 ? M4.rotAxis(ax, ang) : (z[2] < 0 ? M4.rotAxis([1, 0, 0], Math.PI) : M4.ident()));
-    const t = this.time;
-    const flick = 1 + 0.06 * Math.sin(t * 52) + 0.04 * Math.sin(t * 91 + 1.3);
-    gl.useProgram(pp.program);
-    gl.uniformMatrix4fv(pp.u.u_vp, false, this.vp);
-    gl.uniformMatrix4fv(pp.u.u_model, false, m);
-    gl.uniform1f(pp.u.u_logFar, Math.log2(FAR + 1));
-    gl.uniform1f(pp.u.u_time, t % 1000);
-    gl.uniform3fv(pp.u.u_cam, cam.eye);
-    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, T.depthTex); gl.uniform1i(pp.u.u_depth, 3);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    const I = 0.7 + 0.3 * P.thr;
-    // [radius scale, length scale, colour, opacity]: soft shells, denser towards the core
-    const layers = [[1.3, 1.0, [3.2, 1.15, 0.2], 0.8], [0.95, 0.8, [4.6, 3.0, 0.75], 0.75], [0.55, 0.55, [5.2, 4.8, 3.4], 0.8]];
-    for (const [rs, ls, col, al] of layers) {
-      gl.uniform1f(pp.u.u_A, al);
-      gl.uniform1f(pp.u.u_len, P.flameLen * flick * ls);
-      gl.uniform1f(pp.u.u_rad, EXIT_R * 1.75 * (0.85 + 0.15 * P.thr) * rs);
-      gl.uniform1f(pp.u.u_seed, rs * 7.0);
-      gl.uniform3fv(pp.u.u_col, col);
-      gl.uniform1f(pp.u.u_I, I);
-      drawMesh(gl, this.meshFlame);
-    }
-    gl.activeTexture(gl.TEXTURE0);
-  }
 
   _drawParticles(first, count, c) {
     const gl = this.gl, T = this.targets, pp = this.progPart;

@@ -14,9 +14,10 @@ from lander3d.boostback import (
     predict,
     prediction_matches_state,
     steering,
+    throttle_command,
     turn_towards,
 )
-from lander3d.sim import Sim3D
+from lander3d.sim import PHYSICS_DT, Sim3D
 
 
 def test_rank_deficient_endpoint_sensitivity_has_a_bounded_conic_step():
@@ -117,6 +118,38 @@ def test_nose_first_cone_is_relative_to_air_and_direction_slew_is_bounded():
     opposite = turn_towards(np.array([0.0, 0.0, 1.0]), np.array([0.0, 0.0, -1.0]), 0.1)
     assert np.linalg.norm(opposite) == pytest.approx(1.0)
     assert math.acos(opposite[2]) == pytest.approx(0.1)
+
+
+def test_crosswind_request_is_not_turned_into_a_forward_push():
+    # 81 deg off the flow (scenario 5, 12 m/s from 175 deg): the nose-first
+    # cone used to turn it 20 deg off the flow, i.e. forwards.
+    ap = Sim3D(cfd=False).autopilot
+    velocity = np.array([100.0, -50.0, 0.0])
+    flow = velocity / np.linalg.norm(velocity)
+    request = np.array([-0.37, -0.93, 0.0])
+    assert 0.0 < request @ flow < math.cos(math.radians(70.0))
+    d = steering(ap, request, velocity, np.zeros(3))
+    assert abs(d @ flow) < 1e-9
+    assert d @ request > 0.9
+
+
+def test_engine_lights_partly_when_the_air_pins_the_booster_engines_first():
+    ap = Sim3D(cfd=False).autopilot
+    air = np.array([0.0, 0.0, -100.0])                     # falling: retrograde is straight up
+    request = np.array([1.0, 0.0, 0.0])                    # 90 deg off retrograde
+    pinned = np.array([math.sin(math.radians(45.0)), 0.0, math.cos(math.radians(45.0))])
+    assert throttle_command(ap, pinned, request, 30000.0, 6e5, False) == 0.0
+    assert 0.0 < throttle_command(ap, pinned, request, 30000.0, 6e5, False, air) < 1.0
+    # a retrograde request (the usual boost-back) keeps the plain interlock
+    assert throttle_command(ap, pinned, np.array([0.0, 0.0, 1.0]), 30000.0, 6e5, False, air) == 0.0
+
+
+def test_crosswind_boostback_of_scenario_5_is_flown():
+    sim = Sim3D(cfd=False, scenario=4, wind_on=True)
+    sim.apply_action('windcfg:{"from": [175, 175], "speed": [12, 12], "shear": 1}')
+    sim.step(PHYSICS_DT)
+    ap = sim.autopilot
+    assert ap.phase == "BOOSTBACK" and ap._bb_dv is not None, (ap._bb_status, ap._bb_exit_reason)
 
 
 def test_fuel_starved_prediction_is_not_accepted():

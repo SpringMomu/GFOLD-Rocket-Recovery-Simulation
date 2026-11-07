@@ -7,7 +7,7 @@ import { V, rot, slerp } from "./gl.js";
 import { Scene } from "./scene.js?v=trajectory-tvc-2";
 import { HUD } from "./hud.js?v=landing-history-1";
 import { Fluid3D } from "./fluid.js";
-import { plumeParams } from "./plume.js";
+import { plumeParams, EXIT_R } from "./plume.js";
 import { initControls } from "./controls.js?v=landing-history-1";
 
 const canvas = document.getElementById("view");
@@ -553,28 +553,68 @@ function stepEffects(st, dt, P) {
   }
 }
 
+// Engine flame: a chain of glowing puffs drawn by the smoke's own particle
+// shader (same noise-edged blobs), so flame and exhaust smoke share one
+// style.  The puffs stream out of the nozzle along the exhaust axis (they
+// follow the gimbal), grow and cool from a white-yellow core through orange
+// to a dim red tail; the chain is as long as plume.flameLen (throttle, cut
+// short by the ground).  Not simulated: rebuilt every frame from the time.
+const FLAME_HOT = [5.2, 4.8, 3.4], FLAME_YEL = [4.6, 3.0, 0.75], FLAME_ORG = [3.2, 1.15, 0.2], FLAME_RED = [1.1, 0.28, 0.05];
+const hash1 = (x) => { const v = Math.sin(x * 127.1 + 311.7) * 43758.5453; return v - Math.floor(v); };
+const mix3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+function flamePuffs(P, time) {
+  const out = [];
+  if (!P || !P.on || !(P.flameLen > 0.3)) return out;
+  const L = P.flameLen, thr = P.thr, ex = P.axis;
+  const u1 = V.norm(V.cross(ex, Math.abs(ex[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0])), u2 = V.cross(ex, u1);
+  const r0 = EXIT_R * (1.9 + 0.6 * thr);
+  const I = 0.55 * (0.7 + 0.3 * thr);                     // HDR: keeps the orange from saturating to white
+  const N = Math.max(10, Math.min(40, Math.round(L / (0.55 * r0))));
+  const rate = (26 + 30 * thr) / L;                       // the puffs travel at 26-56 m/s
+  for (let i = 0; i < N; i++) {
+    const ph = i / N + time * rate, cyc = Math.floor(ph), s = ph - cyc;
+    const k = i * 7.13 + cyc * 13.7, h1 = hash1(k), h2 = hash1(k + 1.7), h3 = hash1(k + 3.1);
+    const size = r0 * (0.7 + 1.3 * s) * (0.8 + 0.4 * h1);
+    const lat = r0 * (0.1 + 0.9 * s) * 0.8;
+    const p = V.add(V.add(P.exit, V.mul(ex, 0.35 * r0 + s * L)), V.add(V.mul(u1, lat * (h2 * 2 - 1)), V.mul(u2, lat * (h3 * 2 - 1))));
+    const col = s < 0.18 ? mix3(FLAME_HOT, FLAME_YEL, s / 0.18) : s < 0.55 ? mix3(FLAME_YEL, FLAME_ORG, (s - 0.18) / 0.37)
+      : mix3(FLAME_ORG, FLAME_RED, (s - 0.55) / 0.45);
+    const a = Math.min(1, s * 14) * (1 - Math.pow(Math.max(0, (s - 0.5) / 0.5), 1.5)) * 0.95;
+    out.push({ p, size, col, a, seed: h1 * 0.97 + cyc * 0.013, rot: h2 * 6.283 + s * 1.5, emis: I, kind: 7 });
+  }
+  // the hot core right at the nozzle
+  for (let i = 0; i < 4; i++) {
+    const s = 0.03 + 0.05 * i, h = hash1(i * 3.3 + Math.floor(time * 30));
+    out.push({ p: V.add(P.exit, V.mul(ex, 0.3 * r0 + s * L)), size: r0 * (0.75 + 0.15 * h), col: FLAME_HOT, a: 0.9,
+      seed: 0.5 + 0.1 * i + 0.02 * h, rot: h * 6.283, emis: I * 1.1, kind: 7 });
+  }
+  return out;
+}
+
 // Build the instance buffer: back-to-front sorted, split around the plume.
 const partData = new Float32Array(2000 * 12);
 const occGrid = new Map();
 let rocketAxis = null;
-function buildParticles(eye, P) {
-  const n = smoke.length;
+function buildParticles(eye, P, time = 0) {
+  const items = smoke.concat(flamePuffs(P, time));
+  const n = items.length;
   // Crowding (self-shadowing) estimate from a coarse spatial hash.
   occGrid.clear();
   const cell = 5;
   const key = (p) => ((Math.floor(p[0] / cell) * 73856093) ^ (Math.floor(p[1] / cell) * 19349663) ^ (Math.floor(p[2] / cell) * 83492791));
   for (const s of smoke) if (s.kind < 4 && s.kind !== 2) { const k = key(s.p); occGrid.set(k, (occGrid.get(k) || 0) + s.a0 * Math.min(4, s.size)); }
   const order = new Array(n);
-  for (let i = 0; i < n; i++) { const p = smoke[i].p; order[i] = [i, (p[0] - eye[0]) ** 2 + (p[1] - eye[1]) ** 2 + (p[2] - eye[2]) ** 2]; }
+  for (let i = 0; i < n; i++) { const p = items[i].p; order[i] = [i, (p[0] - eye[0]) ** 2 + (p[1] - eye[1]) ** 2 + (p[2] - eye[2]) ** 2]; }
   order.sort((a, b) => b[1] - a[1]);
   let dPl = -1;
   if (P && P.on) { const c = V.add(P.exit, V.mul(P.axis, Math.min(P.len * 0.4, P.hdist * 0.6))); dPl = (c[0] - eye[0]) ** 2 + (c[1] - eye[1]) ** 2 + (c[2] - eye[2]) ** 2; }
   let nFar = 0, m = 0;
   for (const [i, d2] of order) {
-    const s = smoke[i];
+    const s = items[i];
     const life = s.age / s.life;
     let a;
-    if (s.kind === 2) a = s.a0 * Math.pow(1 - life, 1.6);
+    if (s.kind === 7) a = s.a;
+    else if (s.kind === 2) a = s.a0 * Math.pow(1 - life, 1.6);
     else if (s.kind === 4) a = s.a0;
     else if (s.kind === 5) {
       a = s.a0 * Math.min(1, (1 - life) / 0.4);
@@ -598,7 +638,8 @@ function buildParticles(eye, P) {
     partData[o] = s.p[0]; partData[o + 1] = s.p[1]; partData[o + 2] = s.p[2]; partData[o + 3] = s.size;
     partData[o + 4] = s.col[0]; partData[o + 5] = s.col[1]; partData[o + 6] = s.col[2]; partData[o + 7] = a;
     let emis = 0, open = 1;
-    if (s.kind === 4) { emis = 6 * Math.pow(1 - life, 2); open = -1; }
+    if (s.kind === 7) { emis = s.emis; open = -3; }                          // flame puff (emissive)
+    else if (s.kind === 4) { emis = 6 * Math.pow(1 - life, 2); open = -1; }
     else if (s.kind === 5 || s.kind === 6) open = 0.85;                        // soft volumetric puff (same as the video)
     else if (s.kind !== 2) {
       emis = s.kind === 0 ? 0.25 * Math.exp(-s.age * 3) : 0;
@@ -647,22 +688,47 @@ function ribbon(pts, width, color, eye, fade = false) {
   }
 }
 
-// Axis glyphs show the planned thrust direction or the actual body axis;
-// sample evenly by index to keep long flights legible and inexpensive.
-function attitudeGlyphs(points, axes, eye, width, color, length) {
-  if (!points || !axes || points.length !== axes.length) return;
-  const stride = Math.max(1, Math.ceil(points.length / 24));
-  for (let i = 0; i < points.length; i += stride) {
-    const p = points[i], axis = axes[i];
-    if (!axis || V.len(axis) < 0.5) continue;
+// Axis glyphs show the planned thrust direction or the actual body axis,
+// evenly spaced along the path (arc length, GLYPH_SPACING glyph lengths
+// apart) whatever its length: thinning by sample index spread them out on a
+// long path and bunched them on a short one (the samples are uneven in time
+// and space).  ``fromEnd`` anchors the spacing at the last point (the plan's
+// end, on the pad, so its glyphs stay put while the plan shortens); the
+// trail is anchored at its start.  Glyphs between samples interpolate the
+// axis; a very long path widens the spacing (at most GLYPH_MAX glyphs).
+// Below GLYPH_LOW_ALT (the landing) they are GLYPH_LOW_DENSER times closer.
+const GLYPH_SPACING = 2.2, GLYPH_MAX = 160, GLYPH_LOW_ALT = 200, GLYPH_LOW_DENSER = 3;
+function attitudeGlyphs(points, axes, eye, width, color, length, fromEnd = false) {
+  if (!points || !axes || points.length !== axes.length || points.length < 2) return;
+  const n = points.length;
+  const idx = (k) => (fromEnd ? n - 1 - k : k);
+  let total = 0;
+  for (let k = 1; k < n; k++) total += V.len(V.sub(points[idx(k)], points[idx(k - 1)]));
+  const step = Math.max(GLYPH_SPACING * length, total / GLYPH_MAX);
+  const glyph = (p, axis) => {
+    if (!axis || V.len(axis) < 0.5) return;
+    axis = V.norm(axis);
     const tip = V.add(p, V.mul(axis, length));
     let side = V.cross(axis, V.sub(eye, p));
-    const n = V.len(side);
-    if (n < 1e-6) continue;
-    side = V.mul(side, length * 0.13 / n);
+    const m = V.len(side);
+    if (m < 1e-6) return;
+    side = V.mul(side, length * 0.13 / m);
     const tail = V.sub(tip, V.mul(axis, length * 0.22));
     ribbon([p, tip], width, color, eye);
     ribbon([V.add(tail, side), tip, V.sub(tail, side)], width, color, eye);
+  };
+  let next = 0, run = 0;
+  for (let k = 1; k < n && next <= total; k++) {
+    const a = points[idx(k - 1)], b = points[idx(k)], seg = V.len(V.sub(b, a));
+    while (next <= run + seg && next <= total) {
+      const f = seg > 1e-9 ? (next - run) / seg : 0;
+      const xa = axes[idx(k - 1)], xb = axes[idx(k)];
+      const axis = xa && xb ? V.add(V.mul(xa, 1 - f), V.mul(xb, f)) : (f < 0.5 ? xa : xb);
+      const p = V.add(a, V.mul(V.sub(b, a), f));
+      glyph(p, axis);
+      next += p[2] < GLYPH_LOW_ALT ? step / GLYPH_LOW_DENSER : step;
+    }
+    run += seg;
   }
 }
 
@@ -721,11 +787,11 @@ function frame(now) {
     if (!CLEAN && view.showTraj && view.showAttitude) {
       const length = Math.max(18, (st.spec && st.spec.length || 40) * 0.8);
       attitudeGlyphs(st.trail, st.trail_axes, eye, pxW, [0.4, 0.72, 1, 0.9], length);
-      attitudeGlyphs(st.plan, st.plan_axes, eye, pxW, [0.45, 1, 0.65, 0.9], length);
+      attitudeGlyphs(st.plan, st.plan_axes, eye, pxW, [0.45, 1, 0.65, 0.9], length, true);
     }
     scene.time = now / 1000;
     const stR = Object.assign({}, st, { wind: st.wind || [0, 0, 0] });
-    const fx = { rcs: rcsJets(st), lines: lineBuf.subarray(0, lineN * 8), particles: (rocketAxis = [V.add(st.pos, rot(st.q, [0, 0, -2])), rot(st.q, [0, 0, 1])], buildParticles(cam.eye, plumeNow)), plume: plumeNow };
+    const fx = { rcs: rcsJets(st), lines: lineBuf.subarray(0, lineN * 8), particles: (rocketAxis = [V.add(st.pos, rot(st.q, [0, 0, -2])), rot(st.q, [0, 0, 1])], buildParticles(cam.eye, plumeNow, now / 1000)), plume: plumeNow };
     if (fluidOn && view.flowMode > 0) {
       fx.fluid = fluid; fx.fluidMode = view.volField; fx.fluidVolume = true;
     }

@@ -357,31 +357,6 @@ void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); v_uv = p; 
 // soft edges -- the opacity falls off towards the silhouette (like looking
 // through a glowing gas shell) and towards the tip.  No spreading plume, no
 // noise, no volumetrics: the length follows the throttle, plus a flicker.
-export const FLAME_VS = `#version 300 es
-precision highp float;
-layout(location=0) in vec3 a_pos; layout(location=1) in vec3 a_nrm;
-uniform mat4 u_vp, u_model; uniform float u_len, u_rad, u_time, u_seed;
-out float v_w; out float v_s; out vec3 v_n; out vec3 v_world;
-void main() {
-  float s = a_pos.z;                                   // 0 at the nozzle exit, 1 at the tip
-  float wob = 1.0 + 0.07 * sin(u_time * 47.0 + s * 9.0 + u_seed) * smoothstep(0.1, 0.8, s);
-  vec4 w = u_model * vec4(a_pos.xy * u_rad * wob, s * u_len, 1.0);
-  v_n = mat3(u_model) * vec3(a_nrm.xy / max(u_rad, 1e-3), a_nrm.z / max(u_len, 1e-3));
-  v_world = w.xyz; v_s = s;
-  gl_Position = u_vp * w; v_w = gl_Position.w;
-}`;
-export const FLAME_FS = `#version 300 es
-precision highp float;
-in float v_w; in float v_s; in vec3 v_n; in vec3 v_world; out vec4 o;
-uniform highp sampler2D u_depth; uniform float u_logFar; uniform vec3 u_col, u_cam; uniform float u_I, u_A;
-void main() {
-  float wS = exp2(texelFetch(u_depth, ivec2(gl_FragCoord.xy), 0).r * u_logFar) - 1.0;
-  if (v_w > wS) discard;
-  float f = abs(dot(normalize(v_n), normalize(u_cam - v_world)));       // 1 facing the eye, 0 at the silhouette
-  float a = u_A * pow(smoothstep(0.0, 1.0, f), 1.6) * (1.0 - smoothstep(0.25, 1.0, v_s));   // soft: the shell fades out well before its silhouette
-  o = vec4(u_col * u_I * a, a);
-}`;
-
 // ------------------------------------------------------------------ smoke / dust / sparks (instanced billboards)
 export const PART_VS = `#version 300 es
 precision highp float;
@@ -414,6 +389,19 @@ void main() {
   float r2 = dot(v_uv, v_uv); if (r2 > 1.0) discard;
   float dS = texelFetch(u_depth, ivec2(gl_FragCoord.xy), 0).r;
   float wS = exp2(dS * u_logFar) - 1.0;
+  if (v_ex.w < -2.5) {                     // engine flame puff: the smoke's blob, emissive
+    float r = sqrt(r2);
+    vec3 np = vec3(v_uv * 1.35, v_ex.x * 17.3 + u_time * 0.9);
+    float n = fbm3l(np), n2 = noise3(np * 3.3 + 5.0);
+    float dens = smoothstep(1.0, 0.22, r + (n - 0.5) * 1.0 + (n2 - 0.5) * 0.3);
+    float a = v_col.a * dens;
+    a *= clamp((wS - v_w) / (v_size * 0.3 + 0.1), 0.0, 1.0);
+    a *= clamp((v_w - 0.3) / 2.0, 0.0, 1.0);
+    if (a < 0.002) discard;
+    vec3 col = v_col.rgb * v_ex.z * (0.55 + 0.45 * dens);       // hotter inside the puff
+    o = vec4(col * a, a * 0.8);
+    return;
+  }
   if (v_ex.w < -1.5) {                     // pad dust: crisp flat-shaded disc, hard edge, two-tone
     if (v_w > wS + 0.3 * v_size) discard;
     vec2 sd = vec2(dot(u_sun, u_camR), dot(u_sun, u_camU));

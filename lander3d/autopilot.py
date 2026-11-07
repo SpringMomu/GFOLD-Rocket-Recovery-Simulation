@@ -38,7 +38,7 @@ from .vehicle import G0, atmosphere, atmosphere_many, fin_mix
 # last TRIM_FADE metres.  (Holding the planner to this budget too was tried:
 # it then gives up the last-seconds corrections the tracker can still
 # partly fly, and lands further off in wind.)
-TILT_BUDGET = ([0.3, 1.5, 3.0, 8.0, 15.0, 40.0], [0.6, 2.0, 5.0, 12.0, 20.0, 75.0])
+TILT_BUDGET = ([0.3, 1.5, 3.0, 8.0, 15.0, 400.0], [20.0, 20.0, 20.0, 20.0, 20.0, 75.0])
 # Tower catch (heights above the catch point, the base 15 m up with the
 # collar on the arms; the tower top is 33 m above it): beside the tower and
 # the arms the budget stays small.  The keep-out boxes guard
@@ -51,8 +51,8 @@ TILT_BUDGET = ([0.3, 1.5, 3.0, 8.0, 15.0, 40.0], [0.6, 2.0, 5.0, 12.0, 20.0, 75.
 # own 4 / 1 deg, _catch_hold).  The planner's tilt cone uses the same table
 # (PlanConfig3D.tilt_budget, an elastic constraint of the convex problem);
 # the tracker's clip is only the backstop.
-CATCH_TILT_BUDGET = ([0.0, 60.0, 61.0, 100.0, 101.0],
-                     [15.0, 15.0, 30.0, 30.0, 75.0])
+CATCH_TILT_BUDGET = ([0.0, 60.0, 61.0, 100.0, 500.0],
+                     [20.0, 20.0, 30.0, 30.0, 75.0])
 TRIM_FADE = (0.5, 5.5)          # m: upright below the first height, full trim above the second
 SLEW_DEG = ([2.0, 30.0, 300.0], [16.0, 30.0, 50.0])   # thrust-direction slew-rate limit (deg/s) by height
 # Angle of attack (thrust vs the oncoming flow) vs dynamic pressure (Pa ->
@@ -160,7 +160,8 @@ class Autopilot3D:
     low_rcs_height = 15.0         # RCS assists TVC close to the ground
     sink_gain = 0.5               # final approach: sink <= 1.2 + 0.5 h (m/s): 6.2 at 10 m, 2.2 at 2 m
     sink_track_height = 15.0      # the tracker enforces the envelope below this height
-    legs_deploy_height = 450.0
+    legs_deploy_height = 100.0    # landing legs come out below this height (m) ...
+    legs_emergency_time = 3.0     # ... or higher when the ground is closer than this at the sink rate (s; they take 2 s)
     # Boost-back from this predicted miss on.  A fast fall is steered by the
     # glide (body lift ~ q), but a slow one is not: e.g. 180 m off from 2 km
     # at -30 m/s, the glide removes less than half and ignition comes fast
@@ -1491,6 +1492,12 @@ class Autopilot3D:
         self._route = best[1] if best is not None else paths[0]
         return self._route
 
+    def _legs_due(self, veh, v):
+        """Landing legs out: below legs_deploy_height, or higher when a fast
+        sink would reach the ground before they are out (2 s to deploy)."""
+        alt = float(veh.altitude)
+        return alt < self.legs_deploy_height or alt < self.legs_emergency_time * max(0.0, -float(v[2]))
+
     def _far_time(self, r, v):
         """A generous time to the gate from here: a vertical fall plus a
         sideways transfer at a modest acceleration."""
@@ -1545,7 +1552,7 @@ class Autopilot3D:
             self._mark()
             return
 
-        if h < self.legs_deploy_height and self.use_legs:
+        if self.use_legs and self._legs_due(veh, v):
             c.legs_down = True
         if self.burn_locked:
             c.fins_deploy = True
@@ -1607,14 +1614,12 @@ class Autopilot3D:
             # 70-knot horizon costs ~0.1 s); 5 Hz over the last ~8 s.
             self.next_replan = self.elapsed + float(np.interp(t_go, [8.0, 30.0], [self.burn_replan_period, 0.6]))
         self.time_to_go = max(0.0, t_go)
-        if t_go < 8.0 and self.use_legs:
-            c.legs_down = True
 
         if self.plan is not None:
             self.phase = "LANDING BURN"
             tau = self.elapsed - self.plan.created_at
             p_ref, v_ref, u_ff = self.plan.sample(tau)
-            kp, kd, lim = (0.5, 1.6, 5.0) if self.replan_enabled else (self.frozen_kp, self.frozen_kd, self.frozen_fb_limit)
+            kp, kd, lim = (0.5, 0.5, 5.0) if self.replan_enabled else (self.frozen_kp, self.frozen_kd, self.frozen_fb_limit)
             fb = kp * (p_ref - r) + kd * (v_ref - v)
             nfb = float(np.linalg.norm(fb))
             if nfb > lim:
@@ -1632,7 +1637,7 @@ class Autopilot3D:
                     accel[2] += 2.0 * (v_lim - v[2])
             if self.elapsed - self.plan.created_at > self.brake_floor_age:
                 accel = self._braking_floor(veh, r, v, m, accel)
-                if (not self.use_legs and float(veh.altitude) < self.legs_deploy_height
+                if (not self.use_legs and self._legs_due(veh, v)
                         and self.elapsed - self.plan.created_at > 0.5 * self.plan_stale_after
                         and float(np.linalg.norm(r[:2])) > self.catch_far_distance):
                     # (really no new plan: with the planner on its own thread a
@@ -1662,7 +1667,7 @@ class Autopilot3D:
             # (down to the ground, not to the end of the planned burn: a tower
             # catch's end point is 30 m up, and the legs come out here)
             vz_ref = -math.sqrt(2 * a_brake * max(float(veh.altitude), 0.0)) - self.touchdown_speed
-            if float(veh.altitude) < self.legs_deploy_height:
+            if self._legs_due(veh, v):
                 c.legs_down = True
             pull = -0.08 * r[:2]
             pn = float(np.linalg.norm(pull))
@@ -2356,7 +2361,7 @@ class Autopilot3D:
                 d = boostback.steering(self, np.array([a_h * toward[0], a_h * toward[1], a_z]), v, wind_bb, r[2])
                 previous = veh.axis if self._bb_axis is None else self._bb_axis
                 self._bb_axis = boostback.turn_towards(previous, d, self.max_rate * self._dt)
-                thr = boostback.throttle_command(self, veh.axis, d, m, available, True)
+                thr = boostback.throttle_command(self, veh.axis, d, m, available, True, v - wind_bb)
                 c.fins_deploy = False
                 c.throttle = self.cmd_throttle = thr
                 self.cmd_axis = self._bb_axis.copy()
@@ -2416,7 +2421,7 @@ class Autopilot3D:
                 self.next_predict = 0.0
             else:
                 c.fins_deploy = False           # grid fins stay stowed for the boost-back
-                thr = boostback.throttle_command(self, veh.axis, d, m, available, self._hop)
+                thr = boostback.throttle_command(self, veh.axis, d, m, available, self._hop, v - wind_bb)
                 previous = veh.axis if self._bb_axis is None else self._bb_axis
                 self._bb_axis = boostback.turn_towards(previous, d, self.max_rate * self._dt)
                 c.throttle = thr

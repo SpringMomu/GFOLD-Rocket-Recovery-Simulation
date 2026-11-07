@@ -102,9 +102,19 @@ def steering(ap, requested, velocity, wind, height=None):
     speed = float(np.linalg.norm(vr))
     if speed > ap.nose_first_speed:
         flow = vr / speed
-        if d @ flow > 0.0:
+        along = float(d @ flow)
+        if along > NOSE_FIRST_HANDOVER_COS:
             d = turn_towards(flow, d, math.radians(ap.nose_first_aoa_deg))
-        elif height is not None:
+        elif along > 0.0:
+            # Nearly across the flow (a crosswind return: 12 m/s from 175 deg
+            # in scenario 5 asked for 81 deg off the flow).  The nose-first
+            # cone turned it into a forward push 20 deg off the flow, which
+            # the booster (fins stowed, ~7 kPa) could never turn nose-first
+            # into: the interlock held zero throttle until the floor and no
+            # return was ever flown.  Push across the flow, engines-first
+            # side, and leave the small along-flow part to the shooting.
+            d = unit(d - along * flow)
+        if along <= NOSE_FIRST_HANDOVER_COS and height is not None:
             q = 0.5 * atmosphere(max(0.0, float(height)))[0] * speed * speed
             if q > RETRO_FREE_Q:
                 limit = float(np.interp(q, (RETRO_FREE_Q, RETRO_PINNED_Q), (math.pi, math.radians(ap.nose_first_aoa_deg))))
@@ -112,13 +122,40 @@ def steering(ap, requested, velocity, wind, height=None):
     return d
 
 
-def throttle_command(ap, axis, direction, mass, thrust, hop):
-    """Alignment interlock; a low hop retains vertical support while turning."""
-    if axis @ direction >= math.cos(math.radians(25.0)):
+# Pinned engines-first (see throttle_command): light for gimbal authority
+# once the axis is this close to a request this far from retrograde.
+PINNED_LIGHT_COS = math.cos(math.radians(60.0))
+PINNED_THROTTLE = 0.4
+
+
+def throttle_command(ap, axis, direction, mass, thrust, hop, air=None):
+    """Alignment interlock; a low hop retains vertical support while turning.
+
+    ``air`` (velocity relative to the air): with the grid fins stowed and the
+    engine off only the RCS turns the booster, and in a dense flow the air
+    holds it engines-first.  A request far from retrograde -- across the
+    flow, as an upwind return in a crosswind (scenario 5, 12 m/s from
+    175 deg: 80-90 deg off the flow at ~5 kPa) -- then never came within the
+    25 deg interlock: zero throttle until the floor, no return flown.  Once
+    the axis is within 60 deg of such a request and the air is holding it on
+    the retrograde side of it, the engine lights partly: the gimbal turns the
+    booster the rest of the way, and the thrust meanwhile still has a
+    component along the request (the rest is retrograde, the stable
+    direction).  Prediction and execution use the same rule."""
+    c = float(axis @ direction)
+    if c >= math.cos(math.radians(25.0)):
         return 1.0
+    throttle = 0.0
+    if air is not None and c >= PINNED_LIGHT_COS:
+        speed = float(np.linalg.norm(air))
+        if speed > ap.nose_first_speed:
+            retro = -air / speed
+            off_retro = float(direction @ retro)
+            if off_retro < PINNED_LIGHT_COS and float(axis @ retro) > off_retro:
+                throttle = PINNED_THROTTLE
     if hop and axis[2] > 0.3:
-        return float(np.clip(1.1 * mass * G0 / (thrust * axis[2]), 0.0, 1.0))
-    return 0.0
+        throttle = max(throttle, float(np.clip(1.1 * mass * G0 / (thrust * axis[2]), 0.0, 1.0)))
+    return throttle
 
 
 def braking_handover(ap, impulse, axis, velocity, wind, position=None):
@@ -221,7 +258,7 @@ def execution_state_steps(ap, veh, impulse, lead, waiting, dt=0.05):
             if ap._hop and probe.axis[2] > 0.3:
                 throttle = float(np.clip(1.1 * mass * G0 / (thrust * probe.axis[2]), 0.0, 1.0))
         else:
-            throttle = throttle_command(ap, probe.axis, direction, mass, thrust, ap._hop)
+            throttle = throttle_command(ap, probe.axis, direction, mass, thrust, ap._hop, v - wind)
         desired = turn_towards(desired, direction, ap.max_rate * step)
         probe.controls.throttle = throttle
         probe.controls.fins_deploy = False
@@ -288,7 +325,8 @@ def predict_steps(ap, veh, r, v, m, wind_now, impulse, dt=0.05, fast=False):
         tail = thrust / mass * probe.throttle ** 2 / (2.0 * s.throttle_rate)
         shutting_down = (shutting_down or remaining <= max(ap.boostback_done_dv, tail)
                          or braking_handover(ap, impulse, probe.axis, u, wind, p))
-        command = 0.0 if shutting_down else throttle_command(ap, probe.axis, direction, mass, thrust, ap._hop)
+        command = 0.0 if shutting_down else throttle_command(ap, probe.axis, direction, mass, thrust, ap._hop,
+                                                                  u - wind)
         probe.controls.throttle = command
         probe.controls.fins_deploy = False
         desired = turn_towards(desired, direction, ap.max_rate * dt)
