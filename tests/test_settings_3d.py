@@ -20,6 +20,8 @@ TARGETS = {
     "lateral_aero_share": ("pl", "lateral_aero_share"), "knots": ("pl", "knots"),
     "lateral_accel_weight": ("pl", "lateral_accel_weight"), "jerk_weight": ("pl", "jerk_weight"),
     "lateral_rate": ("pl", "lateral_rate"), "max_iter": ("pl", "max_iter"),
+    "tracker_mpc": ("ap", "tracker_mpc"), "mpc_steps": ("ap", "mpc_steps"), "mpc_q_pos": ("ap", "mpc_q_pos"),
+    "mpc_q_vel": ("ap", "mpc_q_vel"), "mpc_r_rate": ("ap", "mpc_r_rate"), "mpc_lag_h": ("ap", "mpc_lag_h"),
 }
 
 

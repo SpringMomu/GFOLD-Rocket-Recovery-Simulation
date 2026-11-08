@@ -20,6 +20,7 @@ from common.conic import golden_section_search
 from . import boostback
 from .aero import grid_fin_forces
 from .attitude import FIN_MIN_EFF, attitude_control
+from .mpc import TrackingMPC
 from .planner import (
     KeepOutBox,
     Plan3D,
@@ -257,6 +258,28 @@ class Autopilot3D:
     frozen_kd = 1.6               # flight keeps 0.5 / 1.6 / 5 m/s^2 (the plan itself is renewed every 0.6 s)
     frozen_fb_limit = 5.0
     frozen_net_gain = True        # a frozen plan (replan off): feedback through the net-acceleration gain of a tilt (_net_gain_feedback)
+    # Landing-burn tracker: G-FOLD plans the burn, a model-predictive tracker
+    # (lander3d/mpc.py) closes the loop round the plan instead of the PD
+    # correction above -- it knows the thrust lags the command (the attitude
+    # loop turns it), so it does not keep pushing while the thrust swings round.
+    tracker_mpc = True            # False: the PD correction (pd_* re-planned, frozen_* frozen)
+    pd_kp = 0.5                   # PD correction while re-planning (tracker_mpc off, or the MPC does not solve)
+    pd_kd = 0.1
+    pd_limit = 5.0
+    mpc_period = 0.1              # s between solves (the first move is held meanwhile)
+    mpc_dt = 0.2                  # s, model step
+    mpc_steps = 12                # model steps (horizon mpc_steps * mpc_dt)
+    mpc_lag_h = 1.0               # s, lag of the sideways thrust behind the command (attitude loop + slew limit; on the slow side)
+    mpc_lag_v = 0.2               # s, lag of the vertical thrust (throttle)
+    mpc_q_pos = 0.15              # weight of the position error (m^-2 against (m/s^2)^-2 of correction)
+    mpc_q_vel = 0.0               # weight of the velocity error (the horizon damps by itself)
+    mpc_terminal = 4.0            # x the error weights at the horizon's end
+    mpc_r_u = 1.0                 # weight of the correction
+    mpc_r_rate = 1.0              # weight of its change per model step
+    mpc_lead = True               # lead the plan's own thrust changes by the lag
+    mpc_bridge = True             # keep plan thrust + correction continuous when the plan is replaced
+    mpc_limit = 5.0               # m/s^2, largest correction
+    mpc_a0_mode = 0               # initial thrust offset: 0 as commanded, 1 measured thrust, 2 |thrust| along the axis (1/2 rock)
     replan_enabled = True         # continuous planning (front-end switch); off: the plan in hand is flown to touchdown, no new ones
     lift_calibrate = True         # ... and scaled by the ratio of the lift measured in flight to the lift of that model
     lift_gain_tau = 3.0           # s, memory of that ratio
@@ -309,6 +332,7 @@ class Autopilot3D:
 
     def __init__(self, aero_model=None) -> None:
         self.planner = Planner3D()
+        self.mpc = TrackingMPC()
         self.aero = aero_model
         self.async_plan = False        # re-plans on a background thread (server / browser)
         self._bb_cooperative = False   # bounded work slices, also works without Python threads
@@ -620,6 +644,12 @@ class Autopilot3D:
         self._settle_t0 = None        # ... and when the settle onto the arms began
         self._secured = False
         self._dir_prev = None
+        self._mpc_du = np.zeros(3)    # correction of the model-predictive tracker in force
+        self._mpc_next = 0.0
+        self.mpc_seq = None           # its last predicted correction sequence (N, 3)
+        self._mpc_t = 0.0             # when it was solved
+        self._mpc_key = None          # plan the correction was made against (_mpc_feedback: bridging)
+        self._mpc_uff = None          # ... and its thrust at the last step
         self._gate_xy = np.zeros(2)
         self._dir_rate = np.zeros(3)
         self._dt = 1.0 / 240.0
@@ -1626,11 +1656,17 @@ class Autopilot3D:
             r_fb, v_fb = r, v
             if self.catch_link is not None and tau >= self.plan.t_f:
                 p_ref, v_ref, settling, r_fb, v_fb = self._catch_hover_reference(veh, r, v)
-            kp, kd, lim = (0.5, 0.5, 5.0) if self.replan_enabled else (self.frozen_kp, self.frozen_kd, self.frozen_fb_limit)
-            fb = kp * (p_ref - r_fb) + kd * (v_ref - v_fb)
-            nfb = float(np.linalg.norm(fb))
-            if nfb > lim:
-                fb *= lim / nfb
+            fb = None
+            if self.tracker_mpc and self.mpc.available:
+                held = self.catch_link is not None and tau >= self.plan.t_f
+                fb = self._mpc_feedback(veh, tau, p_ref, v_ref, u_ff, r_fb, v_fb, m, held)
+            if fb is None:
+                kp, kd, lim = ((self.pd_kp, self.pd_kd, self.pd_limit) if self.replan_enabled
+                               else (self.frozen_kp, self.frozen_kd, self.frozen_fb_limit))
+                fb = kp * (p_ref - r_fb) + kd * (v_ref - v_fb)
+                nfb = float(np.linalg.norm(fb))
+                if nfb > lim:
+                    fb *= lim / nfb
             if not self.replan_enabled and self.frozen_net_gain:
                 fb = self._net_gain_feedback(veh, wind_now, u_ff, fb)
             accel = u_ff + fb
@@ -1678,6 +1714,11 @@ class Autopilot3D:
             # braking profile -- at minimum throttle it out-thrusts the weight
             # and would carry the booster up.
             self.phase = "FALLBACK"
+            self._mpc_du = np.zeros(3)
+            self._mpc_next = 0.0
+            self.mpc_seq = None
+            self._mpc_key = None
+            self._mpc_uff = None
             a_max_now = s.thrust_sl / m
             a_brake = 0.35 * (a_max_now - g)        # the deceleration of the braking profile ...
             # (down to the ground, not to the end of the planned burn: a tower
@@ -1697,6 +1738,74 @@ class Autopilot3D:
                 accel = self._aoa_limit(veh, accel, wind_now, max_tilt, self._aoa_table(veh), self._q_filt)
         self._mark()
         self._fly_accel(veh, accel, max_tilt, floor=0.9 * self.minimum_throttle if h > 1.0 and (self.plan is not None or accel[2] > 0.7 * g) else None, center=center)
+
+    def _mpc_feedback(self, veh, tau, p_ref, v_ref, u_ff, r_fb, v_fb, m, held):
+        """The correction of the model-predictive tracker (lander3d/mpc.py),
+        re-solved every ``mpc_period`` and held in between; None if it does
+        not solve (the PD correction is used then).  ``held``: the reference
+        is a fixed point (tower-catch hover/settle), not the plan's motion."""
+        # A new plan (or the switch to the fixed catch reference) starts from
+        # the present state: its errors are zero and its thrust is not quite
+        # the one being flown.  Left alone, the correction built up against
+        # the old plan would drop out at once and the thrust direction jump
+        # (~3.5 m/s^2, 20 deg, at every re-plan in a strong wind: the rocking
+        # in scenario 10).  Bridge it: keep the total command (plan thrust +
+        # correction) continuous and let the tracker take the difference out
+        # at its rate cost.
+        key = (id(self.plan), self.plan.created_at, bool(held))
+        u_ff = np.asarray(u_ff, float)
+        if self.mpc_bridge and self._mpc_key is not None and key != self._mpc_key and self._mpc_uff is not None:
+            jump = self._mpc_uff - u_ff
+            du = self._mpc_du + jump
+            dn = float(np.linalg.norm(du))
+            if dn > self.mpc_limit:
+                du *= self.mpc_limit / dn
+            self._mpc_du = du
+            self.mpc_seq = None
+            self._mpc_next = self.elapsed          # re-solve from the bridged correction now
+        self._mpc_key = key
+        self._mpc_uff = u_ff.copy()
+        if self.elapsed < self._mpc_next:
+            return self._mpc_du.copy()
+        N, dt = int(self.mpc_steps), float(self.mpc_dt)
+        if held or not self.mpc_lead:
+            u_dot = np.zeros((N, 3))
+        else:
+            _, _, acc = self.plan.sample_many(tau + dt * np.arange(N + 1))
+            u_dot = np.diff(acc, axis=0) / dt
+        # The thrust offset the prediction starts from.  Default (0): the
+        # correction in force, i.e. no measurement -- the lag is in the
+        # prediction (how fast a new correction arrives), not in the state.
+        # Measured thrust (1) or |thrust| along the body axis (2) couple the
+        # tracker to the attitude loop (the gimbal swings to steer the
+        # attitude, the axis sways): at 10 Hz the tracker answers that sway
+        # and drives it -- pitch/yaw rate RMS 6 -> 9.5-14 deg/s, 4-6/8 passes.
+        if self.mpc_a0_mode == 2:
+            # along the body axis: the attitude is the slow state the thrust
+            # follows; the gimbal's own quick swings (it steers the attitude)
+            # are not thrust the tracker should answer
+            a_thr = float(np.linalg.norm(veh.last["thrust"])) * np.asarray(veh.axis, float) / m
+        elif self.mpc_a0_mode == 1:
+            a_thr = np.asarray(veh.last["thrust"], float) / m
+        else:
+            a_thr = np.asarray(u_ff, float) + self._mpc_du    # no measurement: as commanded
+        a0 = a_thr - np.asarray(u_ff, float)
+        an = float(np.linalg.norm(a0))
+        if an > 2.0 * self.mpc_limit:
+            a0 *= 2.0 * self.mpc_limit / an
+        seq = self.mpc.solve(np.asarray(r_fb, float) - p_ref, np.asarray(v_fb, float) - v_ref, a0, u_dot,
+                             self._mpc_du, self.mpc_limit, N=N, dt=dt,
+                             taus=(self.mpc_lag_h, self.mpc_lag_h, self.mpc_lag_v),
+                             q_pos=self.mpc_q_pos, q_vel=self.mpc_q_vel, terminal_weight=self.mpc_terminal,
+                             r_u=self.mpc_r_u, r_rate=self.mpc_r_rate)
+        if seq is None:
+            self._mpc_next = self.elapsed + self.mpc_period
+            return None
+        self.mpc_seq = seq
+        self._mpc_t = self.elapsed
+        self._mpc_du = np.array(seq[0], float)
+        self._mpc_next = self.elapsed + self.mpc_period
+        return self._mpc_du.copy()
 
     def _catch_hover_reference(self, veh, r, v):
         """Past the end of a tower-catch plan (a hover at the gate): hold the

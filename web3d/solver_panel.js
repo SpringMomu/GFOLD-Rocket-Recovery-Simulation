@@ -49,6 +49,19 @@ const DEFS = [
     hint: "飞行中每秒试探触地时间的步长（占剩余时间的比例）" },
   { key: "max_iter", group: "plan", label: "求解器迭代上限", fmt: num(0),
     hint: "Clarabel 内点法单次求解的最大迭代数；失败时仍会用 400 次重解一次" },
+
+  { key: "tracker_mpc", group: "track", label: "跟踪器", choices: ["PD", "MPC"],
+    hint: "着陆燃烧中把火箭拉回 G-FOLD 规划轨迹的方式。MPC（默认）在 2–3 s 时域内预测推力随姿态转动的滞后，不会在推力还没转过来时继续加码；PD 为原来的比例–微分修正" },
+  { key: "mpc_steps", group: "track", label: "MPC 预测步数", fmt: (v) => `${v} 步 / ${(v * 0.2).toFixed(1)} s`,
+    hint: "MPC 预测时域（每步 0.2 s）。越长越平稳、越能提前反应，求解也稍慢" },
+  { key: "mpc_q_pos", group: "track", label: "MPC 位置误差权重", fmt: num(2),
+    hint: "偏离规划位置的代价。越大拉回越快，太大会重新出现过冲和摆动" },
+  { key: "mpc_q_vel", group: "track", label: "MPC 速度误差权重", fmt: num(2),
+    hint: "偏离规划速度的代价，起阻尼作用" },
+  { key: "mpc_r_rate", group: "track", label: "MPC 修正变化代价", fmt: num(1),
+    hint: "修正加速度每步变化的代价。越大推力方向越平滑、姿态越稳，响应越慢" },
+  { key: "mpc_lag_h", group: "track", label: "MPC 侧向推力滞后", fmt: num(2, " s"),
+    hint: "MPC 模型里侧向推力跟上指令所需的时间（姿态环 + 转动速率限制）。比实际小会过冲，比实际大会偏慢" },
 ];
 
 const PRESETS = {
@@ -81,8 +94,8 @@ export function initSolverPanel({ act }) {
   const build = (list) => {
     opts = {};
     for (const [key, kind, lo, hi, step, def] of list) opts[key] = { kind, lo, hi, step, def };
-    const groups = { wind: "抗风", plan: "规划与求解" };
-    const subs = { wind: "规划对风的预测与应对", plan: "" };
+    const groups = { wind: "抗风", plan: "规划与求解", track: "轨迹跟踪" };
+    const subs = { wind: "规划对风的预测与应对", plan: "", track: "着陆燃烧中跟踪规划的反馈" };
     for (const g of Object.keys(groups)) {
       const h = document.createElement("div");
       h.className = "sg";

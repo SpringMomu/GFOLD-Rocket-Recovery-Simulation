@@ -57,6 +57,8 @@ def run(sc, over=None, pert=None, t_max=400.0):
     t_ign = None
     axis_prev = None
     tilt_rate = []
+    omega_burn = []
+    omega_low = 0.0
     max_tilt = max_tilt_low = 0.0
     climb = 0.0
     lowslow = 0.0
@@ -95,6 +97,10 @@ def run(sc, over=None, pert=None, t_max=400.0):
                 ang = math.degrees(math.acos(max(-1.0, min(1.0, float(np.dot(axis_prev, veh.axis)))))) / PHYSICS_DT
                 tilt_rate.append(ang)
             axis_prev = veh.axis.copy()
+            w_pq = math.degrees(math.hypot(float(veh.omega[0]), float(veh.omega[1])))
+            omega_burn.append(w_pq)
+            if veh.altitude < 8.0:
+                omega_low = max(omega_low, w_pq)
             if veh.vel[2] > 0.5:
                 climb = max(climb, float(veh.vel[2]))
             M["burn_vh_max"] = max(M.get("burn_vh_max", 0.0), float(np.hypot(*veh.vel[:2])))
@@ -129,6 +135,8 @@ def run(sc, over=None, pert=None, t_max=400.0):
         tilt_rate_p95=float(np.percentile(tr, 95)), tilt_rate_max=float(tr.max()),
         jump_max=float(max(plans)) if plans else 0.0, jump_mean=float(np.mean(plans)) if plans else 0.0,
         retimes=retimes, climb=climb, lowslow=lowslow,
+        omega_rms=float(np.sqrt(np.mean(np.square(omega_burn)))) if omega_burn else 0.0,
+        omega_p95=float(np.percentile(omega_burn, 95)) if omega_burn else 0.0, omega_low=omega_low,
     ))
     return M
 
@@ -141,7 +149,7 @@ def fmt(sc, M):
     return (f"{sc} {M['state'][:6]:6s} bbEnd={f('bb_end_miss',0):>5} ignMiss={f('ign_miss',0):>4} ignLine={f('ign_line',0):>4} ignD={f('ign_d',0):>4} "
             f"ignVh={f('ign_vh',0):>3} ignH={f('ign_alt',0):>5} | burn={f('burn_s')}s tilt={f('max_tilt',0)} "
             f"tilt<200={f('max_tilt_low',0)} rate95={f('tilt_rate_p95',0)} jump={f('jump_max',0)}/{f('jump_mean',0)} "
-            f"ret={M['retimes']} climb={f('climb')} lowslow={f('lowslow')} | @200m d={f('h200_d',0)} vh={f('h200_vh',1)} vz={f('h200_vz',0)} burnVhMax={f('burn_vh_max',0)} | err={f('err')} vh={f('vh',2)} vz={f('vz',2)} prop={f('prop',0)}")
+            f"ret={M['retimes']} climb={f('climb')} lowslow={f('lowslow')} | @200m d={f('h200_d',0)} vh={f('h200_vh',1)} vz={f('h200_vz',0)} burnVhMax={f('burn_vh_max',0)} | wRms={f('omega_rms',2)} w95={f('omega_p95',1)} w<8m={f('omega_low',1)} | err={f('err')} vh={f('vh',2)} vz={f('vz',2)} prop={f('prop',0)}")
 
 
 def run_job(job):

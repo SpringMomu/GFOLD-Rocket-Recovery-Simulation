@@ -48,6 +48,13 @@ OPTIONS = (
     Option("time_search_evals", "int", 9, 5, 14, 1),             # solves of the touchdown-time search at ignition
     Option("retime_step", "float", 0.08, 0.02, 0.2, 0.01),       # touchdown time trial step (share of the time to go)
     Option("max_iter", "int", 100, 50, 300, 10),                 # interior-point iteration cap
+    # --- landing-burn tracker (lander3d/mpc.py): MPC round the G-FOLD plan, or the PD correction
+    Option("tracker_mpc", "bool", 1, 0, 1, 1),                   # 1 MPC, 0 PD
+    Option("mpc_steps", "int", 12, 5, 25, 1),                    # horizon in model steps of 0.2 s
+    Option("mpc_q_pos", "float", 0.15, 0.05, 5.0, 0.05),          # weight of the position error
+    Option("mpc_q_vel", "float", 0.0, 0.0, 5.0, 0.05),           # weight of the velocity error
+    Option("mpc_r_rate", "float", 1.0, 0.0, 10.0, 0.1),          # weight of the change of the correction
+    Option("mpc_lag_h", "float", 1.0, 0.1, 1.5, 0.05),           # s, modelled lag of the sideways thrust
 )
 BY_KEY = {o.key: o for o in OPTIONS}
 
@@ -107,5 +114,11 @@ def apply(autopilot, values: dict) -> None:
     pl.jerk_weight = float(values["jerk_weight"])
     pl.lateral_rate = float(values["lateral_rate"])
     pl.max_iter = int(values["max_iter"])
+    ap.tracker_mpc = bool(values["tracker_mpc"])
+    ap.mpc_steps = int(values["mpc_steps"])
+    ap.mpc_q_pos = float(values["mpc_q_pos"])
+    ap.mpc_q_vel = float(values["mpc_q_vel"])
+    ap.mpc_r_rate = float(values["mpc_r_rate"])
+    ap.mpc_lag_h = float(values["mpc_lag_h"])
     if not ap.shear_fit:
         ap.wind_shear_est = 1.0
